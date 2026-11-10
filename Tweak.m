@@ -35,7 +35,7 @@
 #pragma mark - Config / storage
 
 #define RY_CFG @"ry.cfg.v1"
-#define RY_ROOM_DEFAULT @"DCDChatViewController" // Discord native chat screen (also matches DCDChatViewControllerContainer); changeable in Diag
+#define RY_ROOM_DEFAULT @"ChatViewController" // matches DCDChatViewController, DiscordChat.ChatViewController and their containers; changeable in Diag
 
 static NSMutableDictionary *gCfg;
 
@@ -186,12 +186,13 @@ static NSString *RYImgName(UIImage *im) {
 #pragma mark - View-controller discovery
 #pragma mark - Visibility (hidden pre-loaded screens must not count as "on screen")
 
-static BOOL RYVisible(UIView *v) {
+static BOOL RYVisibleMin(UIView *v, CGFloat minW, CGFloat minH) {
     if (!v.window) return NO;
     for (UIView *p = v; p; p = p.superview) if (p.hidden || p.alpha < 0.05) return NO;
     CGRect f = CGRectIntersection([v convertRect:v.bounds toView:nil], v.window.bounds);
-    return !CGRectIsNull(f) && f.size.width > 40 && f.size.height > 40;
+    return !CGRectIsNull(f) && f.size.width > minW && f.size.height > minH;
 }
+static BOOL RYVisible(UIView *v) { return RYVisibleMin(v, 40, 40); }
 static void RYScanAll(UIViewController *vc, NSString *needle, int d, NSMutableArray *out) {
     if (!vc || d > 14) return;
     if ([NSStringFromClass(vc.class) containsString:needle] && vc.isViewLoaded && vc.view.window) [out addObject:vc];
@@ -279,6 +280,19 @@ static void RYLog(NSString *fmt, ...) {
 #pragma mark - Room helpers (see-through views, chat input, diagnostics)
 
 static NSMapTable *gOrigBG;
+static NSHashTable *gKeepClear; static BOOL gBgActive = NO; // views we made see-through stay see-through even when the app paints them again
+static void (*orig_setBGC)(id, SEL, UIColor *);
+static void RYSetBGC(id self, SEL _cmd, UIColor *c) {
+    if (gBgActive && gKeepClear && c && [gKeepClear containsObject:self]) c = UIColor.clearColor;
+    orig_setBGC(self, _cmd, c);
+}
+static void RYInstallBGHook(void) {
+    static dispatch_once_t once; dispatch_once(&once, ^{
+        Method m = class_getInstanceMethod(UIView.class, @selector(setBackgroundColor:)); if (!m) return;
+        orig_setBGC = (void (*)(id, SEL, UIColor *))method_getImplementation(m);
+        method_setImplementation(m, (IMP)RYSetBGC);
+    });
+}
 static BOOL RYSkipClass(UIView *v) {
     NSString *c = NSStringFromClass(v.class), *l = NSStringFromClass(v.layer.class);
     for (NSString *k in @[@"Video", @"Player", @"Metal", @"MTK", @"Camera", @"Preview", @"Flutter", @"WK", @"WebView", @"SampleBuffer"])
@@ -287,14 +301,18 @@ static BOOL RYSkipClass(UIView *v) {
 }
 static void RYClear(UIView *v) {
     if (!gOrigBG) gOrigBG = [NSMapTable weakToStrongObjectsMapTable];
+    if (!gKeepClear) gKeepClear = [NSHashTable weakObjectsHashTable];
     if (![gOrigBG objectForKey:v]) [gOrigBG setObject:(v.backgroundColor ?: (id)NSNull.null) forKey:v];
+    [gKeepClear addObject:v];
     v.backgroundColor = UIColor.clearColor;
 }
 static void RYRestoreAll(void) {
+    BOOL was = gBgActive; gBgActive = NO;
     for (UIView *v in [gOrigBG.keyEnumerator allObjects]) {
         id o = [gOrigBG objectForKey:v]; v.backgroundColor = [o isKindOfClass:UIColor.class] ? o : nil;
     }
-    [gOrigBG removeAllObjects];
+    [gOrigBG removeAllObjects]; [gKeepClear removeAllObjects];
+    gBgActive = was;
 }
 static BOOL RYHasBG(UIView *v) { return v.backgroundColor && CGColorGetAlpha(v.backgroundColor.CGColor) > 0.05; }
 // highest full-screen container above the room view (the room VC's own view can be only a small part of the screen)
@@ -319,11 +337,17 @@ static void RYClearBig(UIView *v, UIView *host, UIView *skip, int d) {
     }
 }
 
+// any text control the chat bar may use: UITextField, UITextView, or a custom editor (YYTextView etc.) that adopts UIKeyInput
+static BOOL RYIsInputClass(UIView *v) {
+    if ([v isKindOfClass:UITextField.class]) return !((UITextField *)v).secureTextEntry;
+    if ([v isKindOfClass:UITextView.class]) return ((UITextView *)v).isEditable;
+    if (![v conformsToProtocol:@protocol(UIKeyInput)]) return NO;
+    if ([v respondsToSelector:@selector(isSecureTextEntry)] && ((BOOL (*)(id, SEL))objc_msgSend)(v, @selector(isSecureTextEntry))) return NO;
+    return YES;
+}
 static void RYCollectInputs(UIView *v, NSMutableArray *o, int d) {
     if (d > 40) return;
-    BOOL tf = [v isKindOfClass:UITextField.class] && !((UITextField *)v).secureTextEntry;
-    BOOL tv = [v isKindOfClass:UITextView.class] && ((UITextView *)v).isEditable;
-    if ((tf || tv) && !v.hidden && v.alpha > 0.01 && v.window && v.userInteractionEnabled) [o addObject:v];
+    if (RYIsInputClass(v) && !v.hidden && v.alpha > 0.01 && v.window && v.userInteractionEnabled) [o addObject:v];
     for (UIView *s in v.subviews) RYCollectInputs(s, o, d + 1);
 }
 // chat bars sit at the bottom: pick the lowest visible input
@@ -333,17 +357,38 @@ static UIView *RYBottomInput(UIView *root) {
     for (UIView *x in c) { CGFloat y = CGRectGetMaxY([x convertRect:x.bounds toView:nil]); if (y > by) { by = y; best = x; } }
     return best;
 }
-static NSString *RYGetText(UIView *in) { return [in isKindOfClass:UITextField.class] ? ((UITextField *)in).text : ((UITextView *)in).text; }
+static id RYMsg0(id o, SEL s) { return [o respondsToSelector:s] ? ((id (*)(id, SEL))objc_msgSend)(o, s) : nil; }
+static NSString *RYGetText(UIView *in) {
+    id t = RYMsg0(in, @selector(text)); if ([t isKindOfClass:NSString.class]) return t;
+    t = RYMsg0(in, @selector(attributedText)); if ([t isKindOfClass:NSAttributedString.class]) return [(NSAttributedString *)t string];
+    return @"";
+}
 static void RYSetText(UIView *in, NSString *msg) {
+    if ([in respondsToSelector:@selector(setText:)]) ((void (*)(id, SEL, id))objc_msgSend)(in, @selector(setText:), msg);
+    else if ([in respondsToSelector:@selector(setAttributedText:)]) ((void (*)(id, SEL, id))objc_msgSend)(in, @selector(setAttributedText:), [[NSAttributedString alloc] initWithString:msg ?: @""]);
+    id dl = RYMsg0(in, @selector(delegate));
     if ([in isKindOfClass:UITextField.class]) {
-        UITextField *tf = (UITextField *)in; tf.text = msg;
+        UITextField *tf = (UITextField *)in;
         [tf sendActionsForControlEvents:UIControlEventEditingChanged];
         [NSNotificationCenter.defaultCenter postNotificationName:UITextFieldTextDidChangeNotification object:tf];
+        if ([dl respondsToSelector:@selector(textFieldDidChangeSelection:)]) ((void (*)(id, SEL, id))objc_msgSend)(dl, @selector(textFieldDidChangeSelection:), tf);
     } else {
-        UITextView *tv = (UITextView *)in; tv.text = msg;
-        if ([tv.delegate respondsToSelector:@selector(textViewDidChange:)]) [tv.delegate textViewDidChange:tv];
-        [NSNotificationCenter.defaultCenter postNotificationName:UITextViewTextDidChangeNotification object:tv];
+        if ([dl respondsToSelector:@selector(textViewDidChange:)]) ((void (*)(id, SEL, id))objc_msgSend)(dl, @selector(textViewDidChange:), in);
+        if ([dl respondsToSelector:@selector(textViewDidChangeSelection:)]) ((void (*)(id, SEL, id))objc_msgSend)(dl, @selector(textViewDidChangeSelection:), in);
+        [NSNotificationCenter.defaultCenter postNotificationName:UITextViewTextDidChangeNotification object:in];
     }
+}
+// a real edit through UIKeyInput (select all, replace): goes through the app's own change pipeline. Needs the app window to be key.
+static BOOL RYTypeText(UIView *in, NSString *msg) {
+    if (![in conformsToProtocol:@protocol(UIKeyInput)]) return NO;
+    if (!in.isFirstResponder && ![in becomeFirstResponder]) return NO;
+    if ([in conformsToProtocol:@protocol(UITextInput)]) {
+        id<UITextInput> ti = (id<UITextInput>)in;
+        UITextRange *all = [ti textRangeFromPosition:ti.beginningOfDocument toPosition:ti.endOfDocument];
+        if (all) [ti replaceRange:all withText:@""];
+    }
+    [(id<UIKeyInput>)in insertText:msg];
+    return YES;
 }
 static void RYPressReturn(UIView *in) {
     if ([in isKindOfClass:UITextField.class]) {
@@ -352,9 +397,9 @@ static void RYPressReturn(UIView *in) {
         [tf sendActionsForControlEvents:UIControlEventEditingDidEndOnExit];
         [tf sendActionsForControlEvents:UIControlEventPrimaryActionTriggered];
     } else {
-        UITextView *tv = (UITextView *)in;
-        if ([tv.delegate respondsToSelector:@selector(textView:shouldChangeTextInRange:replacementText:)])
-            [tv.delegate textView:tv shouldChangeTextInRange:NSMakeRange(tv.text.length, 0) replacementText:@"\n"];
+        id dl = RYMsg0(in, @selector(delegate));
+        if ([dl respondsToSelector:@selector(textView:shouldChangeTextInRange:replacementText:)])
+            ((BOOL (*)(id, SEL, id, NSRange, id))objc_msgSend)(dl, @selector(textView:shouldChangeTextInRange:replacementText:), in, NSMakeRange(RYGetText(in).length, 0), @"\n");
     }
 }
 static void RYCollectCtl(UIView *v, NSMutableArray *o, int d) {
@@ -407,6 +452,27 @@ static UIControl *RYSendBtnNear(UIView *in) {
     return nil;
 }
 
+
+// fires a tap on a view that is not a UIControl: calls the targets of its tap gesture recognizers, which is what UIKit does on a real tap
+static BOOL RYTapView(UIView *v) {
+    int lvl = 0;
+    for (UIView *p = v; p && lvl < 5; p = p.superview, lvl++) {
+        if ([p isKindOfClass:UIControl.class] && ((UIControl *)p).enabled) { [(UIControl *)p sendActionsForControlEvents:UIControlEventTouchUpInside]; return YES; }
+        BOOL did = NO;
+        for (UIGestureRecognizer *g in p.gestureRecognizers) {
+            if (![g isKindOfClass:UITapGestureRecognizer.class] || !g.enabled) continue;
+            NSArray *ts = nil; @try { ts = [g valueForKey:@"targets"]; } @catch (__unused id e) { ts = nil; }
+            for (id t in ts) {
+                Ivar ta = class_getInstanceVariable([t class], "_target"), ac = class_getInstanceVariable([t class], "_action");
+                if (!ta || !ac) continue;
+                id target = object_getIvar(t, ta); SEL act = *(SEL *)((uint8_t *)(__bridge void *)t + ivar_getOffset(ac));
+                if (target && act && [target respondsToSelector:act]) { ((void (*)(id, SEL, id))objc_msgSend)(target, act, g); did = YES; }
+            }
+        }
+        if (did) return YES;
+    }
+    return NO;
+}
 static void RYWalk(UIView *v, int d, void (^blk)(UIView *, int)) { blk(v, d); for (UIView *s in v.subviews) RYWalk(s, d + 1, blk); }
 static NSString *RYClip(NSString *s, NSUInteger n) {
     if (!s.length) return @"";
@@ -1071,14 +1137,6 @@ static UIView *RYFindViewNamed(UIView *v, NSString *needle, int d) {
     for (UIView *s in v.subviews) { UIView *r = RYFindViewNamed(s, needle, d + 1); if (r) return r; }
     return nil;
 }
-// the visible chat screen: first as a view controller, then as a plain view
-static UIView *RYChatHost(void) {
-    NSString *needle = CF(@"roomClass", RY_ROOM_DEFAULT);
-    UIViewController *vc = RYFindVC(needle);
-    if (vc && RYVisible(vc.view)) return vc.view;
-    for (UIWindow *w in RYAppWindows()) { UIView *r = RYFindViewNamed(w, needle, 0); if (r && RYVisible(r)) return r; }
-    return nil;
-}
 static void RYClearCells(UIView *v, int d) {
     if (d > 9) return;
     for (UIView *s in v.subviews) {
@@ -1094,16 +1152,109 @@ static UIView *RYLowestInput(void) {
     UIView *best = nil; CGFloat by = -1e9;
     for (UIWindow *w in RYAppWindows()) {
         NSMutableArray *c = [NSMutableArray new]; RYCollectInputs(w, c, 0);
-        for (UIView *x in c) { if (!RYVisible(x)) continue; CGFloat y = CGRectGetMaxY([x convertRect:x.bounds toView:nil]); if (y > by) { by = y; best = x; } }
+        for (UIView *x in c) { if (!RYVisibleMin(x, 20, 12)) continue; CGFloat y = CGRectGetMaxY([x convertRect:x.bounds toView:nil]); if (y > by) { by = y; best = x; } }
     }
     return best;
 }
-// RN / Swift send buttons are not always UIControls: try a real control first, then the accessibility element called "send"
-static BOOL RYPressSend(UIView *in) {
+
+// the visible chat screen. 1) a view controller whose class contains the needle (the saved one, then the known Discord names),
+// 2) a plain view with that class name, 3) class-free guess: the full-screen container that holds a big scroll view and a text input low on the screen
+static BOOL RYHasBigScroll(UIView *host) {
+    __block BOOL ok = NO; CGSize ws = host.window.bounds.size;
+    RYWalk(host, 0, ^(UIView *v, int d) {
+        if (ok || d > 9 || v.hidden || ![v isKindOfClass:UIScrollView.class]) return;
+        CGSize s = [v convertRect:v.bounds toView:nil].size;
+        if (s.width >= ws.width * 0.85 && s.height >= ws.height * 0.35) ok = YES;
+    });
+    return ok;
+}
+static UIView *RYGuessChatHost(void) {
+    UIView *in = RYLowestInput(); if (!in) return nil;
+    UIWindow *w = in.window; if (!w) return nil;
+    if (CGRectGetMaxY([in convertRect:in.bounds toView:nil]) < w.bounds.size.height * 0.55) return nil;
+    for (UIView *p = in.superview; p && p != w; p = p.superview) {
+        CGSize s = [p convertRect:p.bounds toView:w].size;
+        if (s.width >= w.bounds.size.width * 0.9 && s.height >= w.bounds.size.height * 0.6) return RYHasBigScroll(p) ? p : nil;
+    }
+    return nil;
+}
+static NSString *gChatHostHow = @"-";
+static UIView *RYChatHost(void) {
+    NSMutableArray *needles = [NSMutableArray new];
+    NSString *cfg = CF(@"roomClass", nil); if (cfg.length) [needles addObject:cfg];
+    for (NSString *n in @[@"DCDChatViewController", @"ChatViewController"]) if (![needles containsObject:n]) [needles addObject:n];
+    for (NSString *needle in needles) {
+        UIView *best = nil; CGFloat bestA = 0;
+        for (UIWindow *w in RYAppWindows()) {
+            NSMutableArray *vcs = [NSMutableArray new]; RYScanAll(w.rootViewController, needle, 0, vcs);
+            for (UIViewController *vc in vcs) {
+                if (!RYVisible(vc.view)) continue;
+                CGSize z = vc.view.bounds.size; CGFloat a = z.width * z.height;
+                if (a > bestA) { bestA = a; best = vc.view; }
+            }
+        }
+        if (best) { gChatHostHow = [@"vc:" stringByAppendingString:needle]; return best; }
+        for (UIWindow *w in RYAppWindows()) { UIView *r = RYFindViewNamed(w, needle, 0); if (r && RYVisible(r)) { gChatHostHow = [@"view:" stringByAppendingString:needle]; return r; } }
+    }
+    UIView *g = RYGuessChatHost(); gChatHostHow = g ? @"guess" : @"none";
+    return g;
+}
+
+// geometry fallback: the small tappable view next to the text field (outside it, on the trailing side) that is not emoji / sticker / mic / attach
+static NSArray<NSString *> *RYNotSendWords(void) {
+    return @[@"sticker", @"emoji", @"gif", @"mic", @"voice", @"record", @"camera", @"attach", @"photo", @"gift", @"apps", @"plus", @"add", @"صوت", @"ملصق", @"إضافة"];
+}
+static UIView *RYGeoSend(UIView *in) {
+    UIWindow *w = in.window; if (!w) return nil;
+    UIView *bar = nil, *p = in;
+    for (int i = 0; i < 8 && p.superview && p.superview != w; i++) {
+        p = p.superview; CGSize s = [p convertRect:p.bounds toView:nil].size;
+        if (s.height > 260) break;
+        if (s.width >= w.bounds.size.width * 0.8) bar = p;
+    }
+    if (!bar) bar = in.superview; if (!bar) return nil;
+    CGRect fi = [in convertRect:in.bounds toView:nil];
+    BOOL rtl = UIApplication.sharedApplication.userInterfaceLayoutDirection == UIUserInterfaceLayoutDirectionRightToLeft;
+    NSArray *bad = RYNotSendWords();
+    __block UIView *best = nil; __block CGFloat bestX = rtl ? 1e9 : -1e9;
+    RYWalk(bar, 0, ^(UIView *v, int d) {
+        if (v == in || v.hidden || v.alpha < 0.05 || !v.window) return;
+        BOOL tappable = [v isKindOfClass:UIControl.class] || v.isAccessibilityElement;
+        if (!tappable) for (UIGestureRecognizer *g in v.gestureRecognizers) if ([g isKindOfClass:UITapGestureRecognizer.class]) { tappable = YES; break; }
+        if (!tappable) return;
+        CGRect f = [v convertRect:v.bounds toView:nil];
+        if (f.size.width < 24 || f.size.width > 80 || f.size.height < 24 || f.size.height > 80) return;
+        CGFloat cy = CGRectGetMidY(f), cx = CGRectGetMidX(f);
+        if (cy < fi.origin.y - 60 || cy > CGRectGetMaxY(fi) + 60) return;
+        if (cx > fi.origin.x && cx < CGRectGetMaxX(fi)) return;
+        NSString *k = [v isKindOfClass:UIControl.class] ? RYCtlKey((UIControl *)v) : RYA11yKey(v);
+        for (NSString *x in bad) if ([k containsString:x]) return;
+        if (rtl ? cx < bestX : cx > bestX) { bestX = cx; best = v; }
+    });
+    return best;
+}
+// last resort: the app's own "send tapped" handler on the object that owns the input (zero-argument names only, so no wrong-type argument can reach it)
+static BOOL RYSendViaSelectors(UIView *in) {
+    NSArray *names = @[@"handleSendButtonTap", @"handleSendTap", @"sendButtonTapped", @"sendButtonPressed", @"didTapSendButton", @"didTapSend", @"onSendButtonPress", @"handleSendButtonPress"];
+    NSMutableArray *objs = [NSMutableArray new];
+    id dl = RYMsg0(in, @selector(delegate)); if (dl) [objs addObject:dl];
+    for (UIResponder *r = in; r; r = r.nextResponder) [objs addObject:r];
+    for (id o in objs) for (NSString *n in names) {
+        SEL s = NSSelectorFromString(n); if (![o respondsToSelector:s]) continue;
+        ((void (*)(id, SEL))objc_msgSend)(o, s); return YES;
+    }
+    return NO;
+}
+// attempt 0: the button called "send" (UIControl, then accessibility element, then its tap recognizers)
+// 1: the small button beside the field  2: the app's own send handler  3: return key
+static BOOL RYPressSend(UIView *in, int attempt) {
+    if (attempt == 1) { UIView *g = RYGeoSend(in); if (!g) return NO; if (g.isAccessibilityElement && [g accessibilityActivate]) return YES; return RYTapView(g); }
+    if (attempt == 2) return RYSendViaSelectors(in);
+    if (attempt >= 3) { RYPressReturn(in); return YES; }
     UIControl *btn = RYSendBtnNear(in);
     if (btn) { [btn sendActionsForControlEvents:UIControlEventTouchUpInside]; return YES; }
     NSString *lbl = [CF(@"sendLabel", @"send") lowercaseString];
-    NSArray *bad = @[@"voice", @"sticker", @"emoji", @"gif", @"camera", @"attach", @"gift", @"apps", @"صوت"];
+    NSArray *bad = RYNotSendWords();
     UIView *p = in;
     for (int i = 0; i < 7 && p.superview; i++) {
         p = p.superview;
@@ -1111,10 +1262,11 @@ static BOOL RYPressSend(UIView *in) {
         for (id e in els) {
             if (e == in) continue;
             NSString *k = RYA11yKey(e);
-            if (![k containsString:lbl] && ![k containsString:@"إرسال"] && ![k containsString:@"ارسال"]) continue;
+            if (![k containsString:lbl] && ![k containsString:@"send"] && ![k containsString:@"إرسال"] && ![k containsString:@"ارسال"]) continue;
             BOOL skip = NO; for (NSString *w in bad) if ([k containsString:w]) { skip = YES; break; }
             if (skip) continue;
             if ([e accessibilityActivate]) return YES;
+            if ([e isKindOfClass:UIView.class] && RYTapView(e)) return YES;
         }
         if (p.bounds.size.height > 500) break;
     }
@@ -1162,7 +1314,13 @@ static NSString *RYDiagVoice(void) {
 static NSString *RYDiagChat(void) {
     NSMutableString *o = [NSMutableString new];
     UIView *host = RYChatHost();
-    [o appendFormat:@"chat class needle: %@\nchat host: %@\n\n", CF(@"roomClass", RY_ROOM_DEFAULT), host ? NSStringFromClass(host.class) : @"NOT FOUND"];
+    [o appendFormat:@"chat class needle: %@\nchat host: %@  (found by: %@)\n\n", CF(@"roomClass", RY_ROOM_DEFAULT), host ? NSStringFromClass(host.class) : @"NOT FOUND", gChatHostHow];
+    [o appendString:@"== view controllers whose class has Chat in the name\n"];
+    for (UIWindow *w in RYAppWindows()) { NSMutableArray *vs = [NSMutableArray new]; RYScanAll(w.rootViewController, @"Chat", 0, vs); for (UIViewController *vc in vs) { CGRect f = [vc.view convertRect:vc.view.bounds toView:nil]; [o appendFormat:@"   %@  %.0fx%.0f @%.0f,%.0f  visible=%d\n", NSStringFromClass(vc.class), f.size.width, f.size.height, f.origin.x, f.origin.y, RYVisible(vc.view)]; } }
+    [o appendString:@"\n== every text input on screen (UIKeyInput views)\n"];
+    for (UIWindow *w in RYAppWindows()) { NSMutableArray *ins = [NSMutableArray new]; RYCollectInputs(w, ins, 0); for (UIView *x in ins) { CGRect f = [x convertRect:x.bounds toView:nil]; id dl = RYMsg0(x, @selector(delegate)); [o appendFormat:@"   %@  %.0fx%.0f @%.0f,%.0f  text=\"%@\"  delegate=%@  visible=%d\n", NSStringFromClass(x.class), f.size.width, f.size.height, f.origin.x, f.origin.y, RYClip(RYGetText(x), 30), dl ? NSStringFromClass([dl class]) : @"-", RYVisibleMin(x, 20, 12)]; } }
+    { UIView *li = RYLowestInput(); UIView *gs = li ? RYGeoSend(li) : nil; [o appendFormat:@"\nbeside-field send candidate: %@\n", gs ? [NSString stringWithFormat:@"%@ key=%@", NSStringFromClass(gs.class), [gs isKindOfClass:UIControl.class] ? RYCtlKey((UIControl *)gs) : RYA11yKey(gs)] : @"none"]; }
+    [o appendString:@"\n"];
     if (host) { [o appendString:@"== chat view tree (depth 7)\n"]; RYDiagTree(host, 0, 7, o); }
     UIView *in = RYLowestInput();
     [o appendFormat:@"\n== lowest visible text input: %@\n", in ? NSStringFromClass(in.class) : @"NONE"];
@@ -1230,6 +1388,8 @@ static void RYShareText(UIViewController *from, NSString *name, NSString *text) 
 - (void)hud:(NSString *)s;
 - (void)start; - (void)openPanel; - (void)panelClosed; - (void)bump;
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger code))done;
+- (void)sendTry:(NSString *)msg input:(UIView *)in prev:(NSString *)prev mode:(int)mode attempt:(int)att done:(void (^)(NSInteger))done;
+- (void)syncBG:(UIView *)chat;
 @end
 
 #pragma mark - Quick-message loop (sends the saved messages one after another until switched off)
@@ -1677,7 +1837,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 #pragma mark - Core
 @implementation RYCore
 + (instancetype)shared { static RYCore *c; static dispatch_once_t t; dispatch_once(&t, ^{ c = [RYCore new]; }); return c; }
-- (void)bump { self.stamp++; }
+- (void)bump { self.stamp++; dispatch_async(dispatch_get_main_queue(), ^{ [self syncBG:RYChatHost()]; }); }
 - (void)hud:(NSString *)s {
     UIView *host = self.win.rootViewController.view; if (!host) return;
     UILabel *l = RYLabel(s, 14, UIFontWeightMedium, nil); l.textAlignment = NSTextAlignmentCenter; l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.85];
@@ -1702,7 +1862,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     CGSize sz = root.view.bounds.size;
     b.center = CGPointMake([CF(@"bx", @(sz.width - 40)) doubleValue], [CF(@"by", @(sz.height * 0.35)) doubleValue]);
     [root.view addSubview:b]; self.fab = b;
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.8 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick) userInfo:nil repeats:YES];
 }
 - (void)pan:(UIPanGestureRecognizer *)g {
     UIView *v = g.view; CGPoint t = [g translationInView:v.superview];
@@ -1728,6 +1888,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 }
 - (void)syncBG:(UIView *)chat {
     BOOL want = chat && ![CF(@"bgMode", @"none") isEqual:@"none"];
+    RYInstallBGHook(); gBgActive = want;
     if (!want) {
         if (self.bgView) { [self.bgView removeFromSuperview]; self.bgView = nil; self.bgHost = nil; RYRestoreAll(); }
         return;
@@ -1748,23 +1909,41 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     if (self.bgView.stamp != self.stamp) { [self.bgView apply]; self.bgView.stamp = self.stamp; }
 }
 // code: 0 sent, 1 chat input not found, 2 not sent
+// mode 0 puts the text in without focus; if the app does not accept it (or nothing sends) mode 1 types it for real (app window becomes key).
+// each mode tries the send routes in turn (button called send, button beside the field, the app's own handler, return key); a message counts as sent only when the field is empty afterwards.
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
     UIView *in = RYLowestInput();
     if (!in) { done(1); return; }
-    NSString *prev = RYGetText(in) ?: @"";
-    RYSetText(in, msg);
-    __weak UIView *wi = in;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    __weak typeof(self) ws = self;
+    void (^fin)(NSInteger) = ^(NSInteger c) {
+        if (ws.win.rootViewController.presentedViewController) [ws.win makeKeyWindow];
+        done(c);
+    };
+    [self sendTry:msg input:in prev:(RYGetText(in) ?: @"") mode:0 attempt:0 done:fin];
+}
+- (void)sendTry:(NSString *)msg input:(UIView *)in prev:(NSString *)prev mode:(int)mode attempt:(int)att done:(void (^)(NSInteger))done {
+    __weak UIView *wi = in; __weak typeof(self) ws = self;
+    if (att == 0) {
+        if (mode == 0) RYSetText(in, msg);
+        else {
+            UIWindow *w = in.window; if (w && !w.isKeyWindow) [w makeKeyWindow];
+            if (!RYTypeText(in, msg)) RYSetText(in, msg);
+        }
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         UIView *x = wi; if (!x) { done(2); return; }
-        RYPressSend(x);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            UIView *y = wi;
-            if (!y || ![RYGetText(y) isEqualToString:msg]) { done(0); return; }   // field was cleared by the app = sent
-            RYPressReturn(y);                                                       // second try: return key
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UIView *z = wi;
-                if (!z || ![RYGetText(z) isEqualToString:msg]) { done(0); } else { RYSetText(z, prev); done(2); }
-            });
+        if (att == 0 && ![RYGetText(x) isEqualToString:msg]) {   // the app did not accept the text
+            if (mode == 0) [ws sendTry:msg input:x prev:prev mode:1 attempt:0 done:done]; else done(2);
+            return;
+        }
+        RYPressSend(x, att);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIView *y = wi; if (!y) { done(0); return; }
+            if (RYGetText(y).length == 0) { done(0); return; }   // field emptied by the app = sent
+            if (att < 3) { [ws sendTry:msg input:y prev:prev mode:mode attempt:att + 1 done:done]; return; }
+            RYSetText(y, @"");
+            if (mode == 0) [ws sendTry:msg input:y prev:prev mode:1 attempt:0 done:done];
+            else { RYSetText(y, prev); done(2); }
         });
     });
 }
