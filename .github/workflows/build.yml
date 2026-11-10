@@ -1,40 +1,27 @@
-name: Build 8ubah
+name: build-dylib
 on:
   push:
-  workflow_dispatch:
+    branches: [main, master]
+  workflow_dispatch: {}
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-
-      # Theos is installed by hand: the theos-action "Get SDKs" step downloads a zip with symlinks and fails on the runner
-      # ("symlink error: Permission denied"). The iOS SDK that comes with Xcode on the runner is enough for this dylib.
-      - name: Install Theos
+      - name: Build 8ubahDiscord.dylib (arm64, iOS 16+)
         run: |
-          brew install ldid make
-          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
-          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
-          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
-
-      - name: Show SDK
-        run: |
-          xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
-          xcrun --sdk iphoneos --show-sdk-version
-
-      - name: Build dylib
-        run: make clean all FINALPACKAGE=1
-
-      - name: Collect
-        run: |
-          mkdir -p out
-          F=$(find .theos -name 8ubah.dylib | head -1)
-          echo "found: $F"
-          cp "$F" out/8ubah.dylib
-          ls -la out
-
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 \
+            -dynamiclib -fobjc-arc -O2 -w \
+            -framework UIKit -framework Foundation -framework AVFoundation -framework PhotosUI \
+            -framework ImageIO -framework AudioToolbox -framework CoreMedia \
+            -framework UniformTypeIdentifiers -framework QuartzCore -framework CoreGraphics \
+            -install_name @executable_path/Frameworks/8ubahDiscord.dylib \
+            -o 8ubahDiscord.dylib Tweak.m
+          codesign -f -s - 8ubahDiscord.dylib || true
+          file 8ubahDiscord.dylib
+          otool -L 8ubahDiscord.dylib
       - uses: actions/upload-artifact@v4
         with:
-          name: 8ubah-dylib
-          path: out/8ubah.dylib
+          name: 8ubahDiscord
+          path: 8ubahDiscord.dylib
