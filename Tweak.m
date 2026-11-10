@@ -286,11 +286,46 @@ static void RYSetBGC(id self, SEL _cmd, UIColor *c) {
     if (gBgActive && gKeepClear && c && [gKeepClear containsObject:self]) c = UIColor.clearColor;
     orig_setBGC(self, _cmd, c);
 }
+// RN / Discord views can paint straight onto the layer (or override setBackgroundColor: without calling UIView's), which skipped the hook above and
+// let the black come back for up to half a second between two ticks. Hook the layer setter too: it catches every route.
+static void (*orig_layerSetBGC)(id, SEL, CGColorRef);
+static void RYLayerSetBGC(id self, SEL _cmd, CGColorRef c) {
+    if (gBgActive && c && gKeepClear) {
+        id d = ((CALayer *)self).delegate;
+        if (d && [d isKindOfClass:UIView.class] && ((UIView *)d).layer == (CALayer *)self && [gKeepClear containsObject:d] && CGColorGetAlpha(c) > 0.001) c = UIColor.clearColor.CGColor;
+    }
+    orig_layerSetBGC(self, _cmd, c);
+}
+static void RYHookOwnBGC(Class c) {
+    SEL s = @selector(setBackgroundColor:);
+    Method m = class_getInstanceMethod(c, s); if (!m) return;
+    IMP orig = method_getImplementation(m);
+    void (^blk)(id, UIColor *) = ^(id me, UIColor *col) {
+        if (gBgActive && col && gKeepClear && [gKeepClear containsObject:me]) col = UIColor.clearColor;
+        ((void (*)(id, SEL, UIColor *))orig)(me, s, col);
+    };
+    method_setImplementation(m, imp_implementationWithBlock(blk));
+}
 static void RYInstallBGHook(void) {
     static dispatch_once_t once; dispatch_once(&once, ^{
         Method m = class_getInstanceMethod(UIView.class, @selector(setBackgroundColor:)); if (!m) return;
-        orig_setBGC = (void (*)(id, SEL, UIColor *))method_getImplementation(m);
+        IMP viewImp = method_getImplementation(m);
+        orig_setBGC = (void (*)(id, SEL, UIColor *))viewImp;
         method_setImplementation(m, (IMP)RYSetBGC);
+        // every view class of the app that has its own setBackgroundColor: (it would skip the hook on UIView)
+        unsigned int n = 0; const char *img = [NSBundle mainBundle].executablePath.fileSystemRepresentation;
+        const char **names = img ? objc_copyClassNamesForImage(img, &n) : NULL;
+        for (unsigned int i = 0; i < n; i++) {
+            Class c = objc_getClass(names[i]); if (!c) continue;
+            BOOL isView = NO; for (Class k = c; k; k = class_getSuperclass(k)) if (k == UIView.class) { isView = YES; break; }   // plain runtime walk: Swift root classes do not answer isSubclassOfClass:
+            if (!isView) continue;
+            Class sup = class_getSuperclass(c); if (!sup) continue;
+            Method mc = class_getInstanceMethod(c, @selector(setBackgroundColor:)), ms = class_getInstanceMethod(sup, @selector(setBackgroundColor:));
+            if (mc && ms && method_getImplementation(mc) != method_getImplementation(ms)) RYHookOwnBGC(c);
+        }
+        if (names) free(names);
+        Method lm = class_getInstanceMethod(CALayer.class, @selector(setBackgroundColor:));
+        if (lm) { orig_layerSetBGC = (void (*)(id, SEL, CGColorRef))method_getImplementation(lm); method_setImplementation(lm, (IMP)RYLayerSetBGC); }
     });
 }
 static BOOL RYSkipClass(UIView *v) {
@@ -346,7 +381,7 @@ static BOOL RYIsInputClass(UIView *v) {
     return YES;
 }
 static void RYCollectInputs(UIView *v, NSMutableArray *o, int d) {
-    if (d > 40) return;
+    if (d > 140) return;
     if (RYIsInputClass(v) && !v.hidden && v.alpha > 0.01 && v.window && v.userInteractionEnabled) [o addObject:v];
     for (UIView *s in v.subviews) RYCollectInputs(s, o, d + 1);
 }
@@ -1148,13 +1183,56 @@ static void RYClearCells(UIView *v, int d) {
         RYClearCells(s, d + 1);
     }
 }
-static UIView *RYLowestInput(void) {
+// Every chat input registers itself when it enters a window, so it is found even when the view tree is too deep / too odd for the scan.
+static NSHashTable *gLiveInputs; static NSMutableSet<NSString *> *gInputHooked;
+static void RYNoteInput(UIView *v) {
+    if (!v.window) return;
+    if (!gLiveInputs) gLiveInputs = [NSHashTable weakObjectsHashTable];
+    [gLiveInputs addObject:v];
+}
+static void RYHookInputClass(NSString *cn) {
+    Class c = NSClassFromString(cn); if (!c) return;
+    if (!gInputHooked) gInputHooked = [NSMutableSet new];
+    if ([gInputHooked containsObject:cn]) return;
+    SEL s = @selector(didMoveToWindow);
+    Method m = class_getInstanceMethod(c, s); if (!m) return;
+    [gInputHooked addObject:cn];
+    IMP orig = method_getImplementation(m);
+    void (^blk)(UIView *) = ^(UIView *me) { ((void (*)(id, SEL))orig)(me, s); RYNoteInput(me); };
+    IMP ni = imp_implementationWithBlock(blk);
+    if (!class_addMethod(c, s, ni, method_getTypeEncoding(m))) method_setImplementation(m, ni);
+}
+static void RYHookInputs(void) { for (NSString *n in @[@"DCDChatInput", @"RCTUITextView", @"YYTextView"]) RYHookInputClass(n); }
+// on screen even if an ancestor is semi-transparent (animations / fades); only hidden ancestors or off-screen count as not there
+static BOOL RYOnScreenLoose(UIView *v) {
+    if (!v.window) return NO;
+    for (UIView *p = v; p; p = p.superview) if (p.hidden) return NO;
+    CGRect f = CGRectIntersection([v convertRect:v.bounds toView:nil], v.window.bounds);
+    return !CGRectIsNull(f) && f.size.width > 10 && f.size.height > 8;
+}
+static UIView *RYLowestOf(NSArray *c, int tier) {
     UIView *best = nil; CGFloat by = -1e9;
-    for (UIWindow *w in RYAppWindows()) {
-        NSMutableArray *c = [NSMutableArray new]; RYCollectInputs(w, c, 0);
-        for (UIView *x in c) { if (!RYVisibleMin(x, 20, 12)) continue; CGFloat y = CGRectGetMaxY([x convertRect:x.bounds toView:nil]); if (y > by) { by = y; best = x; } }
+    for (UIView *x in c) {
+        if ([NSStringFromClass(x.window.class) isEqual:@"RYWindow"]) continue;
+        if (!RYIsInputClass(x)) continue;
+        BOOL ok = tier == 0 ? RYVisibleMin(x, 20, 12) : RYOnScreenLoose(x);
+        if (!ok) continue;
+        CGFloat y = CGRectGetMaxY([x convertRect:x.bounds toView:nil]); if (y > by) { by = y; best = x; }
     }
     return best;
+}
+static UIView *RYLowestInput(void) {
+    RYHookInputs();
+    NSMutableArray *scan = [NSMutableArray new], *chat = [NSMutableArray new];
+    for (UIView *x in gLiveInputs.allObjects) if (x.window && [NSStringFromClass(x.class) isEqual:@"DCDChatInput"]) [chat addObject:x];
+    for (UIWindow *w in RYAppWindows()) RYCollectInputs(w, scan, 0);
+    // 1) the app's own chat input, strictly visible  2) any visible text input  3) the same, relaxed  4) any registered input in a window
+    UIView *r = RYLowestOf(chat, 0); if (r) return r;
+    r = RYLowestOf(scan, 0); if (r) return r;
+    r = RYLowestOf(chat, 1); if (r) return r;
+    r = RYLowestOf(scan, 1); if (r) return r;
+    NSMutableArray *all = [NSMutableArray new]; for (UIView *x in gLiveInputs.allObjects) if (x.window && ![NSStringFromClass(x.window.class) isEqual:@"RYWindow"]) [all addObject:x];
+    return RYLowestOf(all, 1);
 }
 
 // the visible chat screen. 1) a view controller whose class contains the needle (the saved one, then the known Discord names),
@@ -1179,7 +1257,8 @@ static UIView *RYGuessChatHost(void) {
     return nil;
 }
 static NSString *gChatHostHow = @"-";
-static UIView *RYChatHost(void) {
+static __weak UIView *gLastChat;
+static UIView *RYChatHostRaw(void) {
     NSMutableArray *needles = [NSMutableArray new];
     NSString *cfg = CF(@"roomClass", nil); if (cfg.length) [needles addObject:cfg];
     for (NSString *n in @[@"DCDChatViewController", @"ChatViewController"]) if (![needles containsObject:n]) [needles addObject:n];
@@ -1198,6 +1277,13 @@ static UIView *RYChatHost(void) {
     }
     UIView *g = RYGuessChatHost(); gChatHostHow = g ? @"guess" : @"none";
     return g;
+}
+// the chat screen found last time is kept for as long as it is still on screen, so a transition / keyboard animation / a second matching
+// controller cannot make the wallpaper jump to another view (every jump tore the wallpaper down and rebuilt it = flicker to black)
+static UIView *RYChatHost(void) {
+    UIView *last = gLastChat;
+    if (last && RYVisible(last)) { gChatHostHow = @"sticky"; return last; }
+    UIView *h = RYChatHostRaw(); gLastChat = h; return h;
 }
 
 // geometry fallback: the small tappable view next to the text field (outside it, on the trailing side) that is not emoji / sticker / mic / attach
@@ -1315,6 +1401,7 @@ static NSString *RYDiagChat(void) {
     NSMutableString *o = [NSMutableString new];
     UIView *host = RYChatHost();
     [o appendFormat:@"chat class needle: %@\nchat host: %@  (found by: %@)\n\n", CF(@"roomClass", RY_ROOM_DEFAULT), host ? NSStringFromClass(host.class) : @"NOT FOUND", gChatHostHow];
+    [o appendFormat:@"registered chat inputs: %lu\n\n", (unsigned long)gLiveInputs.allObjects.count];
     [o appendString:@"== view controllers whose class has Chat in the name\n"];
     for (UIWindow *w in RYAppWindows()) { NSMutableArray *vs = [NSMutableArray new]; RYScanAll(w.rootViewController, @"Chat", 0, vs); for (UIViewController *vc in vs) { CGRect f = [vc.view convertRect:vc.view.bounds toView:nil]; [o appendFormat:@"   %@  %.0fx%.0f @%.0f,%.0f  visible=%d\n", NSStringFromClass(vc.class), f.size.width, f.size.height, f.origin.x, f.origin.y, RYVisible(vc.view)]; } }
     [o appendString:@"\n== every text input on screen (UIKeyInput views)\n"];
@@ -1383,6 +1470,7 @@ static void RYShareText(UIViewController *from, NSString *name, NSString *text) 
 @property (nonatomic, weak) UIWindow *prevKey;
 @property (nonatomic, strong) RYBGView *bgView;
 @property (nonatomic, weak) UIView *bgHost;
+@property (nonatomic) NSInteger missTicks;
 @property (nonatomic) NSInteger stamp;
 + (instancetype)shared;
 - (void)hud:(NSString *)s;
@@ -1883,16 +1971,21 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 }
 - (void)panelClosed { [self.prevKey makeKeyWindow]; }
 - (void)tick {
-    self.fab.hidden = NO; self.fab.backgroundColor = RYAccent();
+    self.fab.hidden = NO; self.fab.backgroundColor = RYAccent(); RYHookInputs();
     [self syncBG:RYChatHost()];
 }
 - (void)syncBG:(UIView *)chat {
-    BOOL want = chat && ![CF(@"bgMode", @"none") isEqual:@"none"];
-    RYInstallBGHook(); gBgActive = want;
+    BOOL on = ![CF(@"bgMode", @"none") isEqual:@"none"];
+    RYInstallBGHook();
+    // the chat view can be missing from one scan (transition, keyboard, reload): keep the wallpaper ~2 seconds before tearing it down
+    if (on && !chat && self.bgView && ++self.missTicks < 4) { gBgActive = YES; return; }
+    BOOL want = chat && on; gBgActive = want;
     if (!want) {
         if (self.bgView) { [self.bgView removeFromSuperview]; self.bgView = nil; self.bgHost = nil; RYRestoreAll(); }
+        self.missTicks = 0;
         return;
     }
+    self.missTicks = 0;
     BOOL full = [CF(@"bgFull", @NO) boolValue];
     UIView *host = full ? RYFullHost(chat) : chat;
     if (self.bgView && self.bgView.superview != host) { [self.bgView removeFromSuperview]; self.bgView = nil; RYRestoreAll(); }
@@ -1913,7 +2006,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 // each mode tries the send routes in turn (button called send, button beside the field, the app's own handler, return key); a message counts as sent only when the field is empty afterwards.
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
     UIView *in = RYLowestInput();
-    if (!in) { done(1); return; }
+    if (!in) { RYLog(@"send: chat input not found (registered inputs: %lu)", (unsigned long)gLiveInputs.allObjects.count); done(1); return; }
     __weak typeof(self) ws = self;
     void (^fin)(NSInteger) = ^(NSInteger c) {
         if (ws.win.rootViewController.presentedViewController) [ws.win makeKeyWindow];
