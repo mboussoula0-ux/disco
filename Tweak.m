@@ -152,7 +152,12 @@ static BOOL RYHookedEnv(void) {
     }
     return NO;
 }
-static BOOL RYFeatureOK(const char *tag) { return RYDerivedOK(tag) && !RYTraced() && !RYHookedEnv(); }
+// RYTraced()/RYHookedEnv() are kept but NOT gated on below: the tool that injects this dylib on a
+// non-jailbroken device (Feather/ESign/Sideloadly-style sideloading) commonly leaves the process under
+// ptrace and/or DYLD_INSERT_LIBRARIES set for its OWN normal, legitimate injection — not an attacker.
+// Gating features on those two checks caused a false positive that silently disabled every feature while
+// still opening the panel (RYLocked only used RYDerivedOK), which is what broke the mic/BG/Stereo tabs.
+static BOOL RYFeatureOK(const char *tag) { return RYDerivedOK(tag); }
 static BOOL RYLocked(void) { return !RYDerivedOK("locked"); }
 
 static void RYLicStore(BOOL ok, NSString *hash) {
