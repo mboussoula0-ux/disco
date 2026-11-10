@@ -28,6 +28,8 @@
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #import <mach-o/nlist.h>
+#include <sys/sysctl.h>
+#include <sys/types.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <os/lock.h>
@@ -95,7 +97,104 @@ static NSString *RYHash(NSString *s) {
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) [o appendFormat:@"%02x", h[i]];
     return o;
 }
-static BOOL RYLocked(void) { return NO; }
+#pragma mark - Licence (key system; same server/repo as the Rave project)
+// The Worker URL is stored XOR-scrambled, not as a plain string literal, so a "strings" scan of the
+// binary (the exact technique used to find everything else in this file) doesn't just hand it over.
+static NSString *RY_LIC_API_(void) {
+    static const unsigned char enc[] = {0xBB,0xA7,0xA7,0xA3,0xA0,0xE9,0xFC,0xFC,0xB6,0xBE,0xA3,0xA7,0xAA,0xFE,0xBE,0xBC,
+        0xBC,0xBD,0xFE,0xB0,0xE1,0xB5,0xE4,0xFD,0xBE,0xB1,0xBC,0xA6,0xA0,0xA0,0xBC,0xA6,0xBF,0xB2,0xE3,0xFD,0xA4,0xBC,
+        0xA1,0xB8,0xB6,0xA1,0xA0,0xFD,0xB7,0xB6,0xA5};
+    const uint8_t key = 0xD3;
+    NSMutableString *o = [NSMutableString new];
+    for (size_t i = 0; i < sizeof(enc); i++) [o appendFormat:@"%c", (char)(enc[i] ^ key)];
+    return o;
+}
+#define RY_LIC_API RY_LIC_API_()
+static NSString *RYDeviceId(void) {
+    NSString *v = CF(@"devId", nil); if (v.length) return v;
+    v = UIDevice.currentDevice.identifierForVendor.UUIDString ?: [NSUUID UUID].UUIDString;
+    CS(@"devId", v); return v;
+}
+// The unlock state is not one plain BOOL. It is re-derived, independently, at every call site below
+// (RYLocked and the effects gate) from the saved key hash + device id + a per-build salt, and compared
+// against a signature written once at activation. Patching one call site to always say "unlocked" leaves
+// the other — which reads the same derived value its own way — still locked.
+#define RY_SALT 0xA17C3F9B5E2D8461ULL
+static uint64_t RYFNV(const char *s) { uint64_t h = 1469598103934665603ULL; for (; *s; s++) { h ^= (unsigned char)*s; h *= 1099511628211ULL; } return h; }
+static BOOL RYDerivedOK(const char *tag) {
+    NSString *h = CF(@"licHash", nil); NSString *d = RYDeviceId();
+    if (!h.length || !d.length || ![CF(@"unlocked", @NO) boolValue]) return NO;
+    uint64_t v = RYFNV([[h stringByAppendingString:d] UTF8String]) ^ RY_SALT ^ RYFNV(tag);
+    NSNumber *want = CF(@"licSig", nil);
+    return want && (uint64_t)want.unsignedLongLongValue == (v ^ (RYFNV("sig") ^ RYFNV(tag)));
+}
+// A debugger/Frida gadget attached to the process (the common way to force a function to always return
+// YES/NO at runtime without touching the file on disk) shows up as P_TRACED. We don't try to block it —
+// we just stop trusting the derived unlock while it's attached.
+static BOOL RYTraced(void) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
+    struct kinfo_proc info; size_t sz = sizeof(info); memset(&info, 0, sz);
+    if (sysctl(mib, 4, &info, &sz, NULL, 0) != 0) return NO;
+    return (info.kp_proc.p_flag & P_TRACED) != 0;
+}
+// DYLD_INSERT_LIBRARIES is how Frida/Substrate-style tools commonly attach to a process from outside;
+// a named pipe or loaded image matching a known hooking tool is the same kind of signal. None of this
+// can be made airtight (an attacker can rename the library), but it costs them real effort to work around.
+static BOOL RYHookedEnv(void) {
+    if (getenv("DYLD_INSERT_LIBRARIES")) return YES;
+    static NSArray<NSString *> *bad; static dispatch_once_t t;
+    dispatch_once(&t, ^{ bad = @[@"FridaGadget", @"frida-agent", @"cynject", @"CydiaSubstrate", @"SubstrateLoader", @"libsubstitute", @"SSLKillSwitch"]; });
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *nm = _dyld_get_image_name(i); if (!nm) continue;
+        NSString *s = [NSString stringWithUTF8String:nm];
+        for (NSString *b in bad) if ([s rangeOfString:b options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+static BOOL RYFeatureOK(const char *tag) { return RYDerivedOK(tag) && !RYTraced() && !RYHookedEnv(); }
+static BOOL RYLocked(void) { return !RYDerivedOK("locked"); }
+
+static void RYLicStore(BOOL ok, NSString *hash) {
+    if (ok) {
+        CS(@"licHash", hash); CS(@"unlocked", @YES); CS(@"licTs", @(NSDate.date.timeIntervalSince1970));
+        uint64_t v = RYFNV([[hash stringByAppendingString:RYDeviceId()] UTF8String]) ^ RY_SALT ^ RYFNV("sig");
+        CS(@"licSig", @(v));
+    } else { CS(@"unlocked", @NO); }
+}
+// Activate with the key itself (not its hash — sending only the hash would let someone else claim the
+// same key's device slot just by knowing the public keys.json hash).
+static void RYLicActivate(NSString *key, void (^done)(BOOL)) {
+    NSString *k = [[key stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] uppercaseString];
+    NSString *h = RYHash(k);
+    NSURL *u = [NSURL URLWithString:[RY_LIC_API stringByAppendingString:@"/activate"]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u];
+    r.HTTPMethod = @"POST"; [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"key": k, @"device": RYDeviceId()} options:0 error:nil];
+    [[[NSURLSession sharedSession] dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        BOOL ok = [j isKindOfClass:NSDictionary.class] && [j[@"ok"] boolValue];
+        RYLicStore(ok, h);
+        dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
+    }] resume];
+}
+// Silent background re-check of the key already saved on this device (no UI). Only a definite "no" from
+// the server locks the panel back up — a network hiccup never locks out someone with a valid key.
+static void RYLicRevalidate(void) {
+    NSString *h = CF(@"licHash", nil); if (!h.length) return;
+    NSString *u = [NSString stringWithFormat:@"%@/check?hash=%@&device=%@", RY_LIC_API, h, RYDeviceId()];
+    [[[NSURLSession sharedSession] dataTaskWithURL:[NSURL URLWithString:u] completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        BOOL ok = [j isKindOfClass:NSDictionary.class] && [j[@"ok"] boolValue];
+        if (ok) return;
+        NSString *why = [j isKindOfClass:NSDictionary.class] ? j[@"reason"] : nil;
+        if (![why isKindOfClass:NSString.class]) return;
+        BOOL hard = [@[@"global_off", @"not_found", @"off", @"expired", @"device_mismatch"] containsObject:why];
+        BOOL unbound = [why isEqualToString:@"not_bound"] && (NSDate.date.timeIntervalSince1970 - [CF(@"licTs", @0) doubleValue]) > 600;
+        if (!hard && !unbound) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ CS(@"unlocked", @NO); });
+    }] resume];
+}
 
 
 // session modes that switch the system echo canceller / noise suppressor / AGC on
@@ -600,7 +699,7 @@ static void RYStDecode(NSURL *u, void (^done)(BOOL ok, NSString *msg)) {
     });
 }
 
-#define RY_FX_ON (gMicOn || gMicDist || gMicRev || gMicMute || gStOn)   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
+#define RY_FX_ON (RYFeatureOK("fx") && (gMicOn || gMicDist || gMicRev || gMicMute || gStOn))   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
 enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
 static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
 static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
@@ -753,7 +852,7 @@ static void RYMonEngineStart(void) {
 }
 static void RYMonStart(void) { gMonOn = 1; gMonR = gMonW; RYMonEngineStart(); }
 // start the Stereo file from the beginning, and (if enabled) start hearing it locally
-static void RYStPlay(void) { gStPos = 0; gMonR = gMonW; gStOn = 1; if (gStMon) RYMonEngineStart(); }
+static void RYStPlay(void) { if (!RYFeatureOK("stereo")) return; gStPos = 0; gMonR = gMonW; gStOn = 1; if (gStMon) RYMonEngineStart(); }
 static void RYStMonSet(BOOL on) {
     gStMon = on ? 1 : 0; CS(@"stMon", @(on));
     if (on && gStOn) { gMonR = gMonW; RYMonEngineStart(); }
@@ -1589,10 +1688,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), T(@"رسائل سريعة", @"Quick messages"), T(@"تشخيص", @"Diag")];
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), T(@"رسائل سريعة", @"Quick messages")];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @4];
-    if (self.tab < 0 || self.tab > 4) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @3];
+    if (self.tab < 0 || self.tab > 3) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -1621,7 +1720,19 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-60],
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 2: [self renderBG]; break; case 3: [self renderMsgs]; break; default: [self renderDiag]; }
+    if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 2: [self renderBG]; break; default: [self renderMsgs]; }
+}
+#pragma mark Locked
+- (void)renderLocked {
+    __weak typeof(self) ws = self;
+    UIButton *unlock = RYBtn(T(@"فتح", @"Unlock"), YES, ^{
+        [ws ask:T(@"المفتاح", @"Key") ph:@"XXXX-XXXX-XXXX-XXXX" secure:NO ok:^(NSString *k) {
+            if (!k.length) return;
+            RYLicActivate(k, ^(BOOL ok) { if (ok) [ws rebuild]; else [ws toast:T(@"المفتاح غلط", @"Wrong key")]; });
+        }];
+    });
+    [self.stack addArrangedSubview:RYCard(@[unlock])];
 }
 
 #pragma mark Backgrounds
@@ -1982,6 +2093,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     b.center = CGPointMake([CF(@"bx", @(sz.width - 40)) doubleValue], [CF(@"by", @(sz.height * 0.35)) doubleValue]);
     [root.view addSubview:b]; self.fab = b;
     self.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:self selector:@selector(tick) userInfo:nil repeats:YES];
+    RYLicRevalidate();
 }
 - (void)pan:(UIPanGestureRecognizer *)g {
     UIView *v = g.view; CGPoint t = [g translationInView:v.superview];
@@ -2004,9 +2116,10 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 - (void)tick {
     self.fab.hidden = NO; self.fab.backgroundColor = RYAccent(); RYHookInputs();
     [self syncBG:RYChatHost()];
+    static int licTick = 0; if (++licTick % 144 == 0) RYLicRevalidate(); // ~every 72s
 }
 - (void)syncBG:(UIView *)chat {
-    BOOL on = ![CF(@"bgMode", @"none") isEqual:@"none"];
+    BOOL on = RYFeatureOK("bg") && ![CF(@"bgMode", @"none") isEqual:@"none"];
     RYInstallBGHook();
     // the chat view can be missing from one scan (transition, keyboard, reload): keep the wallpaper ~2 seconds before tearing it down
     if (on && !chat && self.bgView && ++self.missTicks < 4) { gBgActive = YES; return; }
@@ -2036,6 +2149,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 // mode 0 puts the text in without focus; if the app does not accept it (or nothing sends) mode 1 types it for real (app window becomes key).
 // each mode tries the send routes in turn (button called send, button beside the field, the app's own handler, return key); a message counts as sent only when the field is empty afterwards.
 - (void)sendMessage:(NSString *)msg done:(void (^)(NSInteger))done {
+    if (!RYFeatureOK("msg")) { done(1); return; }
     UIView *in = RYLowestInput();
     if (!in) { RYLog(@"send: chat input not found (registered inputs: %lu)", (unsigned long)gLiveInputs.allObjects.count); done(1); return; }
     __weak typeof(self) ws = self;
