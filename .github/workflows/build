@@ -1,0 +1,40 @@
+name: Build 8ubah
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Theos is installed by hand: the theos-action "Get SDKs" step downloads a zip with symlinks and fails on the runner
+      # ("symlink error: Permission denied"). The iOS SDK that comes with Xcode on the runner is enough for this dylib.
+      - name: Install Theos
+        run: |
+          brew install ldid make
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+
+      - name: Show SDK
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Build dylib
+        run: make clean all FINALPACKAGE=1
+
+      - name: Collect
+        run: |
+          mkdir -p out
+          F=$(find .theos -name 8ubah.dylib | head -1)
+          echo "found: $F"
+          cp "$F" out/8ubah.dylib
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 8ubah-dylib
+          path: out/8ubah.dylib
