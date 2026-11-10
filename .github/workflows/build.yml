@@ -25,4 +25,3 @@ jobs:
         with:
           name: 8ubahDiscord
           path: 8ubahDiscord.dylib
-
