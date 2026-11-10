@@ -1,0 +1,27 @@
+name: build-dylib
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build 8ubahDiscord.dylib (arm64, iOS 16+)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun --sdk iphoneos clang -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 \
+            -dynamiclib -fobjc-arc -O2 -w \
+            -framework UIKit -framework Foundation -framework AVFoundation -framework PhotosUI \
+            -framework ImageIO -framework AudioToolbox -framework CoreMedia \
+            -framework UniformTypeIdentifiers -framework QuartzCore -framework CoreGraphics \
+            -install_name @executable_path/Frameworks/8ubahDiscord.dylib \
+            -o 8ubahDiscord.dylib Tweak.m
+          codesign -f -s - 8ubahDiscord.dylib || true
+          file 8ubahDiscord.dylib
+          otool -L 8ubahDiscord.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 8ubahDiscord
+          path: 8ubahDiscord.dylib
