@@ -164,7 +164,7 @@ static void RYLicStore(BOOL ok, NSString *hash) {
 }
 // Activate with the key itself (not its hash — sending only the hash would let someone else claim the
 // same key's device slot just by knowing the public keys.json hash).
-static void RYLicActivate(NSString *key, void (^done)(BOOL)) {
+static void RYLicActivate(NSString *key, void (^done)(BOOL ok, NSString *reason)) {
     NSString *k = [[key stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] uppercaseString];
     NSString *h = RYHash(k);
     NSURL *u = [NSURL URLWithString:[RY_LIC_API stringByAppendingString:@"/activate"]];
@@ -174,8 +174,8 @@ static void RYLicActivate(NSString *key, void (^done)(BOOL)) {
     [[[NSURLSession sharedSession] dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
         id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
         BOOL ok = [j isKindOfClass:NSDictionary.class] && [j[@"ok"] boolValue];
-        RYLicStore(ok, h);
-        dispatch_async(dispatch_get_main_queue(), ^{ done(ok); });
+        NSString *reason = e ? e.localizedDescription : (([j isKindOfClass:NSDictionary.class] ? j[@"reason"] : nil) ?: (d ? nil : @"no_response"));
+        dispatch_async(dispatch_get_main_queue(), ^{ RYLicStore(ok, h); done(ok, reason); });
     }] resume];
 }
 // Silent background re-check of the key already saved on this device (no UI). Only a definite "no" from
@@ -1688,10 +1688,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), T(@"رسائل سريعة", @"Quick messages")];
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds")];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @3];
-    if (self.tab < 0 || self.tab > 3) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @1, @2];
+    if (self.tab < 0 || self.tab > 2) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -1721,7 +1721,7 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 2: [self renderBG]; break; default: [self renderMsgs]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; default: [self renderBG]; }
 }
 #pragma mark Locked
 - (void)renderLocked {
@@ -1729,7 +1729,7 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *unlock = RYBtn(T(@"فتح", @"Unlock"), YES, ^{
         [ws ask:T(@"المفتاح", @"Key") ph:@"XXXX-XXXX-XXXX-XXXX" secure:NO ok:^(NSString *k) {
             if (!k.length) return;
-            RYLicActivate(k, ^(BOOL ok) { if (ok) [ws rebuild]; else [ws toast:T(@"المفتاح غلط", @"Wrong key")]; });
+            RYLicActivate(k, ^(BOOL ok, NSString *reason) { if (ok) [ws rebuild]; else [ws toast:reason.length ? [NSString stringWithFormat:@"%@ (%@)", T(@"المفتاح غلط", @"Wrong key"), reason] : T(@"المفتاح غلط", @"Wrong key")]; });
         }];
     });
     [self.stack addArrangedSubview:RYCard(@[unlock])];
