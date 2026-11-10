@@ -1450,6 +1450,251 @@ static void RYShareText(UIViewController *from, NSString *name, NSString *text) 
     });
 }
 
+#pragma mark - Message logger (deleted message stays in red, edited message shows the original first then the edited one under it)
+// The chat list is a native table that the app's JS feeds through -[DCDChatManager updateRows:rows:...]. Every update is the full row list,
+// so the previous list is compared with the new one: a row that vanished from the middle of the list is put back (red), a row whose text
+// changed gets its old copy kept next to it. Rows are matched by message id (a 15+ digit number found in the row JSON).
+static BOOL gLogOn = YES;
+static NSMutableDictionary *gLogTags;     // reactTag -> @{last: NSDictionary id->row, lastIds: NSArray, chan: NSString, out: NSArray, red: NSSet}
+static NSMutableDictionary *gLogGhosts;   // channel key -> NSMutableArray of @{kind, id, orig, anchor, before, row}
+static NSObject *gLogLock;
+static int gLogDel, gLogEdit, gLogCalls, gLogSampleN, gLogSeq;
+static char gLogErr[240];
+static void (*orig_updRows)(id, SEL, id, id, BOOL, id, id, BOOL, id, id);
+static void (*orig_clrRows)(id, SEL, id, id);
+static void (*orig_willDisp)(id, SEL, id, id, id);
+
+static NSString *RYLogFile(NSString *chan) {
+    NSMutableString *s = [NSMutableString new];
+    for (NSUInteger i = 0; i < chan.length; i++) { unichar c = [chan characterAtIndex:i]; [s appendFormat:@"%C", (isalnum(c) ? c : (unichar)'_')]; }
+    return [RYDir(@"logger") stringByAppendingPathComponent:[s stringByAppendingString:@".json"]];
+}
+static BOOL RYIsSnow(NSString *s) {
+    if (![s isKindOfClass:NSString.class] || s.length < 15 || s.length > 21) return NO;
+    for (NSUInteger i = 0; i < s.length; i++) { unichar c = [s characterAtIndex:i]; if (c < '0' || c > '9') return NO; }
+    return YES;
+}
+static NSComparisonResult RYSnowCmp(NSString *a, NSString *b) {
+    if (a.length != b.length) return a.length < b.length ? NSOrderedAscending : NSOrderedDescending;
+    return [a compare:b];
+}
+static NSString *RYSnowIn(id o, int d) { // first message-id-looking value under an id-ish key
+    if (d > 4) return nil;
+    if ([o isKindOfClass:NSDictionary.class]) {
+        for (NSString *k in @[@"id", @"messageId", @"message_id"]) { id v = ((NSDictionary *)o)[k]; if ([v isKindOfClass:NSNumber.class]) v = [v stringValue]; if (RYIsSnow(v)) return v; }
+        for (NSString *k in @[@"message", @"messageModel", @"data", @"row", @"item"]) { id v = ((NSDictionary *)o)[k]; if (v) { NSString *r = RYSnowIn(v, d + 1); if (r) return r; } }
+    }
+    return nil;
+}
+static NSString *RYRowId(id row) { return RYSnowIn(row, 0); }
+static NSString *RYFindKey(id o, NSArray *keys, int d) {
+    if (d > 6) return nil;
+    if ([o isKindOfClass:NSDictionary.class]) {
+        for (NSString *k in keys) { id v = ((NSDictionary *)o)[k]; if ([v isKindOfClass:NSNumber.class]) v = [v stringValue]; if ([v isKindOfClass:NSString.class] && [v length]) return v; }
+        for (id v in ((NSDictionary *)o).allValues) { NSString *r = RYFindKey(v, keys, d + 1); if (r) return r; }
+    } else if ([o isKindOfClass:NSArray.class]) for (id v in (NSArray *)o) { NSString *r = RYFindKey(v, keys, d + 1); if (r) return r; }
+    return nil;
+}
+static void RYTextOf(id o, NSMutableString *out, int d) {
+    if (d > 14 || out.length > 4000) return;
+    if ([o isKindOfClass:NSDictionary.class]) {
+        for (NSString *k in ((NSDictionary *)o).allKeys) {
+            id v = ((NSDictionary *)o)[k];
+            if ([v isKindOfClass:NSString.class] && ([k isEqual:@"content"] || [k isEqual:@"text"] || [k isEqual:@"literal"] || [k isEqual:@"url"] || [k isEqual:@"src"])) [out appendString:v];
+            else if ([v isKindOfClass:NSDictionary.class] || [v isKindOfClass:NSArray.class]) RYTextOf(v, out, d + 1);
+        }
+    } else if ([o isKindOfClass:NSArray.class]) for (id v in (NSArray *)o) RYTextOf(v, out, d + 1);
+}
+static NSString *RYRowText(id row) { NSMutableString *s = [NSMutableString new]; RYTextOf(row, s, 0); return s; }
+static id RYCopyJSON(id o) {
+    @try { NSData *d = [NSJSONSerialization dataWithJSONObject:@{@"v": o} options:0 error:nil]; if (!d) return nil;
+        NSDictionary *r = [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers | NSJSONReadingMutableLeaves error:nil]; return r[@"v"]; } @catch (__unused id e) { return nil; }
+}
+static id RYReplaceStr(id o, NSString *from, NSString *to) {
+    if ([o isKindOfClass:NSString.class]) return [o isEqualToString:from] ? to : o;
+    if ([o isKindOfClass:NSMutableDictionary.class]) { NSMutableDictionary *m = o; for (id k in m.allKeys) { id v = m[k]; id n = RYReplaceStr(v, from, to); if (n != v) m[k] = n; } return o; }
+    if ([o isKindOfClass:NSMutableArray.class]) { NSMutableArray *m = o; for (NSUInteger i = 0; i < m.count; i++) { id n = RYReplaceStr(m[i], from, to); if (n != m[i]) m[i] = n; } return o; }
+    return o;
+}
+static BOOL RYPrefixFirstContent(id o, NSString *pre, int d) {
+    if (d > 14) return NO;
+    if ([o isKindOfClass:NSMutableDictionary.class]) {
+        NSMutableDictionary *m = o; id c = m[@"content"];
+        if ([c isKindOfClass:NSString.class] && [c length] && !m[@"url"]) { m[@"content"] = [pre stringByAppendingString:c]; return YES; }
+        for (id v in m.allValues) if (RYPrefixFirstContent(v, pre, d + 1)) return YES;
+    } else if ([o isKindOfClass:NSMutableArray.class]) for (id v in (NSMutableArray *)o) if (RYPrefixFirstContent(v, pre, d + 1)) return YES;
+    return NO;
+}
+static void RYGhostSave(NSString *chan) {
+    NSArray *g = gLogGhosts[chan]; if (!g) return;
+    @try { NSData *d = [NSJSONSerialization dataWithJSONObject:g options:0 error:nil]; if (d) [d writeToFile:RYLogFile(chan) atomically:YES]; } @catch (__unused id e) {}
+}
+static NSMutableArray *RYGhostGet(NSString *chan) {
+    NSMutableArray *g = gLogGhosts[chan];
+    if (!g) {
+        g = [NSMutableArray new];
+        NSData *d = [NSData dataWithContentsOfFile:RYLogFile(chan)];
+        if (d) { id j = [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers | NSJSONReadingMutableLeaves error:nil]; if ([j isKindOfClass:NSArray.class]) g = [j mutableCopy]; }
+        gLogGhosts[chan] = g;
+    }
+    return g;
+}
+static void RYLogSample(NSString *tag, NSString *raw, NSString *kind) {
+    if (gLogSampleN >= 4 || !raw.length) return; gLogSampleN++;
+    NSString *p = [RYDir(@"logs") stringByAppendingPathComponent:@"logger-sample.txt"];
+    NSString *line = [NSString stringWithFormat:@"=== %@ tag %@ (%lu chars)\n%@\n\n", kind, tag, (unsigned long)raw.length, raw.length > 9000 ? [raw substringToIndex:9000] : raw];
+    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!h) { [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil]; return; }
+    [h seekToEndOfFile]; [h writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [h closeFile];
+}
+
+// returns the list to hand to the app (live rows + ghosts); nil = leave the update untouched
+static NSMutableArray *RYLogProcess(NSString *tag, NSArray *rowsIn) {
+    NSMutableArray *R = [NSMutableArray new]; NSMutableArray *ids = [NSMutableArray new]; NSMutableDictionary *byId = [NSMutableDictionary new];
+    for (id r in rowsIn) { NSString *i = RYRowId(r); [R addObject:r]; [ids addObject:i ?: @""]; if (i) byId[i] = r; }
+    if (!byId.count) return nil;
+    NSString *chan = nil; for (id r in R) { chan = RYFindKey(r, @[@"channel_id", @"channelId"], 0); if (chan) break; } if (!chan) chan = [@"tag-" stringByAppendingString:tag];
+    NSMutableDictionary *st = gLogTags[tag]; if (!st) { st = [NSMutableDictionary new]; gLogTags[tag] = st; }
+    if (![st[@"chan"] isEqual:chan]) { [st removeAllObjects]; st[@"chan"] = chan; }
+    NSDictionary *last = st[@"last"]; NSArray *lastIds = st[@"lastIds"];
+    NSMutableArray *ghosts = RYGhostGet(chan);
+    BOOL dirty = NO;
+    if (last.count) {
+        int overlap = 0; for (NSString *i in byId) if (last[i]) overlap++;
+        if (overlap == 0) last = nil;
+    }
+    NSString *minId = nil, *maxId = nil;
+    for (NSString *i in byId) { if (!minId || RYSnowCmp(i, minId) == NSOrderedAscending) minId = i; if (!maxId || RYSnowCmp(i, maxId) == NSOrderedDescending) maxId = i; }
+    if (last.count) {
+        NSMutableSet *newTexts = [NSMutableSet new];
+        for (NSString *i in byId) if (!last[i]) { NSString *t = RYRowText(byId[i]); if (t.length) [newTexts addObject:t]; }
+        for (NSUInteger k = 0; k < lastIds.count; k++) {
+            NSString *i = lastIds[k]; if (!i.length || byId[i] || !last[i]) continue;
+            if (RYSnowCmp(i, minId) != NSOrderedDescending || RYSnowCmp(i, maxId) != NSOrderedAscending) continue; // fell out of the loaded window, not deleted
+            BOOL known = NO; for (NSDictionary *g in ghosts) if ([g[@"id"] isEqual:i]) { known = YES; break; } if (known) continue;
+            NSString *t = RYRowText(last[i]); if (t.length && [newTexts containsObject:t]) continue; // a sending placeholder replaced by the real message
+            NSString *anchor = @"", *before = @"";
+            for (NSInteger p = (NSInteger)k - 1; p >= 0; p--) if ([lastIds[p] length]) { anchor = lastIds[p]; break; }
+            for (NSUInteger p = k + 1; p < lastIds.count; p++) if ([lastIds[p] length]) { before = lastIds[p]; break; }
+            id cp = RYCopyJSON(last[i]); if (!cp) continue;
+            RYPrefixFirstContent(cp, @"🗑 ", 0);
+            [ghosts addObject:@{@"kind": @"del", @"id": i, @"orig": i, @"anchor": anchor, @"before": before, @"row": cp}]; gLogDel++; dirty = YES;
+        }
+        for (NSString *i in byId) {
+            id old = last[i]; if (!old) continue;
+            NSString *a = RYRowText(old), *b = RYRowText(byId[i]);
+            if (!a.length || [a isEqualToString:b]) continue;
+            NSString *gid = [[i substringToIndex:i.length - 2] stringByAppendingFormat:@"%02d", (++gLogSeq) % 100]; // same length, still looks like a message id
+            id cp = RYCopyJSON(old); if (!cp) continue; RYReplaceStr(cp, i, gid);
+            [ghosts addObject:@{@"kind": @"edit", @"id": gid, @"orig": i, @"anchor": @"", @"before": @"", @"row": cp}]; gLogEdit++; dirty = YES;
+        }
+    }
+    while (ghosts.count > 300) [ghosts removeObjectAtIndex:0];
+    if (dirty) RYGhostSave(chan);
+    st[@"last"] = byId; st[@"lastIds"] = ids;
+    if (!ghosts.count) { st[@"out"] = ids; st[@"red"] = [NSSet set]; return nil; }
+    // newest-first lists (inverted chat): the original of an edited message goes after the edited one, so on screen it is above it
+    BOOL inv = NO; { NSString *f = nil, *l = nil; for (NSString *i in ids) if (i.length) { if (!f) f = i; l = i; } if (f && l && f != l) inv = RYSnowCmp(f, l) == NSOrderedDescending; }
+    NSMutableArray *out = [NSMutableArray new], *outIds = [NSMutableArray new]; NSMutableSet *red = [NSMutableSet new], *used = [NSMutableSet new];
+    __block void (^emitDel)(NSString *) = nil;
+    emitDel = ^(NSString *anchorId) {
+        for (NSDictionary *g in ghosts) {
+            if (![g[@"kind"] isEqual:@"del"] || [used containsObject:g[@"id"]]) continue;
+            if (![g[@"anchor"] isEqual:anchorId]) continue;
+            if (anchorId.length == 0 && !byId[g[@"before"]]) continue; // head-of-list ghost only while its neighbour is on screen
+            [used addObject:g[@"id"]]; [out addObject:g[@"row"]]; [outIds addObject:g[@"id"]]; [red addObject:g[@"id"]];
+            emitDel(g[@"id"]);
+        }
+    };
+    emitDel(@"");
+    for (NSUInteger k = 0; k < R.count; k++) {
+        NSString *i = ids[k]; NSMutableArray *eg = [NSMutableArray new];
+        if (i.length) for (NSDictionary *g in ghosts) if ([g[@"kind"] isEqual:@"edit"] && [g[@"orig"] isEqual:i]) [eg addObject:g];
+        if (!inv) for (NSDictionary *g in eg) { [out addObject:g[@"row"]]; [outIds addObject:g[@"id"]]; }
+        [out addObject:R[k]]; [outIds addObject:i];
+        if (inv) for (NSInteger q = (NSInteger)eg.count - 1; q >= 0; q--) { [out addObject:eg[q][@"row"]]; [outIds addObject:eg[q][@"id"]]; }
+        if (i.length) emitDel(i);
+    }
+    emitDel = nil; // break the block's self-reference
+    st[@"out"] = outIds; st[@"red"] = red;
+    return out.count == R.count ? nil : out;
+}
+static id RYLogRows(id tag, id rows) { // any container the rows can arrive in; returns the replacement or the same object
+    if (!gLogOn || !rows) return rows;
+    @try {
+        NSString *t = [tag description]; NSArray *arr = nil; BOOL str = NO;
+        if ([rows isKindOfClass:NSString.class]) { str = YES; NSData *d = [(NSString *)rows dataUsingEncoding:NSUTF8StringEncoding]; id j = d ? [NSJSONSerialization JSONObjectWithData:d options:NSJSONReadingMutableContainers | NSJSONReadingMutableLeaves error:nil] : nil; if ([j isKindOfClass:NSArray.class]) arr = j; }
+        else if ([rows isKindOfClass:NSArray.class]) arr = rows;
+        if (!arr) { snprintf(gLogErr, sizeof gLogErr, "rows type %s not an array", class_getName(object_getClass(rows))); return rows; }
+        gLogCalls++;
+        if (gLogSampleN < 4) RYLogSample(t, str ? rows : [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:arr options:0 error:nil] ?: NSData.data encoding:NSUTF8StringEncoding], str ? @"string" : @"array");
+        NSMutableArray *res; @synchronized (gLogLock) { res = RYLogProcess(t, arr); }
+        if (!res) return rows;
+        if (str) { NSData *d = [NSJSONSerialization dataWithJSONObject:res options:0 error:nil]; NSString *s = d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil; return s ?: rows; }
+        return res;
+    } @catch (NSException *e) { snprintf(gLogErr, sizeof gLogErr, "exception %s", e.name.UTF8String); return rows; }
+}
+static void RYUpdRows(id self, SEL _cmd, id tag, id rows, BOOL top, id scroll, id csid, BOOL hack, id res, id rej) {
+    id n = RYLogRows(tag, rows);
+    orig_updRows(self, _cmd, tag, n, top, scroll, csid, hack, res, rej);
+}
+static void RYClrRows(id self, SEL _cmd, id tag, id csid) {
+    @synchronized (gLogLock) { [gLogTags removeObjectForKey:[tag description]]; }
+    orig_clrRows(self, _cmd, tag, csid);
+}
+static void RYTintRed(UIView *v, int d) {
+    if (d > 14) return;
+    UIColor *red = [UIColor colorWithRed:1.0 green:0.23 blue:0.23 alpha:1];
+    if ([v isKindOfClass:UILabel.class]) ((UILabel *)v).textColor = red;
+    else if ([v respondsToSelector:@selector(attributedText)] && [v respondsToSelector:@selector(setAttributedText:)]) {
+        NSAttributedString *a = ((id (*)(id, SEL))objc_msgSend)(v, @selector(attributedText));
+        if ([a isKindOfClass:NSAttributedString.class] && a.length) {
+            NSMutableAttributedString *m = [a mutableCopy]; [m addAttribute:NSForegroundColorAttributeName value:red range:NSMakeRange(0, m.length)];
+            ((void (*)(id, SEL, id))objc_msgSend)(v, @selector(setAttributedText:), m);
+        }
+    }
+    for (UIView *s in v.subviews) RYTintRed(s, d + 1);
+}
+static void RYWillDisp(id self, SEL _cmd, UITableView *tv, UITableViewCell *cell, NSIndexPath *ip) {
+    orig_willDisp(self, _cmd, tv, cell, ip);
+    if (!gLogOn) return;
+    @try {
+        NSString *tag = [RYMsg0(self, NSSelectorFromString(@"reactTag")) description]; if (!tag) return;
+        BOOL isRed = NO;
+        @synchronized (gLogLock) { NSDictionary *st = gLogTags[tag]; NSArray *out = st[@"out"]; NSSet *red = st[@"red"]; if (ip.row >= 0 && ip.row < (NSInteger)out.count) isRed = [red containsObject:out[ip.row]]; }
+        if (!isRed) return;
+        RYTintRed(cell.contentView, 0);
+        dispatch_async(dispatch_get_main_queue(), ^{ RYTintRed(cell.contentView, 0); });
+    } @catch (__unused id e) {}
+}
+static void RYInstallLogger(void) {
+    static dispatch_once_t once; dispatch_once(&once, ^{ gLogLock = [NSObject new]; gLogTags = [NSMutableDictionary new]; gLogGhosts = [NSMutableDictionary new]; });
+    static BOOL done1, done2, done3;
+    Class cm = NSClassFromString(@"DCDChatManager");
+    if (cm && !done1) {
+        SEL s = NSSelectorFromString(@"updateRows:rows:isLoadingAtTop:scrollData:changesetUpdateId:HACK_iOSForceAnimations:::");
+        Method m = class_getInstanceMethod(cm, s);
+        if (m) {
+            const char *e = method_getTypeEncoding(m); unsigned n = method_getNumberOfArguments(m);
+            char t2[16] = {0}, t3[16] = {0}, t4[16] = {0}, t7[16] = {0};
+            if (n == 10) { method_getArgumentType(m, 2, t2, 16); method_getArgumentType(m, 3, t3, 16); method_getArgumentType(m, 4, t4, 16); method_getArgumentType(m, 7, t7, 16); }
+            BOOL ok = n == 10 && t2[0] == '@' && t3[0] == '@' && (t4[0] == 'B' || t4[0] == 'c') && (t7[0] == 'B' || t7[0] == 'c');
+            if (ok) { orig_updRows = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYUpdRows); done1 = YES; RYLog(@"logger: updateRows hooked %s", e); }
+            else { snprintf(gLogErr, sizeof gLogErr, "updateRows signature differs: %s", e ?: "?"); RYLog(@"logger: %s", gLogErr); done1 = YES; }
+        }
+        SEL c = NSSelectorFromString(@"clearRows:changesetUpdateId:"); Method mc = class_getInstanceMethod(cm, c);
+        if (mc && !done2 && method_getNumberOfArguments(mc) == 4 && orig_updRows) { orig_clrRows = (void *)method_getImplementation(mc); method_setImplementation(mc, (IMP)RYClrRows); done2 = YES; }
+    }
+    Class vc = NSClassFromString(@"DCDChatViewController");
+    if (vc && !done3) {
+        SEL w = @selector(tableView:willDisplayCell:forRowAtIndexPath:); Method m = class_getInstanceMethod(vc, w);
+        if (m) { orig_willDisp = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYWillDisp); done3 = YES; RYLog(@"logger: willDisplayCell hooked"); }
+    }
+}
+static NSString *RYLogStatus(void) {
+    return [NSString stringWithFormat:@"%@: %d   %@: %d   %@: %d%@", T(@"محذوف", @"Deleted"), gLogDel, T(@"معدّل", @"Edited"), gLogEdit, T(@"تحديثات", @"Updates"), gLogCalls, gLogErr[0] ? [NSString stringWithFormat:@"\n⚠ %s", gLogErr] : (orig_updRows ? @"" : @"\n⚠ not hooked")];
+}
+
 #pragma mark - Window / root
 
 @interface RYWindow : UIWindow @end
@@ -1559,10 +1804,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), T(@"رسائل سريعة", @"Quick messages"), T(@"تشخيص", @"Diag")];
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), T(@"رسائل سريعة", @"Quick messages"), T(@"تشخيص", @"Diag"), T(@"سجل الرسائل", @"Logger")];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @4];
-    if (self.tab < 0 || self.tab > 4) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @5, @4];
+    if (self.tab < 0 || self.tab > 5) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -1591,7 +1836,7 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-60],
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 2: [self renderBG]; break; case 3: [self renderMsgs]; break; default: [self renderDiag]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 2: [self renderBG]; break; case 3: [self renderMsgs]; break; case 5: [self renderLogger]; break; default: [self renderDiag]; }
 }
 
 #pragma mark Backgrounds
@@ -1885,6 +2130,26 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYMicStatus2(); }];
 }
 
+#pragma mark Logger
+- (void)renderLogger {
+    __weak typeof(self) ws = self;
+    UISwitch *sw = [UISwitch new]; sw.on = gLogOn; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
+    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { gLogOn = wsw.on; CS(@"logOn", @(gLogOn)); }] forControlEvents:UIControlEventValueChanged];
+    UILabel *st = RYLabel(RYLogStatus(), 13, UIFontWeightMedium, RY_MUTED); st.numberOfLines = 0; self.invLabel = st;
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"سجل الرسائل", @"Message logger"), 15, UIFontWeightBold, nil), sw], 12), st])];
+    [self.stack addArrangedSubview:RYCard(@[
+        RYBtn(T(@"مسح السجل", @"Clear log"), NO, ^{
+            @synchronized (gLogLock) { [gLogGhosts removeAllObjects]; [gLogTags removeAllObjects]; }
+            for (NSString *f in [[NSFileManager defaultManager] contentsOfDirectoryAtPath:RYDir(@"logger") error:nil]) [[NSFileManager defaultManager] removeItemAtPath:[RYDir(@"logger") stringByAppendingPathComponent:f] error:nil];
+            gLogDel = 0; gLogEdit = 0; [ws toast:T(@"انمسح", @"Cleared")];
+        }),
+        RYBtn(T(@"نموذج البيانات", @"Data sample"), NO, ^{
+            NSString *t = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"logger-sample.txt"] encoding:NSUTF8StringEncoding error:nil];
+            RYShareText(ws, @"logger-sample.txt", [NSString stringWithFormat:@"%@\n\n%@", RYLogStatus(), t ?: @"(no rows captured yet: open a chat first)"]);
+        })])];
+    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYLogStatus(); }];
+}
+
 #pragma mark Diag
 - (void)renderDiag {
     __weak typeof(self) ws = self;
@@ -2054,5 +2319,7 @@ __attribute__((constructor)) static void RYInit(void) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ud setBool:NO forKey:@"8ubah.dc.launching"]; [ud synchronize]; });
     RYLog(@"=== launch (pid %d) mode: %@ ===", getpid(), safe ? @"SAFE (previous launch crashed)" : @"normal");
     if (!safe) RYInstallMic();
+    { id lv = CF(@"logOn", @YES); gLogOn = [lv boolValue]; }
+    RYInstallLogger(); for (NSNumber *sec in @[@1, @3, @8]) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYInstallLogger(); });
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { [[RYCore shared] start]; }];
 }
