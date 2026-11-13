@@ -1071,7 +1071,7 @@ static void RYInstallTapHook(void) {
 }
 
 // ---- remove the app's audio "isolation" (system voice processing, session mode, WebRTC noise/echo/AGC) so loud or effected voice is not ducked or muted
-static volatile int gIsoSess = 0, gIsoVP = 0, gIsoRTC = 0;
+static volatile int gIsoSess = 0, gIsoVP = 0, gIsoRTC = 0, gIsoOn = 0;
 static volatile long long gIsoSessN = 0, gIsoVPN = 0, gIsoVPFail = 0, gIsoEngN = 0, gIsoRTCN = 0;
 // (1) the AVAudioSession mode: VoiceChat / VideoChat switch the system echo canceller, noise suppressor and AGC on
 static BOOL (*orig_setMode)(id, SEL, NSString *, NSError **);
@@ -1131,7 +1131,7 @@ static void RYMicLoad(void) {
       if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
       else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
     gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
-    gIsoSess = gIsoVP = gIsoRTC = 1; // isolation is ALWAYS off: no switch, not stored
+    gIsoOn = [CF(@"isoOn", @NO) boolValue]; gIsoSess = gIsoVP = gIsoRTC = gIsoOn ? 1 : 0; // switch in the Mic tab
 }
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
@@ -1140,6 +1140,10 @@ static void RYMicSetMute(BOOL on) { gMicMute = on; } // not persisted on purpose
 static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); CS(@"revCfgVer", @2); }
 static BOOL RYRevIsDefault(void) { for (int i = 0; i < RV_N; i++) if (fabsf(gRv[i] - kRvDef[i]) > 0.0005f) return NO; return YES; }
 static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"الافتراضي ✓", @"Default ✓") : T(@"معدّل", @"Changed"); }
+static void RYMicSetIso(BOOL on) {
+    gIsoOn = on ? 1 : 0; gIsoSess = gIsoVP = gIsoRTC = gIsoOn; CS(@"isoOn", @(on));
+    if (on) RYIsoApplySession();
+}
 static void RYIsoSave(void) { CS(@"isoSess", @(gIsoSess != 0)); CS(@"isoVP", @(gIsoVP != 0)); CS(@"isoRTC", @(gIsoRTC != 0)); }
 static void RYMicApplyPreset(int i) {
     if (i < 0 || i >= RY_NPRESETS) return; const RYPreset *p = &kPresets[i];
@@ -1217,11 +1221,12 @@ static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
 #pragma mark - Discord voice engine: its own noise cancellation (Krisp), echo, noise suppression and AGC are switched off at the source
 static NSMutableDictionary<NSString *, NSValue *> *gTOOrig; static volatile int gTOCalls = 0; static char gTOLast[300] = "-";
 static NSArray<NSString *> *RYVoiceKeys(void) {
-    return @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"automaticGainControlConfig"];
+    return @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"automaticGainControlConfig", @"vadUseKrisp", @"vadKrispActivationThreshold"];
 }
 static NSDictionary *RYScrubOpts(NSDictionary *o) {
     NSMutableDictionary *m = [o mutableCopy];
-    for (NSString *k in @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation"]) m[k] = @NO;
+    for (NSString *k in @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"vadUseKrisp"]) m[k] = @NO;
+    if (m[@"vadKrispActivationThreshold"]) m[@"vadKrispActivationThreshold"] = @0;
     NSDictionary *a = m[@"automaticGainControlConfig"];
     if ([a isKindOfClass:NSDictionary.class]) {
         NSMutableDictionary *x = [a mutableCopy];
@@ -1235,7 +1240,7 @@ static void RYTransportHook(id self, SEL _cmd, NSDictionary *o) {
     for (Class k = object_getClass(self); k && !orig; k = class_getSuperclass(k)) { NSValue *v = gTOOrig[NSStringFromClass(k)]; if (v) orig = (IMP)[v pointerValue]; }
     NSDictionary *n = o; BOOL has = NO;
     if ([o isKindOfClass:NSDictionary.class]) for (NSString *k in RYVoiceKeys()) if (o[k]) { has = YES; break; }
-    if (has) {
+    if (has && gIsoOn) {
         gTOCalls++; n = RYScrubOpts(o);
         snprintf(gTOLast, sizeof gTOLast, "%s", [[NSString stringWithFormat:@"in: %@", o] UTF8String] ?: "-");
     }
@@ -1268,6 +1273,77 @@ static void RYInstallMic(void) {
     for (NSNumber *sec in @[@2, @6, @15]) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYInstallRB(); RYInstallVoiceHook(); }); // classes may load late
 }
 
+
+
+#pragma mark - Chat text colour (auto contrast with the wallpaper, or a colour the owner picks)
+static CGFloat RYLum(UIColor *c) {
+    CGFloat r = 0, g = 0, b = 0, a = 0; if (![c getRed:&r green:&g blue:&b alpha:&a]) { CGFloat w = 0; [c getWhite:&w alpha:&a]; r = g = b = w; }
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+}
+static CGFloat RYImgLum(UIImage *im) {
+    if (!im.CGImage) return 0; unsigned char px[4] = {0, 0, 0, 255};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGContextRef x = CGBitmapContextCreate(px, 1, 1, 8, 4, cs, kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big); CGColorSpaceRelease(cs);
+    if (!x) return 0; CGContextSetInterpolationQuality(x, kCGInterpolationMedium);
+    CGContextDrawImage(x, CGRectMake(0, 0, 1, 1), im.CGImage); CGContextRelease(x);
+    return 0.2126 * px[0] / 255.0 + 0.7152 * px[1] / 255.0 + 0.0722 * px[2] / 255.0;
+}
+// brightness of what the wallpaper really looks like (after the dim layer), 0 = black, 1 = white
+static CGFloat RYBGLum(void) {
+    NSString *m = CF(@"bgMode", @"none"), *v = CF(@"bgValue", @""); CGFloat l = 0;
+    if ([m isEqual:@"color"]) l = RYLum(RYHex(v));
+    else if ([m isEqual:@"gradient"]) { NSArray *p = [v componentsSeparatedByString:@","]; if (p.count >= 2) l = (RYLum(RYHex(p[0])) + RYLum(RYHex(p[1]))) / 2; }
+    else if ([m isEqual:@"image"]) {
+        static NSInteger cachedStamp = -1; static CGFloat cachedL = 0; static NSString *cachedKey;
+        NSString *path = [RYDir(nil) stringByAppendingPathComponent:@"bg.jpg"];
+        NSDate *mod = [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileModificationDate];
+        NSString *key = [NSString stringWithFormat:@"%f", mod.timeIntervalSince1970];
+        if (!cachedKey || ![cachedKey isEqual:key]) { cachedKey = key; cachedL = RYImgLum([UIImage imageWithContentsOfFile:path]); }
+        (void)cachedStamp; l = cachedL;
+    }
+    CGFloat dim = [CF(@"dim", @30) floatValue] / 100.0 * 0.9;
+    return l * (1 - dim);
+}
+static UIColor *RYTextTarget(void) {
+    NSString *mode = CF(@"txtMode", @"auto");
+    if ([mode isEqual:@"off"]) return nil;
+    if ([mode isEqual:@"custom"]) return RYHex(CF(@"txtColor", @"#FFFFFF"));
+    return RYBGLum() > 0.5 ? UIColor.blackColor : UIColor.whiteColor;
+}
+// only plain/greyish text is recoloured: mentions, links, role colours, red/green etc. keep their own colour
+static BOOL RYIsGreyish(UIColor *c) {
+    if (!c) return YES;
+    UIColor *r = [c resolvedColorWithTraitCollection:[UITraitCollection traitCollectionWithUserInterfaceStyle:UIUserInterfaceStyleDark]];
+    CGFloat h = 0, s = 0, b = 0, a = 0; if (![r getHue:&h saturation:&s brightness:&b alpha:&a]) return YES;
+    return s < 0.22;
+}
+static BOOL RYSameColor(UIColor *a, UIColor *b) {
+    CGFloat r1 = 0, g1 = 0, b1 = 0, a1 = 0, r2 = 0, g2 = 0, b2 = 0, a2 = 0;
+    [[a resolvedColorWithTraitCollection:UITraitCollection.currentTraitCollection] getRed:&r1 green:&g1 blue:&b1 alpha:&a1];
+    [[b resolvedColorWithTraitCollection:UITraitCollection.currentTraitCollection] getRed:&r2 green:&g2 blue:&b2 alpha:&a2];
+    return fabs(r1 - r2) + fabs(g1 - g2) + fabs(b1 - b2) < 0.02;
+}
+static NSAttributedString *RYRecolor(NSAttributedString *in, UIColor *to, BOOL *changed) {
+    NSMutableAttributedString *m = [in mutableCopy]; __block BOOL ch = NO;
+    [in enumerateAttribute:NSForegroundColorAttributeName inRange:NSMakeRange(0, in.length) options:0 usingBlock:^(id val, NSRange rg, BOOL *stop) {
+        if (!RYIsGreyish(val) || (val && RYSameColor(val, to))) return;
+        [m addAttribute:NSForegroundColorAttributeName value:to range:rg]; ch = YES;
+    }];
+    *changed = ch; return m;
+}
+static void RYTintText(UIView *v, UIColor *to, int d) {
+    if (d > 40 || !v || RYSkipClass(v)) return;
+    if (RYIsInputClass(v) || [v isKindOfClass:UIButton.class]) return;
+    if ([v isKindOfClass:UILabel.class]) {
+        UILabel *l = (UILabel *)v;
+        if (l.attributedText.length) { BOOL ch = NO; NSAttributedString *n = RYRecolor(l.attributedText, to, &ch); if (ch) l.attributedText = n; }
+        else if (l.text.length && RYIsGreyish(l.textColor) && !RYSameColor(l.textColor, to)) l.textColor = to;
+    } else if ([v isKindOfClass:UITextView.class]) {
+        UITextView *t = (UITextView *)v;
+        if (t.attributedText.length) { BOOL ch = NO; NSAttributedString *n = RYRecolor(t.attributedText, to, &ch); if (ch) { NSRange sel = t.selectedRange; t.attributedText = n; t.selectedRange = sel; } }
+    }
+    for (UIView *s in v.subviews) RYTintText(s, to, d + 1);
+}
 
 #pragma mark - Discord helpers (chat screen, send button, diagnostics)
 static UIView *RYFindViewNamed(UIView *v, NSString *needle, int d) {
@@ -1764,7 +1840,7 @@ static void RYMsgLoopSet(BOOL on) {
         [b.heightAnchor constraintEqualToConstant:40].active = YES; [sw addObject:b];
     }
     UIButton *custom = RYBtn(T(@"لون مخصص", @"Custom colour"), NO, ^{
-        UIColorPickerViewController *cp = [UIColorPickerViewController new]; cp.delegate = ws; [ws presentViewController:cp animated:YES completion:nil];
+        ws.pickPurpose = nil; UIColorPickerViewController *cp = [UIColorPickerViewController new]; cp.delegate = ws; [ws presentViewController:cp animated:YES completion:nil];
     });
     [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"لون ثابت", @"Solid colour"), 15, UIFontWeightBold, nil), RYGrid(sw, 4), custom])];
 
@@ -1778,8 +1854,15 @@ static void RYMsgLoopSet(BOOL on) {
 
     [self.stack addArrangedSubview:RYSlider(T(@"التمويه (Blur)", @"Blur"), 0, 100, [CF(@"blur", @0) floatValue], ^(float v) { CS(@"blur", @(v)); [[RYCore shared] bump]; })];
     [self.stack addArrangedSubview:RYSlider(T(@"التعتيم (Dim)", @"Dim"), 0, 100, [CF(@"dim", @30) floatValue], ^(float v) { CS(@"dim", @(v)); [[RYCore shared] bump]; })];
+    { NSString *tm = CF(@"txtMode", @"auto");
+      UIButton *tA = RYBtn(T(@"تلقائي", @"Auto"), [tm isEqual:@"auto"], ^{ CS(@"txtMode", @"auto"); [[RYCore shared] bump]; [ws rebuild]; });
+      UIButton *tC = RYBtn(T(@"لون مخصص", @"Custom"), [tm isEqual:@"custom"], ^{
+          ws.pickPurpose = @"txt"; UIColorPickerViewController *cp = [UIColorPickerViewController new]; cp.delegate = ws; cp.supportsAlpha = NO;
+          cp.selectedColor = RYHex(CF(@"txtColor", @"#FFFFFF")); [ws presentViewController:cp animated:YES completion:nil]; });
+      UIButton *tO = RYBtn(T(@"بدون", @"Off"), [tm isEqual:@"off"], ^{ CS(@"txtMode", @"off"); [[RYCore shared] bump]; [ws rebuild]; });
+      [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"لون كلام الناس", @"Message text colour"), 15, UIFontWeightBold, nil), RYHStack(@[tA, tC, tO], 8)])]; }
     [self.stack addArrangedSubview:RYBtn(T(@"رجوع للافتراضي", @"Reset to default"), NO, ^{
-        [ws setBG:@"none" value:@""]; CS(@"blur", @0); CS(@"dim", @30); [ws rebuild]; [ws toast:T(@"تم الرجوع للافتراضي", @"Reset")];
+        [ws setBG:@"none" value:@""]; CS(@"blur", @0); CS(@"dim", @30); CS(@"txtMode", nil); CS(@"txtColor", nil); [ws rebuild]; [ws toast:T(@"تم الرجوع للافتراضي", @"Reset")];
     })];
 }
 - (void)saveBGData:(NSData *)d {
@@ -1812,7 +1895,10 @@ static void RYMsgLoopSet(BOOL on) {
     }
     [r.itemProvider loadDataRepresentationForTypeIdentifier:@"public.image" completionHandler:^(NSData *d, NSError *e) { [ws saveBGData:d]; }];
 }
-- (void)colorPickerViewController:(UIColorPickerViewController *)vc didSelectColor:(UIColor *)color continuously:(BOOL)c { [self setBG:@"color" value:RYHexFrom(color)]; }
+- (void)colorPickerViewController:(UIColorPickerViewController *)vc didSelectColor:(UIColor *)color continuously:(BOOL)c {
+    if ([self.pickPurpose isEqual:@"txt"]) { CS(@"txtColor", RYHexFrom(color)); CS(@"txtMode", @"custom"); [[RYCore shared] bump]; return; }
+    [self setBG:@"color" value:RYHexFrom(color)];
+}
 
 #pragma mark Stereo (play a file through the mic)
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
@@ -1974,6 +2060,9 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 #pragma mark Mic
 - (void)renderMic {
     __weak typeof(self) ws = self;
+    UISwitch *siso = [UISwitch new]; siso.on = gIsoOn != 0; siso.onTintColor = RYAccent(); __weak UISwitch *wsiso = siso;
+    [siso addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetIso(wsiso.on); [ws toast:wsiso.on ? T(@"انطفت العوازل — اقفل الغرفة وارجع لها", @"Isolation off — rejoin the voice room") : T(@"رجعت العوازل", @"Isolation back on")]; }] forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إطفاء كل العوازل", @"Disable all isolation"), 16, UIFontWeightBold, nil), siso], 12)])];
     UISwitch *smute = [UISwitch new]; smute.on = gMicMute != 0; smute.onTintColor = UIColor.systemRedColor; __weak UISwitch *wsmute = smute;
     [smute addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetMute(wsmute.on); [ws rebuild]; }] forControlEvents:UIControlEventValueChanged];
     UIView *muteCard = RYCard(@[RYHStack(@[RYLabel(T(@"سكر صوتي", @"Kill mic"), 16, UIFontWeightBold, gMicMute ? UIColor.systemRedColor : nil), smute], 12),
@@ -2149,6 +2238,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     RYClearBig(host, host, self.bgView, 0);
     RYClearCells(host, 0);
     if (self.bgView.stamp != self.stamp) { [self.bgView apply]; self.bgView.stamp = self.stamp; }
+    UIColor *tc = RYTextTarget(); if (tc) RYTintText(host, tc, 0);
 }
 // code: 0 sent, 1 chat input not found, 2 not sent
 // mode 0 puts the text in without focus; if the app does not accept it (or nothing sends) mode 1 types it for real (app window becomes key).
