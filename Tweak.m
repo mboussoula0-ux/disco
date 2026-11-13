@@ -1131,7 +1131,7 @@ static void RYMicLoad(void) {
       if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
       else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
     gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
-    gIsoOn = [CF(@"isoOn", @NO) boolValue]; gIsoSess = gIsoVP = gIsoRTC = gIsoOn ? 1 : 0; // switch in the Mic tab
+    gIsoOn = [CF(@"isoOn", @YES) boolValue]; gIsoSess = gIsoVP = gIsoRTC = gIsoOn ? 1 : 0; // switch in the Mic tab
 }
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
@@ -1140,9 +1140,10 @@ static void RYMicSetMute(BOOL on) { gMicMute = on; } // not persisted on purpose
 static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); CS(@"revCfgVer", @2); }
 static BOOL RYRevIsDefault(void) { for (int i = 0; i < RV_N; i++) if (fabsf(gRv[i] - kRvDef[i]) > 0.0005f) return NO; return YES; }
 static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"الافتراضي ✓", @"Default ✓") : T(@"معدّل", @"Changed"); }
+static void RYIsoPushNow(void);
 static void RYMicSetIso(BOOL on) {
     gIsoOn = on ? 1 : 0; gIsoSess = gIsoVP = gIsoRTC = gIsoOn; CS(@"isoOn", @(on));
-    if (on) RYIsoApplySession();
+    if (on) { RYIsoApplySession(); RYIsoPushNow(); }
 }
 static void RYIsoSave(void) { CS(@"isoSess", @(gIsoSess != 0)); CS(@"isoVP", @(gIsoVP != 0)); CS(@"isoRTC", @(gIsoRTC != 0)); }
 static void RYMicApplyPreset(int i) {
@@ -1223,6 +1224,7 @@ static NSMutableDictionary<NSString *, NSValue *> *gTOOrig; static volatile int 
 static NSArray<NSString *> *RYVoiceKeys(void) {
     return @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"automaticGainControlConfig", @"vadUseKrisp", @"vadKrispActivationThreshold"];
 }
+static __weak id gVoiceEng;   // the DCDVoiceEngine the app talks to (seen on its first setTransportOptions call)
 static NSDictionary *RYScrubOpts(NSDictionary *o) {
     NSMutableDictionary *m = [o mutableCopy];
     for (NSString *k in @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"vadUseKrisp"]) m[k] = @NO;
@@ -1238,6 +1240,7 @@ static NSDictionary *RYScrubOpts(NSDictionary *o) {
 static void RYTransportHook(id self, SEL _cmd, NSDictionary *o) {
     IMP orig = NULL;
     for (Class k = object_getClass(self); k && !orig; k = class_getSuperclass(k)) { NSValue *v = gTOOrig[NSStringFromClass(k)]; if (v) orig = (IMP)[v pointerValue]; }
+    if ([NSStringFromClass(object_getClass(self)) isEqual:@"DCDVoiceEngine"]) gVoiceEng = self;
     NSDictionary *n = o; BOOL has = NO;
     if ([o isKindOfClass:NSDictionary.class]) for (NSString *k in RYVoiceKeys()) if (o[k]) { has = YES; break; }
     if (has && gIsoOn) {
@@ -1245,6 +1248,40 @@ static void RYTransportHook(id self, SEL _cmd, NSDictionary *o) {
         snprintf(gTOLast, sizeof gTOLast, "%s", [[NSString stringWithFormat:@"in: %@", o] UTF8String] ?: "-");
     }
     if (orig) ((void (*)(id, SEL, NSDictionary *))orig)(self, _cmd, n);
+}
+// per-connection options (this is the call the app really uses for a live voice connection) and the sidechain compressor
+static void (*orig_connTO)(id, SEL, NSUInteger, NSDictionary *);
+static void RYConnTO(id self, SEL _cmd, NSUInteger cid, NSDictionary *o) {
+    NSDictionary *n = o; BOOL has = NO;
+    if ([NSStringFromClass(object_getClass(self)) isEqual:@"DCDVoiceEngine"]) gVoiceEng = self;
+    if ([o isKindOfClass:NSDictionary.class]) for (NSString *k in RYVoiceKeys()) if (o[k]) { has = YES; break; }
+    if (has && gIsoOn) { gTOCalls++; n = RYScrubOpts(o); snprintf(gTOLast, sizeof gTOLast, "%s", [[NSString stringWithFormat:@"conn %lu: %@", (unsigned long)cid, o] UTF8String] ?: "-"); }
+    if (orig_connTO) orig_connTO(self, _cmd, cid, n);
+}
+static void (*orig_sidechain)(id, SEL, BOOL);
+static void RYSidechain(id self, SEL _cmd, BOOL on) {
+    if (gIsoOn && on) { gTOCalls++; on = NO; }
+    if (orig_sidechain) orig_sidechain(self, _cmd, on);
+}
+static void RYIsoPushNow(void) {   // switch turned on while a voice call is running: send the "all off" options straight away
+    id e = gVoiceEng; if (!e) return;
+    SEL mq = NSSelectorFromString(@"methodQueue");
+    dispatch_queue_t q = [e respondsToSelector:mq] ? ((dispatch_queue_t (*)(id, SEL))objc_msgSend)(e, mq) : nil;
+    void (^blk)(void) = ^{
+        id x = gVoiceEng; if (!x) return;
+        NSDictionary *d = @{@"echoCancellation": @NO, @"noiseSuppression": @NO, @"noiseCancellation": @NO, @"noiseCancellationDuringProcessing": @NO, @"automaticGainControl": @NO, @"builtInEchoCancellation": @NO, @"vadUseKrisp": @NO};
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(x, NSSelectorFromString(@"setTransportOptions:"), d);
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(x, NSSelectorFromString(@"setSidechainCompression:"), NO);
+        } @catch (__unused id ex) {}
+    };
+    dispatch_async(q ?: dispatch_get_main_queue(), blk);
+}
+static void RYInstallVoiceHook2(void) {
+    Class c = NSClassFromString(@"DCDVoiceEngine"); if (!c) return;
+    static BOOL a, b;
+    if (!a) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"connectionInstanceSetTransportOptions:options:")); if (m && method_getNumberOfArguments(m) == 4) { orig_connTO = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYConnTO); a = YES; } }
+    if (!b) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"setSidechainCompression:")); if (m && method_getNumberOfArguments(m) == 3) { orig_sidechain = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSidechain); b = YES; } }
 }
 static void RYInstallVoiceHook(void) {
     static dispatch_once_t once; dispatch_once(&once, ^{ gTOOrig = [NSMutableDictionary new]; });
@@ -1262,6 +1299,7 @@ static void RYInstallVoiceHook(void) {
         class_replaceMethod(c, sel, (IMP)RYTransportHook, method_getTypeEncoding(m));
     }
     free(all);
+    RYInstallVoiceHook2();
 }
 
 static void RYInstallRebind(void) {
@@ -1355,91 +1393,121 @@ static void RYTintText(UIView *v, UIColor *to, int d) {
 }
 
 
-#pragma mark - Message logger (private chats): a deleted message stays in the list, in red. Always on, no switch.
+#pragma mark - Message logger (every chat): a message someone deletes stays in the list, in red. Always on, no switch.
 // Hooks DCDChatViewController updateRows:... (the list JS sends to the native chat). Every update is compared with the previous one of the same
-// chat; a message that disappeared from the middle of the list is a deleted one: its row object is kept and put back at its place.
-// Anything unexpected (other row type, other method shape) = the hook just passes the call through untouched.
+// chat; a message that disappeared is a deleted one: its row object is kept and put back at its place.
+// Cheap on purpose: one pass over the rows, selector calls instead of KVC, a small LRU of chats. Anything unexpected = the call passes through untouched.
 static NSMutableDictionary<NSString *, NSDictionary *> *gLogPrev;           // channel -> {id -> row} exactly as JS last sent it
-static NSMutableDictionary<NSString *, NSMutableDictionary *> *gLogDel;     // channel -> {id -> {row, n (id number), prev (number before it, tail case)}}
+static NSMutableDictionary<NSString *, NSMutableDictionary *> *gLogDel;     // channel -> {id -> {row, n (id number), before, after}}
+static NSMutableDictionary<NSString *, NSNumber *> *gLogAsc;                // channel -> list order seen (YES = oldest first)
+static NSMutableArray<NSString *> *gLogChans;                               // channels, least recently used first (max 12 kept)
 static NSMutableSet<NSString *> *gLogIds;                                   // ids of the kept messages (cells use it to paint red)
+static volatile int gLogUpd = 0, gLogKept = 0, gLogPut = 0, gLogSkip = 0; static char gLogLast[200] = "-";
 static void (*orig_updRows)(id, SEL, NSArray *, BOOL, id, id, BOOL, BOOL, BOOL);
 static void (*orig_cellCfg)(id, SEL, id, id, id);
+static SEL sLMsg, sLId, sLChan, sLNonce, sLInv;
 #define RY_RED [UIColor colorWithRed:1.0 green:0.27 blue:0.27 alpha:1]
 static id RYKV(id o, NSString *k) { if (!o) return nil; @try { return [o valueForKey:k]; } @catch (__unused id e) { return nil; } }
 static NSString *RYStr(id v) {
     if (!v || v == NSNull.null) return nil;
     NSString *s = [v isKindOfClass:NSString.class] ? v : [v description]; return s.length ? s : nil;
 }
+static void RYLogInit(void) {
+    static dispatch_once_t once; dispatch_once(&once, ^{
+        sLMsg = NSSelectorFromString(@"message"); sLId = NSSelectorFromString(@"id"); sLChan = NSSelectorFromString(@"channelID");
+        sLNonce = NSSelectorFromString(@"nonce"); sLInv = NSSelectorFromString(@"inverted");
+        gLogPrev = [NSMutableDictionary new]; gLogDel = [NSMutableDictionary new]; gLogAsc = [NSMutableDictionary new];
+        gLogChans = [NSMutableArray new]; gLogIds = [NSMutableSet new];
+    });
+}
+static id RYGet(id o, SEL s) { return (o && s && [o respondsToSelector:s]) ? ((id (*)(id, SEL))objc_msgSend)(o, s) : nil; }
 static id RYRowMsg(id row) {
     static Class mc; static dispatch_once_t once; dispatch_once(&once, ^{ mc = NSClassFromString(@"DCDMessageModel"); });
-    if (!row || !mc || ![row respondsToSelector:@selector(message)]) return nil;
-    id m = RYKV(row, @"message"); return (m && [m isKindOfClass:mc]) ? m : nil;
+    if (!row || !mc) return nil;
+    if (!sLMsg) sLMsg = NSSelectorFromString(@"message");
+    id m = RYGet(row, sLMsg); return (m && [m isKindOfClass:mc]) ? m : nil;
 }
 static unsigned long long RYNum(NSString *s) { return s.length ? strtoull(s.UTF8String, NULL, 10) : 0; }
-static BOOL RYIsPending(id m, NSString *mid) { NSString *n = RYStr(RYKV(m, @"nonce")); return n && [n isEqual:mid]; } // a message still being sent has id == nonce
+static BOOL RYIsPending(id m, NSString *mid) { NSString *n = RYStr(RYGet(m, sLNonce)); return n && [n isEqual:mid]; } // a message still being sent has id == nonce
 static void RYPaintRow(id m) { @try { [m setValue:RY_RED forKey:@"textColor"]; } @catch (__unused id e) {} }
+static NSString *RYLoggerStatus(void) {
+    return [NSString stringWithFormat:T(@"المسجّل: تحديثات %d، محفوظة %d، معادة %d", @"Logger: updates %d, kept %d, restored %d"), gLogUpd, gLogKept, gLogPut];
+}
 
 static void RYUpdRows(id self, SEL _cmd, NSArray *rows, BOOL top, id sc, id cs, BOOL hack, BOOL force, BOOL anim) {
     NSArray *use = rows; BOOL reload = NO;
     @try {
         if ([rows isKindOfClass:NSArray.class] && rows.count) {
-            if (!gLogPrev) { gLogPrev = [NSMutableDictionary new]; gLogDel = [NSMutableDictionary new]; gLogIds = [NSMutableSet new]; }
-            static BOOL logged; if (!logged) { logged = YES; RYLog(@"logger: first update, rows=%lu first=%@ msg=%@", (unsigned long)rows.count, NSStringFromClass([rows.firstObject class]), RYRowMsg(rows.firstObject) ? @"yes" : @"no"); }
-            // 1. what JS sent now: message rows with their id numbers, in list order
-            NSMutableArray *ids = [NSMutableArray new]; NSMutableArray *nums = [NSMutableArray new]; NSMutableDictionary *cur = [NSMutableDictionary new];
-            NSString *chan = nil; BOOL dm = NO;
+            RYLogInit(); gLogUpd++;
+            // 1. what JS sent now: message rows with their ids, in list order
+            NSString *chan = nil; NSMutableArray<NSString *> *ids = [NSMutableArray new]; NSMutableDictionary *cur = [NSMutableDictionary new];
             for (id row in rows) {
                 id m = RYRowMsg(row); if (!m) continue;
-                NSString *mid = RYStr(RYKV(m, @"id")); if (!mid) continue;
-                if (!chan) { chan = RYStr(RYKV(m, @"channelID")); NSString *g = RYStr(RYKV(m, @"guildID")); dm = (!g || [g isEqual:@"0"]); }
-                [ids addObject:mid]; [nums addObject:@(RYNum(mid))]; cur[mid] = row;
+                NSString *mid = RYStr(RYGet(m, sLId)); if (!mid) continue;
+                if (!chan) chan = RYStr(RYGet(m, sLChan));
+                [ids addObject:mid]; cur[mid] = row;
             }
-            // Private chats only — this is the whole feature's scope. For every other channel type we do
-            // none of the bookkeeping below at all (no dictionaries built or kept per channel), which is
-            // also what was making every chat slow/unstable to open before: this logger was doing full
-            // dictionary/array work on EVERY channel's EVERY update, not just DMs.
-            if (chan && ids.count && dm) {
-                unsigned long long mn = ULLONG_MAX, mx = 0; for (NSNumber *n in nums) { mn = MIN(mn, n.unsignedLongLongValue); mx = MAX(mx, n.unsignedLongLongValue); }
+            static BOOL logged; if (!logged) { logged = YES; RYLog(@"logger: first update, rows=%lu first=%@ msgRows=%lu chan=%@", (unsigned long)rows.count, NSStringFromClass([rows.firstObject class]), (unsigned long)ids.count, chan); }
+            if (chan && ids.count) @synchronized (gLogDel) {
+                unsigned long long mn = ULLONG_MAX, mx = 0;
+                for (NSString *k in ids) { unsigned long long v = RYNum(k); if (v < mn) mn = v; if (v > mx) mx = v; }
+                // small LRU of chats
+                [gLogChans removeObject:chan]; [gLogChans addObject:chan];
+                while (gLogChans.count > 12) {
+                    NSString *old = gLogChans.firstObject; for (NSString *q in gLogDel[old]) [gLogIds removeObject:q];
+                    [gLogDel removeObjectForKey:old]; [gLogPrev removeObjectForKey:old]; [gLogAsc removeObjectForKey:old]; [gLogChans removeObjectAtIndex:0];
+                }
                 NSMutableDictionary *del = gLogDel[chan]; if (!del) { del = [NSMutableDictionary new]; gLogDel[chan] = del; }
+                // list order: oldest first (asc) or newest first
+                BOOL asc;
+                if (ids.count >= 2 && RYNum(ids.firstObject) != RYNum(ids.lastObject)) { asc = RYNum(ids.firstObject) < RYNum(ids.lastObject); gLogAsc[chan] = @(asc); }
+                else if (gLogAsc[chan]) asc = [gLogAsc[chan] boolValue];
+                else { BOOL inv = NO; if ([self respondsToSelector:sLInv]) inv = ((BOOL (*)(id, SEL))objc_msgSend)(self, sLInv); asc = !inv; }
                 // 2. messages that were in the last list and are gone now
                 NSDictionary *prev = gLogPrev[chan];
                 if (prev.count) {
-                    NSMutableArray<NSNumber *> *pn = [NSMutableArray new]; for (NSString *k in prev) [pn addObject:@(RYNum(k))];
-                    [pn sortUsingSelector:@selector(compare:)];
-                    for (NSString *k in prev) {
-                        if (cur[k] || del[k]) continue;
-                        id row = prev[k]; id m = RYRowMsg(row); if (!m || RYIsPending(m, k)) continue;
-                        unsigned long long n = RYNum(k); unsigned long long before = 0;
-                        for (NSNumber *x in pn) if (x.unsignedLongLongValue < n) before = x.unsignedLongLongValue;
+                    NSUInteger added = 0; for (NSString *k in ids) if (!prev[k]) added++;
+                    NSMutableArray<NSString *> *missing = [NSMutableArray new];
+                    for (NSString *k in prev) if (!cur[k] && !del[k]) [missing addObject:k];
+                    // nothing new arrived and only a few rows vanished = a plain removal, wherever it is in the list
+                    BOOL pure = (added == 0 && missing.count <= 3 && prev.count >= 3);
+                    for (NSString *k in missing) {
+                        id row = prev[k]; id m = RYRowMsg(row);
+                        if (!m || RYIsPending(m, k)) { gLogSkip++; continue; }
+                        unsigned long long n = RYNum(k), before = 0, after = 0;
+                        for (NSString *q in prev) { unsigned long long v = RYNum(q); if (v < n && v > before) before = v; if (v > n && (!after || v < after)) after = v; }
                         BOOL inside = n > mn && n < mx;
-                        BOOL tail = n > mx && before == mx && n == pn.lastObject.unsignedLongLongValue; // the newest message was deleted
-                        if (!inside && !tail) continue;
-                        del[k] = @{@"row": row, @"n": @(n), @"prev": @(before), @"tail": @(tail)};
-                        [gLogIds addObject:k]; RYPaintRow(m);
-                        if (del.count > 200) { NSString *oldest = nil; unsigned long long best = ULLONG_MAX; for (NSString *q in del) { unsigned long long v = RYNum(q); if (v < best) { best = v; oldest = q; } } if (oldest) { [del removeObjectForKey:oldest]; [gLogIds removeObject:oldest]; } }
+                        BOOL tail = n > mx && before == mx;   // the newest message was deleted
+                        if (!(pure || inside || tail)) { gLogSkip++; continue; }
+                        del[k] = @{@"row": row, @"n": @(n), @"before": @(before), @"after": @(after)};
+                        [gLogIds addObject:k]; RYPaintRow(m); gLogKept++;
+                        const char *rule = pure ? "removed" : inside ? "inside" : "tail";
+                        snprintf(gLogLast, sizeof gLogLast, "kept %s rule=%s chan=%s", k.UTF8String, rule, chan.UTF8String);
+                        RYLog(@"logger: kept %@ (chan %@, %s)", k, chan, rule);
+                        if (del.count > 300) { NSString *oldest = nil; unsigned long long best = ULLONG_MAX; for (NSString *q in del) { unsigned long long v = RYNum(q); if (v < best) { best = v; oldest = q; } } if (oldest) { [del removeObjectForKey:oldest]; [gLogIds removeObject:oldest]; } }
                     }
                 }
                 // 3. a kept message that JS sends again is not deleted after all
                 for (NSString *k in [del allKeys]) if (cur[k]) { [del removeObjectForKey:k]; [gLogIds removeObject:k]; }
                 gLogPrev[chan] = cur;
                 // 4. put the kept messages back at their place
-                if (del.count && ids.count >= 2) {
-                    BOOL asc = [nums[0] unsignedLongLongValue] < [nums[1] unsignedLongLongValue];
-                    NSMutableArray *out = [rows mutableCopy];
+                if (del.count) {
+                    NSMutableArray *out = nil;
                     NSArray *keys = [del.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) { unsigned long long x = RYNum(a), y = RYNum(b); return x < y ? NSOrderedAscending : x > y ? NSOrderedDescending : NSOrderedSame; }];
                     for (NSString *k in keys) {
-                        NSDictionary *r = del[k]; unsigned long long n = [r[@"n"] unsignedLongLongValue];
-                        BOOL ok = (n > mn && n < mx) || ([r[@"tail"] boolValue] && [r[@"prev"] unsignedLongLongValue] == mx && n > mx);
+                        NSDictionary *r = del[k]; unsigned long long n = [r[@"n"] unsignedLongLongValue], before = [r[@"before"] unsignedLongLongValue], after = [r[@"after"] unsignedLongLongValue];
+                        BOOL ok = (n > mn && n < mx) || (n > mx && before == mx) || (n < mn && after == mn);
                         if (!ok) continue;
+                        if (!out) out = [rows mutableCopy];
                         id m = RYRowMsg(r[@"row"]); RYPaintRow(m);
                         NSInteger at = -1, lastMsg = -1;
                         for (NSUInteger i = 0; i < out.count; i++) {
                             id mm = RYRowMsg(out[i]); if (!mm) continue; lastMsg = (NSInteger)i;
-                            unsigned long long q = RYNum(RYStr(RYKV(mm, @"id")));
+                            unsigned long long q = RYNum(RYStr(RYGet(mm, sLId)));
                             if (asc ? q > n : q < n) { at = (NSInteger)i; break; }
                         }
                         if (at < 0) at = lastMsg + 1;
-                        [out insertObject:r[@"row"] atIndex:(NSUInteger)at]; reload = YES;
+                        [out insertObject:r[@"row"] atIndex:(NSUInteger)at]; gLogPut++; reload = YES;
                     }
                     if (reload) use = out;
                 }
@@ -1448,7 +1516,7 @@ static void RYUpdRows(id self, SEL _cmd, NSArray *rows, BOOL top, id sc, id cs, 
         // chat text colour straight on the message models (wallpaper contrast / chosen colour); kept messages stay red
         if (gBgActive) {
             UIColor *tc = RYTextTarget();
-            if (tc) for (id row in use) { id m = RYRowMsg(row); NSString *mid = m ? RYStr(RYKV(m, @"id")) : nil; if (m && !(mid && [gLogIds containsObject:mid])) { @try { [m setValue:tc forKey:@"textColor"]; } @catch (__unused id e) {} } }
+            if (tc) for (id row in use) { id m = RYRowMsg(row); NSString *mid = m ? RYStr(RYGet(m, sLId)) : nil; if (m && !(mid && [gLogIds containsObject:mid])) { @try { [m setValue:tc forKey:@"textColor"]; } @catch (__unused id e) {} } }
         }
     } @catch (NSException *e) { RYLog(@"logger: error %@", e); use = rows; reload = NO; }
     // a list with put-back rows is reloaded in one go (no incremental row diff against the list the app expects) = no crash
@@ -1805,6 +1873,8 @@ static NSString *RYDiagReport(void) {
     [o appendString:@"\n== voice engine\n"]; [o appendString:RYDiagVoice()];
     [o appendString:@"\n== mic\n"]; [o appendString:RYMicReport()];
     [o appendString:@"\n== screen share\n"]; [o appendString:RYDiagBroadcast()];
+    [o appendFormat:@"\n== message logger\nupdates %d  kept %d  restored %d  skipped %d\nlast: %s\nvoice options last: %s (calls %d)\n", gLogUpd, gLogKept, gLogPut, gLogSkip, gLogLast, gTOLast, gTOCalls];
+    { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
     return o;
 }
 static void RYShareText(UIViewController *from, NSString *name, NSString *text) {
@@ -2309,7 +2379,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     self.invLabel = RYLabel(RYMicStatus2(), 13, UIFontWeightMedium, RY_MUTED);
     [self.stack addArrangedSubview:RYCard(@[self.invLabel])];
     [self.invUI invalidate];
-    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = [NSString stringWithFormat:@"%@\n%@ %d", RYMicStatus2(), T(@"محرك الصوت: تعديلات", @"Voice engine: patched"), gTOCalls]; }];
+    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = [NSString stringWithFormat:@"%@\n%@ %d\n%@", RYMicStatus2(), T(@"محرك الصوت: تعديلات", @"Voice engine: patched"), gTOCalls, RYLoggerStatus()]; }];
 }
 @end
 
