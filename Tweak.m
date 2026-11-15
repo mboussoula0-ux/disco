@@ -107,9 +107,10 @@
 // 6d. CHAT TEXT COLOUR: only the colour the owner picks (txtMode == "custom", txtColor). There is NO automatic contrast / wallpaper luminance / username-colour copy
 //   any more (it made white-on-white text). RYTextTarget() returns nil unless custom; do not add an automatic mode back unless the owner asks.
 //
-// 6e. EQUALIZER (tab "Isolation" / "عوازل"): 10 peaking bands (RBJ biquads, Q 1.1) on the real mic voice, inside RYVoiceBlock after the other effects
-//   (RYEqPrep / RYEqRun, soft limiter at 0.8). Part of RY_FX_ON (gEqOn). Defaults = kEqF / kEqG = the owner's screenshot of the PC equalizer. Settings: eqOn, eqF[10],
-//   eqG[10], eqPre. The graph is RYEQView (UIControl: drag a dot = frequency + gain, between its neighbours). Off until the owner switches it on.
+// 6e. EQUALIZER + STUDIO (tab "Isolation" / "عوازل"): 10 bands (RBJ biquads: peaking / low shelf / high shelf, per-band Q) on the real mic voice, inside RYVoiceBlock after the other effects
+//   (RYEqPrep / RYEqRun, soft limiter at 0.8). Part of RY_FX_ON (gEqOn). Default = Flat (all dots at 0 dB, eq off); built-in presets kEqPresets (incl. "rayan" = the owner's PC screenshot), user presets CF eqUser, favourites eqFav (9), import of a SteelSeries Sonar link (RYEqImportLink, tolerant JSON parse: ASSUMED format).
+//   Studio chain (RYStudioIn before the pitch stage, RYComp after the EQ): Clearcast-style expander, background / impact reduction, noise gate (fixed or auto), compressor. A time-domain approximation, not a neural net. Settings: eqOn, eqF/eqG/eqQ/eqT, eqPre, ncOn... compLvl.
+//   The graph is RYEQView (UIControl): dots move ONLY in edit mode (button "Edit"); edit mode freezes the panel scroll view and the sheet (RYPanel applyEditLock) because they stole the touch. UNTESTED on device.
 //
 // 7. CODE MAP (search the #pragma mark lines)
 //   Config/storage (CF/CS, RYDir = Documents/8ubah), language T(ar,en), UI helpers (RYCard/RYBtn/...), view discovery (RYFindVC, RYAppWindows),
@@ -766,12 +767,30 @@ static volatile float gMicSemi = 0, gMicEcho = 0, gMicGain = 1;
 // ---- Equalizer (tab "Isolation"): 10 peaking bands on YOUR real mic voice. Defaults = the owner's screenshot of the PC equalizer
 // (frequency in Hz / gain in dB read off the picture). Off until the owner switches it on; then it is part of the mic chain (RY_FX_ON).
 #define RYEQ_N 10
-static const float kEqF[RYEQ_N] = {30.f, 90.f, 300.f, 500.f, 1000.f, 2000.f, 4000.f, 12000.f, 13600.f, 17400.f};
-static const float kEqG[RYEQ_N] = {-1.5f, 9.1f, -1.3f, 0.f, -2.8f, 3.0f, 4.0f, 12.0f, 3.3f, 4.0f};
+// band type: 0 = peaking, 1 = low shelf, 2 = high shelf. Default (and "Flat" preset) = every dot at 0 dB.
+static const float kEqF[RYEQ_N] = {31.f, 62.f, 125.f, 250.f, 500.f, 1000.f, 2000.f, 4000.f, 8000.f, 16000.f};
+static const float kEqG[RYEQ_N] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static volatile int gEqOn = 0, gEqVer = 1;
-static volatile float gEqF[RYEQ_N] = {30.f, 90.f, 300.f, 500.f, 1000.f, 2000.f, 4000.f, 12000.f, 13600.f, 17400.f};
-static volatile float gEqG[RYEQ_N] = {-1.5f, 9.1f, -1.3f, 0.f, -2.8f, 3.0f, 4.0f, 12.0f, 3.3f, 4.0f};
+static volatile float gEqF[RYEQ_N] = {31.f, 62.f, 125.f, 250.f, 500.f, 1000.f, 2000.f, 4000.f, 8000.f, 16000.f};
+static volatile float gEqG[RYEQ_N] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+static volatile float gEqQ[RYEQ_N] = {1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f};
+static volatile int gEqT[RYEQ_N] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 static volatile float gEqPre = 0;
+// studio chain (tab "Isolation"): Clearcast-style noise suppression, noise reduction (background / impact), noise gate, compressor. All off by default.
+static volatile int gNcOn = 0, gNrBgOn = 0, gNrImpOn = 0, gGateOn = 0, gGateAuto = 0, gCompOn = 0;
+static volatile float gNcAmt = 0.2f, gNrBg = 0.f, gNrImp = 0.f, gGateThr = -56.3f, gCompLvl = 1.f;
+#define RY_STUDIO (gNcOn || gNrBgOn || gNrImpOn || gGateOn || gCompOn)
+// built-in presets (name, 10 x freq, 10 x gain dB, 10 x Q, 10 x type)
+typedef struct { const char *name; float f[RYEQ_N], g[RYEQ_N], q[RYEQ_N]; int t[RYEQ_N]; } RYEqPreset;
+static const RYEqPreset kEqPresets[] = {
+    {"Flat",          {31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, {1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {"rayan",         {30, 90, 300, 500, 1000, 2000, 4000, 12000, 13600, 17400}, {-1.5f, 9.1f, -1.3f, 0, -2.8f, 3.0f, 4.0f, 12.0f, 3.3f, 4.0f}, {1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f, 1.1f}, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+    {"Studio Vocal",  {80, 160, 300, 500, 1000, 2000, 3500, 6000, 10000, 14000}, {-6.f, -1.5f, -2.0f, -1.0f, 0, 1.5f, 3.0f, 1.5f, 1.5f, 2.0f}, {0.7f, 1.0f, 1.2f, 1.0f, 1.0f, 1.0f, 1.2f, 1.0f, 1.0f, 0.7f}, {1, 0, 0, 0, 0, 0, 0, 0, 0, 2}},
+    {"Broadcast",     {70, 120, 220, 400, 800, 1600, 3000, 5000, 9000, 14000}, {-5.f, 2.5f, 1.5f, -2.0f, 0, 1.0f, 2.5f, 1.0f, -1.0f, 1.5f}, {0.7f, 1.0f, 1.0f, 1.2f, 1.0f, 1.0f, 1.1f, 1.0f, 1.0f, 0.7f}, {1, 0, 0, 0, 0, 0, 0, 0, 0, 2}},
+    {"Crystal Clear", {60, 120, 250, 500, 1000, 2000, 3500, 6000, 10000, 15000}, {-6.f, -2.0f, -1.5f, -2.0f, 0, 2.0f, 3.5f, 2.5f, 2.0f, 3.0f}, {0.7f, 1.0f, 1.2f, 1.0f, 1.0f, 1.0f, 1.2f, 1.0f, 1.0f, 0.7f}, {1, 0, 0, 0, 0, 0, 0, 0, 0, 2}},
+    {"Deep Voice",    {60, 100, 160, 300, 600, 1200, 2400, 4800, 9000, 14000}, {2.0f, 4.5f, 3.0f, 0.5f, -1.0f, -1.0f, 0.5f, 1.0f, 0, 0}, {0.7f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.7f}, {1, 0, 0, 0, 0, 0, 0, 0, 0, 2}},
+};
+#define RY_NEQP ((int)(sizeof(kEqPresets) / sizeof(kEqPresets[0])))
 static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
 static volatile int gMicDist = 0, gMicRev = 0, gMonOn = 0;
@@ -848,7 +867,7 @@ static void RYStDecode(NSURL *u, void (^done)(BOOL ok, NSString *msg)) {
     });
 }
 
-#define RY_FX_ON (RYFeatureOK("fx") && (gMicOn || gMicDist || gMicRev || gMicMute || gStOn || gEqOn))   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
+#define RY_FX_ON (RYFeatureOK("fx") && (gMicOn || gMicDist || gMicRev || gMicMute || gStOn || gEqOn || RY_STUDIO))   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
 enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
 static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
 static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
@@ -864,6 +883,7 @@ typedef struct {
     float pre[16384]; unsigned pw; float er[8192]; unsigned erw;      // pre-delay + early reflections
     float rlc, elp, olp, blp, lfo;                                    // reverb filters + modulation
     int eqVer; double eqSr; float eqc[RYEQ_N][5]; float eqz[RYEQ_N][2]; unsigned char eqAct[RYEQ_N];   // equalizer: coefficients (b0 b1 b2 a1 a2) + state per band
+    float stEnv, stFloor, stGate, stOpen, stFast, stSlow, stHx, stCe, stInit;   // studio chain state
 } RYVS;
 static RYVS gVS[3]; // 0 = AudioUnitRender, 1 = AUAudioUnit block, 2 = AVAudioEngine tap (separate state: they may run at the same time)
 
@@ -924,14 +944,23 @@ static inline float RYRev(float x, RYVS *s, const RYRevC *c) {
 }
 // Equalizer. Coefficients are rebuilt only when the owner changes something (gEqVer) or the capture sample rate changes. A band above 45% of the sample
 // rate (e.g. 17 kHz when the phone captures at 16 kHz) is skipped. After the bands a soft limiter (knee at 0.8) keeps +12 dB boosts from clipping.
+// RBJ biquad for one band: type 0 peaking, 1 low shelf, 2 high shelf. o = {b0, b1, b2, a1, a2} already divided by a0. Returns NO when the band does nothing.
+static BOOL RYEqCoef(int t, float f, float g, float q, double sr, double *o) {
+    if (fabsf(g) < 0.05f || f < 15.f || f > 0.45f * (float)sr) return NO;
+    if (q < 0.2f) q = 0.2f; if (q > 10.f) q = 10.f;
+    double A = pow(10.0, g / 40.0), w0 = 2.0 * M_PI * f / sr, cw = cos(w0), al = sin(w0) / (2.0 * q), b0, b1, b2, a0, a1, a2;
+    if (t == 1 || t == 2) {
+        double sq = 2.0 * sqrt(A) * al;
+        if (t == 1) { b0 = A * ((A + 1) - (A - 1) * cw + sq); b1 = 2 * A * ((A - 1) - (A + 1) * cw); b2 = A * ((A + 1) - (A - 1) * cw - sq); a0 = (A + 1) + (A - 1) * cw + sq; a1 = -2 * ((A - 1) + (A + 1) * cw); a2 = (A + 1) + (A - 1) * cw - sq; }
+        else        { b0 = A * ((A + 1) + (A - 1) * cw + sq); b1 = -2 * A * ((A - 1) + (A + 1) * cw); b2 = A * ((A + 1) + (A - 1) * cw - sq); a0 = (A + 1) - (A - 1) * cw + sq; a1 = 2 * ((A - 1) - (A + 1) * cw); a2 = (A + 1) - (A - 1) * cw - sq; }
+    } else { b0 = 1 + al * A; b1 = -2 * cw; b2 = 1 - al * A; a0 = 1 + al / A; a1 = -2 * cw; a2 = 1 - al / A; }
+    o[0] = b0 / a0; o[1] = b1 / a0; o[2] = b2 / a0; o[3] = a1 / a0; o[4] = a2 / a0; return YES;
+}
 static void RYEqPrep(RYVS *s, double sr) {
     if (s->eqVer == gEqVer && s->eqSr == sr) return;
     for (int b = 0; b < RYEQ_N; b++) {
-        float f = gEqF[b], g = gEqG[b]; s->eqAct[b] = 0;
-        if (fabsf(g) < 0.05f || f < 15.f || f > 0.45f * (float)sr) continue;
-        double A = pow(10.0, g / 40.0), w0 = 2.0 * M_PI * f / sr, al = sin(w0) / (2.0 * 1.1), cw = cos(w0);
-        double b0 = 1 + al * A, b1 = -2 * cw, b2 = 1 - al * A, a0 = 1 + al / A, a1 = -2 * cw, a2 = 1 - al / A;
-        s->eqc[b][0] = (float)(b0 / a0); s->eqc[b][1] = (float)(b1 / a0); s->eqc[b][2] = (float)(b2 / a0); s->eqc[b][3] = (float)(a1 / a0); s->eqc[b][4] = (float)(a2 / a0); s->eqAct[b] = 1;
+        double o[5]; s->eqAct[b] = 0;
+        if (RYEqCoef(gEqT[b], gEqF[b], gEqG[b], gEqQ[b], sr, o)) { for (int k = 0; k < 5; k++) s->eqc[b][k] = (float)o[k]; s->eqAct[b] = 1; }
     }
     s->eqVer = gEqVer; s->eqSr = sr;
 }
@@ -944,6 +973,47 @@ static inline float RYEqRun(float x, RYVS *s, float pre) {
     float a = fabsf(y); if (a > 0.8f) y = copysignf(0.8f + 0.2f * tanhf((a - 0.8f) / 0.2f), y);
     return y;
 }
+// Studio chain. Everything works from a peak envelope of the raw voice and a tracked noise floor (falls fast, rises over ~6 s), so it needs no calibration.
+//  noise cancellation / background reduction: downward expander relative to the floor (+ a gentle low cut); impact: clamps very fast transients; gate: hysteresis gate (fixed or auto = floor x 3).
+//  This is a time-domain approximation of Clearcast, not a neural network: it removes noise in the pauses, it does not separate noise from the voice while you talk.
+typedef struct { float rEnv, rFast, aSlow, aG, rG, rise, fall, hp, aC, rC, gateLin; } RYStC;
+static void RYStPrep(RYStC *c, double sr) {
+    const float r = (float)sr;
+    c->rEnv = expf(-1.f / (0.03f * r)); c->rFast = expf(-1.f / (0.003f * r)); c->aSlow = 1.f - expf(-1.f / (0.06f * r));
+    c->aG = 1.f - expf(-1.f / (0.003f * r)); c->rG = 1.f - expf(-1.f / (0.08f * r));
+    c->rise = 1.f / (6.f * r); c->fall = 1.f - expf(-1.f / (0.02f * r)); c->hp = 1.f - expf(-6.2831853f * 70.f / r);
+    c->aC = 1.f - expf(-1.f / (0.005f * r)); c->rC = 1.f - expf(-1.f / (0.12f * r)); c->gateLin = powf(10.f, gGateThr / 20.f);
+}
+static inline float RYStudioIn(float x, RYVS *s, const RYStC *c) {
+    float a = fabsf(x);
+    s->stEnv = a > s->stEnv ? a : s->stEnv * c->rEnv; const float env = s->stEnv;
+    if (s->stInit < 0.5f) { s->stFloor = fmaxf(env, 1e-3f); s->stInit = 1.f; }
+    s->stFloor += (env - s->stFloor) * (env < s->stFloor ? c->fall : c->rise);
+    if (s->stFloor < 1e-5f) s->stFloor = 1e-5f;
+    float g = 1.f;
+    if (gNcOn || gNrBgOn) {
+        float amt = gNcOn ? gNcAmt : gNrBg, k = gNcOn ? 2.f + 5.f * amt : 1.5f + 3.f * amt, p = gNcOn ? 1.f + 2.f * amt : 1.f;
+        float r = env / (s->stFloor * k); if (r < 1.f) g *= powf(fmaxf(r, 1e-3f), p);
+        s->stHx += c->hp * (x - s->stHx); x -= s->stHx * (0.4f + 0.6f * amt);
+    }
+    if (gNrImpOn && !gNcOn) {
+        s->stFast = a > s->stFast ? a : s->stFast * c->rFast; s->stSlow += (a - s->stSlow) * c->aSlow;
+        float allowed = 3.f + 6.f * (1.f - gNrImp), rr = s->stFast / (s->stSlow + 1e-5f); if (rr > allowed) g *= allowed / rr;
+    }
+    if (gGateOn) {
+        float thr = gGateAuto ? s->stFloor * 3.f : c->gateLin;
+        if (env > thr) s->stOpen = 1.f; else if (env < thr * 0.7f) s->stOpen = 0.f;
+        g *= s->stOpen > 0.5f ? 1.f : 0.f;
+    }
+    s->stGate += (g - s->stGate) * (g > s->stGate ? c->aG : c->rG);
+    return x * s->stGate;
+}
+static inline float RYComp(float x, RYVS *s, const RYStC *c) {
+    float a = fabsf(x); s->stCe += (a - s->stCe) * (a > s->stCe ? c->aC : c->rC);
+    float db = 20.f * log10f(fmaxf(s->stCe, 1e-6f)), thr = -20.f, ratio = 1.f + 3.f * gCompLvl, red = db > thr ? (db - thr) * (1.f - 1.f / ratio) : 0.f;
+    float gdb = 0.4f * (-thr) * (1.f - 1.f / ratio) - red;   // makeup = 40% of the maximum reduction
+    return x * exp2f(gdb * 0.16609640f);
+}
 // pitch shift = two read taps on a delay line that slides at (1 - ratio) samples per sample, cross-faded with a Hann window
 static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; s->d1 = (float)(0.016 * sr); }
@@ -954,10 +1024,11 @@ static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     const float dd = 1.f - powf(2.f, semi / 12.f);
     const BOOL pitch = fabsf(semi) > 0.05f;
     const int eqOn = gEqOn; const float eqPre = powf(10.f, gEqPre / 20.f); if (eqOn) RYEqPrep(s, sr);
+    const int studio = RY_STUDIO, compOn = studio && gCompOn; RYStC sc; if (studio) RYStPrep(&sc, sr);
     int ed = (int)(0.27 * sr); if (ed >= RYM_ECHO) ed = RYM_ECHO - 1;
     const float rph = (float)(2.0 * M_PI * 70.0 / sr);
     for (int i = 0; i < n; i++) {
-        float in = x[i] * gain, y = in;
+        float in = x[i] * gain; if (studio) in = RYStudioIn(in, s, &sc); float y = in;
         if (pitch) {
             s->hist[s->w & (RYM_BUF - 1)] = in;
             float acc = 0; float *dk[2] = { &s->d0, &s->d1 };
@@ -975,6 +1046,7 @@ static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
         if (revOn) y = RYRev(y, s, &rc);
         if (echo > 0.01f) { float e = s->eb[(s->ew - (unsigned)ed) & (RYM_ECHO - 1)]; s->eb[s->ew & (RYM_ECHO - 1)] = y + e * 0.4f; s->ew++; y += e * echo; }
         if (eqOn) y = RYEqRun(y, s, eqPre);
+        if (compOn) y = RYComp(y, s, &sc);
         if (y > 1.f) y = 1.f; else if (y < -1.f) y = -1.f;
         x[i] = y;
     }
@@ -1306,18 +1378,137 @@ static void RYMicLoad(void) {
     gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
     gIsoOn = [CF(@"isoOn", @YES) boolValue]; gIsoVP = gIsoOn ? 1 : 0; gIsoSess = gIsoRTC = 0; // switch in the Mic tab. Session-mode override + RTC constraints are never used (they can stop a voice join)
     gEqOn = [CF(@"eqOn", @NO) boolValue]; gEqPre = [CF(@"eqPre", @0) floatValue];
-    { NSArray *ef = CF(@"eqF", nil), *eg = CF(@"eqG", nil);
-      BOOL ok = [ef isKindOfClass:NSArray.class] && [eg isKindOfClass:NSArray.class] && ef.count == RYEQ_N && eg.count == RYEQ_N;
-      for (int i = 0; i < RYEQ_N; i++) { gEqF[i] = ok ? [ef[i] floatValue] : kEqF[i]; gEqG[i] = ok ? [eg[i] floatValue] : kEqG[i]; }
+    { NSArray *ef = CF(@"eqF", nil), *eg = CF(@"eqG", nil), *eq = CF(@"eqQ", nil), *et = CF(@"eqT", nil);
+      BOOL ok = [CF(@"eqCfgVer", @0) intValue] == 2 && [ef isKindOfClass:NSArray.class] && [eg isKindOfClass:NSArray.class] && ef.count == RYEQ_N && eg.count == RYEQ_N;   // older saved curves (version < 2) restart from Flat
+      BOOL okq = ok && [eq isKindOfClass:NSArray.class] && eq.count == RYEQ_N && [et isKindOfClass:NSArray.class] && et.count == RYEQ_N;
+      for (int i = 0; i < RYEQ_N; i++) { gEqF[i] = ok ? [ef[i] floatValue] : kEqF[i]; gEqG[i] = ok ? [eg[i] floatValue] : kEqG[i]; gEqQ[i] = okq ? [eq[i] floatValue] : 1.1f; gEqT[i] = okq ? [et[i] intValue] : 0; }
+      if (!ok) gEqOn = 0;
       gEqVer++; }
+    gNcOn = [CF(@"ncOn", @NO) boolValue]; gNcAmt = [CF(@"ncAmt", @0.2) floatValue]; gNrBgOn = [CF(@"nrBgOn", @NO) boolValue]; gNrBg = [CF(@"nrBg", @0) floatValue];
+    gNrImpOn = [CF(@"nrImpOn", @NO) boolValue]; gNrImp = [CF(@"nrImp", @0) floatValue]; gGateOn = [CF(@"gateOn", @NO) boolValue]; gGateThr = [CF(@"gateThr", @-56.3) floatValue];
+    gGateAuto = [CF(@"gateAuto", @NO) boolValue]; gCompOn = [CF(@"compOn", @NO) boolValue]; gCompLvl = [CF(@"compLvl", @1) floatValue];
 }
 static void RYEqSave(void) {
-    NSMutableArray *f = [NSMutableArray new], *g = [NSMutableArray new];
-    for (int i = 0; i < RYEQ_N; i++) { [f addObject:@(gEqF[i])]; [g addObject:@(gEqG[i])]; }
-    CS(@"eqF", f); CS(@"eqG", g); CS(@"eqPre", @(gEqPre));
+    NSMutableArray *f = [NSMutableArray new], *g = [NSMutableArray new], *q = [NSMutableArray new], *t = [NSMutableArray new];
+    for (int i = 0; i < RYEQ_N; i++) { [f addObject:@(gEqF[i])]; [g addObject:@(gEqG[i])]; [q addObject:@(gEqQ[i])]; [t addObject:@(gEqT[i])]; }
+    CS(@"eqF", f); CS(@"eqG", g); CS(@"eqQ", q); CS(@"eqT", t); CS(@"eqPre", @(gEqPre)); CS(@"eqCfgVer", @2);
 }
 static void RYEqSetOn(BOOL on) { gEqOn = on ? 1 : 0; gEqVer++; CS(@"eqOn", @(on)); }
-static void RYEqReset(void) { for (int i = 0; i < RYEQ_N; i++) { gEqF[i] = kEqF[i]; gEqG[i] = kEqG[i]; } gEqPre = 0; gEqVer++; RYEqSave(); }
+// presets: built-in + the ones saved by the owner (CF "eqUser": array of {n, f[], g[], q[], t[]}); a preset is always handled as such a dictionary
+static NSDictionary *RYEqDictFrom(const char *name, const float *f, const float *g, const float *q, const int *t) {
+    NSMutableArray *F = [NSMutableArray new], *G = [NSMutableArray new], *Q = [NSMutableArray new], *T_ = [NSMutableArray new];
+    for (int i = 0; i < RYEQ_N; i++) { [F addObject:@(f[i])]; [G addObject:@(g[i])]; [Q addObject:@(q[i])]; [T_ addObject:@(t[i])]; }
+    return @{@"n": [NSString stringWithUTF8String:name], @"f": F, @"g": G, @"q": Q, @"t": T_};
+}
+static NSArray<NSDictionary *> *RYEqAllPresets(void) {
+    NSMutableArray *a = [NSMutableArray new];
+    for (int i = 0; i < RY_NEQP; i++) [a addObject:RYEqDictFrom(kEqPresets[i].name, kEqPresets[i].f, kEqPresets[i].g, kEqPresets[i].q, kEqPresets[i].t)];
+    NSArray *u = CF(@"eqUser", nil); if ([u isKindOfClass:NSArray.class]) for (id d in u) if ([d isKindOfClass:NSDictionary.class] && [d[@"n"] isKindOfClass:NSString.class]) [a addObject:d];
+    return a;
+}
+static BOOL RYEqIsBuiltin(NSString *n) { for (int i = 0; i < RY_NEQP; i++) if ([n isEqualToString:[NSString stringWithUTF8String:kEqPresets[i].name]]) return YES; return NO; }
+static void RYEqApplyDict(NSDictionary *d) {
+    NSArray *f = d[@"f"], *g = d[@"g"], *q = d[@"q"], *t = d[@"t"];
+    if (![f isKindOfClass:NSArray.class] || ![g isKindOfClass:NSArray.class] || f.count != RYEQ_N || g.count != RYEQ_N) return;
+    for (int i = 0; i < RYEQ_N; i++) {
+        gEqF[i] = [f[i] floatValue]; gEqG[i] = [g[i] floatValue];
+        gEqQ[i] = ([q isKindOfClass:NSArray.class] && q.count == RYEQ_N) ? [q[i] floatValue] : 1.1f; gEqT[i] = ([t isKindOfClass:NSArray.class] && t.count == RYEQ_N) ? [t[i] intValue] : 0;
+    }
+    gEqPre = 0; gEqOn = 1; gEqVer++; CS(@"eqOn", @YES); CS(@"eqName", d[@"n"] ?: @"");
+    RYEqSave();
+}
+static void RYEqReset(void) { RYEqApplyDict(RYEqAllPresets().firstObject); gEqOn = 0; CS(@"eqOn", @NO); }
+static void RYEqSaveUser(NSString *name) {
+    if (!name.length) return;
+    NSMutableArray *F = [NSMutableArray new], *G = [NSMutableArray new], *Q = [NSMutableArray new], *T_ = [NSMutableArray new];
+    for (int i = 0; i < RYEQ_N; i++) { [F addObject:@(gEqF[i])]; [G addObject:@(gEqG[i])]; [Q addObject:@(gEqQ[i])]; [T_ addObject:@(gEqT[i])]; }
+    NSMutableArray *u = [NSMutableArray new]; NSArray *old = CF(@"eqUser", nil);
+    if ([old isKindOfClass:NSArray.class]) for (NSDictionary *d in old) if (![d[@"n"] isEqual:name]) [u addObject:d];
+    [u addObject:@{@"n": name, @"f": F, @"g": G, @"q": Q, @"t": T_}]; CS(@"eqUser", u); CS(@"eqName", name);
+}
+static void RYEqDeleteUser(NSString *name) {
+    NSMutableArray *u = [NSMutableArray new]; NSArray *old = CF(@"eqUser", nil);
+    if ([old isKindOfClass:NSArray.class]) for (NSDictionary *d in old) if (![d[@"n"] isEqual:name]) [u addObject:d];
+    CS(@"eqUser", u);
+    NSMutableArray *fv = [NSMutableArray new]; NSArray *fo = CF(@"eqFav", nil); if ([fo isKindOfClass:NSArray.class]) for (NSString *n in fo) if (![n isEqual:name]) [fv addObject:n]; CS(@"eqFav", fv);
+}
+// ---- Sonar (SteelSeries) import. The link is "...import?url=<base64 of https://community-configs.steelseriescdn.com/v1/<id>>" (or that address itself). The config JSON is read tolerantly:
+// the biggest group of sibling objects that carry a frequency and a gain is taken as the equalizer (Q and shelf types are read when present).
+static NSString *RYB64Dec(NSString *s) {
+    s = [[s stringByReplacingOccurrencesOfString:@"-" withString:@"+"] stringByReplacingOccurrencesOfString:@"_" withString:@"/"];
+    while (s.length % 4) s = [s stringByAppendingString:@"="];
+    NSData *d = [[NSData alloc] initWithBase64EncodedString:s options:0]; return d ? [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] : nil;
+}
+static NSDictionary *RYSonarBand(id n) {
+    if (![n isKindOfClass:NSDictionary.class]) return nil;
+    NSNumber *f = nil, *g = nil, *q = nil; NSString *ty = nil; BOOL en = YES;
+    for (NSString *k0 in (NSDictionary *)n) {
+        NSString *k = k0.lowercaseString; id v = ((NSDictionary *)n)[k0];
+        if ([v isKindOfClass:NSNumber.class]) {
+            if ([k isEqualToString:@"frequency"] || [k isEqualToString:@"freq"] || [k isEqualToString:@"hz"] || [k isEqualToString:@"f"]) f = v;
+            else if ([k isEqualToString:@"gain"] || [k isEqualToString:@"gaindb"] || [k isEqualToString:@"gain_db"]) g = v;
+            else if ([k isEqualToString:@"q"] || [k isEqualToString:@"qfactor"] || [k isEqualToString:@"q_factor"] || [k isEqualToString:@"bandwidth"]) q = v;
+            else if ([k isEqualToString:@"enabled"] || [k isEqualToString:@"enable"] || [k isEqualToString:@"active"]) en = [v boolValue];
+        } else if ([v isKindOfClass:NSString.class] && ([k isEqualToString:@"type"] || [k isEqualToString:@"filtertype"] || [k isEqualToString:@"filter_type"])) ty = ((NSString *)v).lowercaseString;
+    }
+    if (!f || !g) return nil;
+    int t = 0; if ([ty containsString:@"low"] && [ty containsString:@"shelf"]) t = 1; else if ([ty containsString:@"high"] && [ty containsString:@"shelf"]) t = 2;
+    return @{@"f": f, @"g": en ? g : @0, @"q": q && q.floatValue > 0.1 ? q : @1.1, @"t": @(t)};
+}
+static void RYSonarWalk(id n, NSMutableArray *groups) {
+    NSArray *kids = [n isKindOfClass:NSDictionary.class] ? [(NSDictionary *)n allValues] : ([n isKindOfClass:NSArray.class] ? n : nil);
+    if (!kids) return;
+    NSMutableArray *g = [NSMutableArray new]; for (id k in kids) { NSDictionary *b = RYSonarBand(k); if (b) [g addObject:b]; }
+    if (g.count) [groups addObject:g];
+    if ([n isKindOfClass:NSDictionary.class]) {   // parallel arrays: {"frequencies":[..], "gains":[..]}
+        NSArray *fa = nil, *ga = nil, *qa = nil;
+        for (NSString *k0 in (NSDictionary *)n) { NSString *k = k0.lowercaseString; id v = ((NSDictionary *)n)[k0]; if (![v isKindOfClass:NSArray.class] || ![[(NSArray *)v firstObject] isKindOfClass:NSNumber.class]) continue;
+            if ([k hasPrefix:@"freq"]) fa = v; else if ([k hasPrefix:@"gain"]) ga = v; else if ([k isEqualToString:@"q"] || [k hasPrefix:@"qf"] || [k hasPrefix:@"qs"]) qa = v; }
+        if (fa && ga && fa.count == ga.count) { NSMutableArray *pg = [NSMutableArray new]; for (NSUInteger i = 0; i < fa.count; i++) [pg addObject:@{@"f": fa[i], @"g": ga[i], @"q": (qa && qa.count == fa.count) ? qa[i] : @1.1, @"t": @0}]; [groups addObject:pg]; }
+    }
+    for (id k in kids) RYSonarWalk(k, groups);
+}
+static NSDictionary *RYSonarParse(id root, NSString *fallbackName) {
+    NSMutableArray *groups = [NSMutableArray new]; RYSonarWalk(root, groups);
+    NSArray *best = nil; for (NSArray *g in groups) if (!best || g.count > best.count) best = g;
+    if (!best.count) return nil;
+    NSMutableArray *bs = [best mutableCopy];
+    while (bs.count > RYEQ_N) { NSUInteger wi = 0; float w = 1e9f; for (NSUInteger i = 0; i < bs.count; i++) { float a = fabsf([bs[i][@"g"] floatValue]); if (a < w) { w = a; wi = i; } } [bs removeObjectAtIndex:wi]; }
+    [bs sortUsingComparator:^NSComparisonResult(NSDictionary *x, NSDictionary *y) { return [x[@"f"] compare:y[@"f"]]; }];
+    NSMutableArray *F = [NSMutableArray new], *G = [NSMutableArray new], *Q = [NSMutableArray new], *T_ = [NSMutableArray new];
+    for (NSDictionary *b in bs) { float f = fmaxf(20.f, fminf(20000.f, [b[@"f"] floatValue])); [F addObject:@(f)]; [G addObject:@(fmaxf(-12.f, fminf(12.f, [b[@"g"] floatValue])))]; [Q addObject:b[@"q"]]; [T_ addObject:b[@"t"]]; }
+    for (int i = (int)F.count; i < RYEQ_N; i++) {   // fewer than 10 bands: the rest sit flat in the gaps
+        float f = kEqF[i]; [F addObject:@(f)]; [G addObject:@0]; [Q addObject:@1.1]; [T_ addObject:@0];
+    }
+    NSMutableArray *idx = [NSMutableArray new]; for (int i = 0; i < RYEQ_N; i++) [idx addObject:@(i)];
+    [idx sortUsingComparator:^NSComparisonResult(NSNumber *x, NSNumber *y) { return [F[x.intValue] compare:F[y.intValue]]; }];
+    NSMutableArray *F2 = [NSMutableArray new], *G2 = [NSMutableArray new], *Q2 = [NSMutableArray new], *T2 = [NSMutableArray new];
+    for (NSNumber *i in idx) { [F2 addObject:F[i.intValue]]; [G2 addObject:G[i.intValue]]; [Q2 addObject:Q[i.intValue]]; [T2 addObject:T_[i.intValue]]; }
+    NSString *nm = [root isKindOfClass:NSDictionary.class] && [root[@"name"] isKindOfClass:NSString.class] && [root[@"name"] length] ? root[@"name"] : fallbackName;
+    return @{@"n": nm, @"f": F2, @"g": G2, @"q": Q2, @"t": T2};
+}
+static void RYEqImportLink(NSString *link, void (^done)(NSString *err, NSString *name)) {
+    NSString *t = [link stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet], *target = nil;
+    NSURLComponents *uc = [NSURLComponents componentsWithString:t];
+    for (NSURLQueryItem *qi in uc.queryItems) if ([qi.name isEqualToString:@"url"] && qi.value.length) { target = qi.value; if (![target hasPrefix:@"http"]) target = RYB64Dec(target); }
+    if (!target && [t hasPrefix:@"http"]) target = t;
+    if (!target && t.length > 20 && ![t containsString:@" "]) target = RYB64Dec(t);
+    NSURL *u = target ? [NSURL URLWithString:target] : nil;
+    if (!u || ![u.scheme isEqualToString:@"https"] || ![u.host hasSuffix:@"steelseriescdn.com"]) { done(T(@"الرابط غير صحيح", @"Invalid link"), nil); return; }
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        NSString *msg = nil, *nm = nil;
+        if (!data.length || err) msg = T(@"تعذر تحميل الإعداد", @"Download failed");
+        else {
+            id j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+            NSDictionary *p = j ? RYSonarParse(j, T(@"استيراد", @"Imported")) : nil;
+            if (!p) msg = T(@"ما لقيت إيكولايزر بالإعداد", @"No equalizer found in the config");
+            else { NSString *base = p[@"n"], *use = base; int k = 2; while (RYEqIsBuiltin(use)) use = [NSString stringWithFormat:@"%@ %d", base, k++];
+                   NSMutableDictionary *m = [p mutableCopy]; m[@"n"] = use; RYEqApplyDict(m); RYEqSaveUser(use); nm = use; }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ done(msg, nm); });
+    }];
+    [task resume];
+}
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
 static void RYMicSetRev(BOOL on) { gMicRev = on; CS(@"micRev", @(on)); }
@@ -2978,10 +3169,9 @@ static void RYMsgLoopSet(BOOL on) {
 }
 
 // magnitude (dB) of one peaking band at frequency f, for drawing the response curve (sample rate 48 kHz)
-static double RYEqBandDb(float fc, float g, double f) {
-    if (fabsf(g) < 0.05f || fc > 0.45f * 48000.f) return 0;
-    double A = pow(10.0, g / 40.0), w0 = 2.0 * M_PI * fc / 48000.0, al = sin(w0) / (2.0 * 1.1), cw = cos(w0);
-    double b0 = (1 + al * A), b1 = -2 * cw, b2 = (1 - al * A), a0 = 1 + al / A, a1 = -2 * cw / a0, a2 = (1 - al / A) / a0; b0 /= a0; b1 /= a0; b2 /= a0;
+static double RYEqBandDb(int type, float fc, float g, float q, double f) {
+    double o[5]; if (!RYEqCoef(type, fc, g, q, 48000.0, o)) return 0;
+    double b0 = o[0], b1 = o[1], b2 = o[2], a1 = o[3], a2 = o[4];
     double w = 2.0 * M_PI * f / 48000.0, c1 = cos(w), c2 = cos(2 * w);
     double num = b0 * b0 + b1 * b1 + b2 * b2 + 2 * (b0 * b1 + b1 * b2) * c1 + 2 * b0 * b2 * c2;
     double den = 1 + a1 * a1 + a2 * a2 + 2 * (a1 + a1 * a2) * c1 + 2 * a2 * c2;
@@ -2990,11 +3180,12 @@ static double RYEqBandDb(float fc, float g, double f) {
 @interface RYEQView : UIControl
 @property (nonatomic, copy) void (^onLive)(int band);
 @property (nonatomic, copy) void (^onEnd)(void);
+@property (nonatomic) BOOL editing;   // dots move only while the owner has pressed the edit button
 @end
 @implementation RYEQView { int _sel; }
 - (instancetype)initWithFrame:(CGRect)f {
     self = [super initWithFrame:f];
-    if (self) { self.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.17 alpha:1]; self.layer.cornerRadius = 10; self.clipsToBounds = YES; _sel = -1; }
+    if (self) { self.backgroundColor = [UIColor colorWithRed:0.12 green:0.13 blue:0.16 alpha:1]; self.layer.cornerRadius = 10; self.clipsToBounds = YES; _sel = -1; }
     return self;
 }
 - (CGRect)plot { return CGRectMake(36, 8, self.bounds.size.width - 44, self.bounds.size.height - 26); }
@@ -3003,7 +3194,7 @@ static double RYEqBandDb(float fc, float g, double f) {
 - (CGFloat)yFor:(double)g { CGRect p = [self plot]; return p.origin.y + p.size.height * (0.5 - g / 24.0); }
 - (double)gFor:(CGFloat)y { CGRect p = [self plot]; return (0.5 - (y - p.origin.y) / p.size.height) * 24.0; }
 - (int)nearest:(CGPoint)pt {
-    int best = -1; CGFloat bd = 34;
+    int best = -1; CGFloat bd = 1e9;
     for (int i = 0; i < RYEQ_N; i++) { CGFloat dx = [self xFor:gEqF[i]] - pt.x, dy = [self yFor:gEqG[i]] - pt.y, d = sqrt(dx * dx + dy * dy); if (d < bd) { bd = d; best = i; } }
     return best;
 }
@@ -3028,9 +3219,9 @@ static double RYEqBandDb(float fc, float g, double f) {
         [[NSString stringWithFormat:@"%+d", d.intValue] drawAtPoint:CGPointMake(6, y - 5) withAttributes:at];
     }
     CGContextSaveGState(g); CGContextClipToRect(g, p);
-    CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:gEqOn ? 0.95 : 0.4].CGColor); CGContextSetLineWidth(g, 1.6);
+    CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:gEqOn ? 0.95 : 0.4].CGColor); CGContextSetLineWidth(g, 1.4);
     for (CGFloat x = p.origin.x; x <= CGRectGetMaxX(p); x += 2) {
-        double f = [self fFor:x], db = 0; for (int i = 0; i < RYEQ_N; i++) db += RYEqBandDb(gEqF[i], gEqG[i], f);
+        double f = [self fFor:x], db = 0; for (int i = 0; i < RYEQ_N; i++) db += RYEqBandDb(gEqT[i], gEqF[i], gEqG[i], gEqQ[i], f);
         db += gEqPre; CGFloat y = [self yFor:MAX(-18, MIN(18, db))];
         if (x == p.origin.x) CGContextMoveToPoint(g, x, y); else CGContextAddLineToPoint(g, x, y);
     }
@@ -3042,6 +3233,7 @@ static double RYEqBandDb(float fc, float g, double f) {
     }
 }
 - (BOOL)beginTrackingWithTouch:(UITouch *)t withEvent:(UIEvent *)e {
+    if (!self.editing) return NO;
     _sel = [self nearest:[t locationInView:self]]; if (_sel < 0) return NO;
     [self setNeedsDisplay]; if (self.onLive) self.onLive(_sel); return YES;
 }
@@ -3066,12 +3258,25 @@ static double RYEqBandDb(float fc, float g, double f) {
 @property (nonatomic, strong) UILabel *stTimeLabel;
 @property (nonatomic, strong) NSTimer *stUI;
 @property (nonatomic) BOOL stDragging; // true while the user's finger is on the slider: stop auto-updating it so it doesn't fight the drag
+@property (nonatomic) BOOL eqEdit;   // equalizer edit mode: scrolling and sheet dragging are frozen so only the dots move
+@property (nonatomic, weak) UIScrollView *mainScroll;
 @property (nonatomic, strong) NSString *pickPurpose; // routes the shared PHPicker callback: nil/"bg" = background image, "stereo" = Stereo video
 @end
 
 @implementation RYPanel
 - (void)viewDidLoad { [super viewDidLoad]; [self rebuild]; }
+- (void)applyEditLock {
+    BOOL e = self.eqEdit && self.tab == 5; static BOOL last = NO;
+    self.mainScroll.scrollEnabled = !e; self.modalInPresentation = e;
+    UISheetPresentationController *sp = self.sheetPresentationController;
+    if (sp && e != last) { last = e;
+        sp.detents = e ? @[UISheetPresentationControllerDetent.largeDetent] : @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent];
+        sp.prefersGrabberVisible = !e; sp.prefersScrollingExpandsWhenScrolledToEdge = !e;
+        if (e) sp.selectedDetentIdentifier = UISheetPresentationControllerDetentIdentifierLarge;
+    }
+}
 - (void)viewDidDisappear:(BOOL)a { [super viewDidDisappear:a]; [self.invUI invalidate]; self.invUI = nil; if (self.isBeingDismissed) [[RYCore shared] panelClosed]; }
+// (equalizer edit lock is released by rebuild / dismiss)
 
 - (void)toast:(NSString *)s {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -3111,7 +3316,7 @@ static double RYEqBandDb(float fc, float g, double f) {
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
     UIStackView *tabStack = RYHStack(tb, 8); tabStack.alignment = UIStackViewAlignmentFill;
     UIScrollView *scroll = [UIScrollView new]; scroll.alwaysBounceVertical = YES; scroll.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
-    self.stack = RYVStack(@[], 12);
+    self.stack = RYVStack(@[], 12); self.mainScroll = scroll;
 
     for (UIView *v in @[head, tabsScroll, scroll]) { v.translatesAutoresizingMaskIntoConstraints = NO; [self.view addSubview:v]; }
     [tabsScroll addSubview:tabStack]; [scroll addSubview:self.stack];
@@ -3133,6 +3338,8 @@ static double RYEqBandDb(float fc, float g, double f) {
         [self.stack.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor constant:-60],
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
+    if (self.tab != 5) self.eqEdit = NO;
+    [self applyEditLock];
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
     switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; default: [self renderBG]; }
 }
@@ -3455,16 +3662,94 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 }
 
 #pragma mark Diag
+static UIView *RYSw(NSString *title, BOOL on, UIColor *tint, void (^chg)(BOOL)) {
+    UISwitch *sw = [UISwitch new]; sw.on = on; sw.onTintColor = tint ?: RYAccent(); __weak UISwitch *w = sw;
+    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { if (w && chg) chg(w.on); }] forControlEvents:UIControlEventValueChanged];
+    UILabel *l = RYLabel(title, 15, UIFontWeightSemibold, nil); [l setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+    return RYHStack(@[l, sw], 12);
+}
+static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float mx, float val, int dec, BOOL enabled, void (^chg)(float)) {
+    UISlider *s = [UISlider new]; s.minimumValue = mn; s.maximumValue = mx; s.value = val; s.minimumTrackTintColor = RYAccent(); s.enabled = enabled;
+    UILabel *l = RYLabel(unit.length ? [NSString stringWithFormat:@"%.*f %@", dec, val, unit] : [NSString stringWithFormat:@"%.*f", dec, val], 13, UIFontWeightMedium, RY_MUTED); l.numberOfLines = 1;
+    [l.widthAnchor constraintEqualToConstant:74].active = YES; l.textAlignment = NSTextAlignmentCenter;
+    __weak UISlider *ws = s; __weak UILabel *wl = l;
+    [s addAction:[UIAction actionWithHandler:^(UIAction *a) { if (!ws) return; float v = ws.value; wl.text = unit.length ? [NSString stringWithFormat:@"%.*f %@", dec, v, unit] : [NSString stringWithFormat:@"%.*f", dec, v]; if (chg) chg(v); }] forControlEvents:UIControlEventTouchDragInside | UIControlEventValueChanged];
+    NSMutableArray *row = [NSMutableArray new]; if (lo.length) [row addObject:RYLabel(lo, 12, UIFontWeightRegular, RY_MUTED)]; [row addObject:s]; if (hi.length) [row addObject:RYLabel(hi, 12, UIFontWeightRegular, RY_MUTED)]; [row addObject:l];
+    UIStackView *h = RYHStack(row, 8); h.alpha = enabled ? 1 : 0.4; return h;
+}
 - (void)renderEQ {
     __weak typeof(self) ws = self;
-    UIButton *on = RYBtn(T(@"الإيكولايزر", @"Equalizer"), gEqOn != 0, ^{ RYEqSetOn(!gEqOn); [ws rebuild]; });
-    RYEQView *gv = [[RYEQView alloc] initWithFrame:CGRectMake(0, 0, 300, 260)]; [gv.heightAnchor constraintEqualToConstant:260].active = YES;
+    NSString *cur = CF(@"eqName", @"Flat"); if (![cur isKindOfClass:NSString.class]) cur = @"Flat";
+    NSArray<NSDictionary *> *all = RYEqAllPresets();
+    // ---- preset header: name (menu), favourite star, more (menu)
+    NSMutableArray *items = [NSMutableArray new];
+    for (NSDictionary *d in all) { NSString *n = d[@"n"]; [items addObject:[UIAction actionWithTitle:n image:nil identifier:nil handler:^(UIAction *a) { RYEqApplyDict(d); [ws rebuild]; }]]; }
+    UIButton *nameBtn = RYBtn(cur, NO, nil); nameBtn.menu = [UIMenu menuWithTitle:@"" children:items]; nameBtn.showsMenuAsPrimaryAction = YES;
+    NSMutableArray *fav = [NSMutableArray new]; { NSArray *fo = CF(@"eqFav", nil); if ([fo isKindOfClass:NSArray.class]) for (id n in fo) if ([n isKindOfClass:NSString.class]) [fav addObject:n]; }
+    BOOL isFav = [fav containsObject:cur];
+    UIButton *star = RYBtn(isFav ? @"★" : @"☆", isFav, ^{
+        NSMutableArray *f2 = [fav mutableCopy];
+        if ([f2 containsObject:cur]) [f2 removeObject:cur]; else if (f2.count < 9) [f2 addObject:cur]; else { [ws toast:T(@"المفضلة ممتلئة", @"Favorites full")]; return; }
+        CS(@"eqFav", f2); [ws rebuild];
+    });
+    NSMutableArray *more = [NSMutableArray new];
+    [more addObject:[UIAction actionWithTitle:T(@"حفظ", @"Save") image:nil identifier:nil handler:^(UIAction *a) {
+        [ws ask:T(@"اسم الوزنية", @"Preset name") ph:cur secure:NO ok:^(NSString *n) { n = [n stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]; if (!n.length) n = cur;
+            if (RYEqIsBuiltin(n)) { [ws toast:T(@"الاسم محجوز", @"Name is reserved")]; return; } RYEqSaveUser(n); [ws rebuild]; }];
+    }]];
+    if (!RYEqIsBuiltin(cur)) [more addObject:[UIAction actionWithTitle:T(@"حذف", @"Delete") image:nil identifier:nil handler:^(UIAction *a) { RYEqDeleteUser(cur); RYEqReset(); [ws rebuild]; }]];
+    [more addObject:[UIAction actionWithTitle:T(@"رجوع للافتراضي", @"Reset") image:nil identifier:nil handler:^(UIAction *a) { RYEqReset(); [ws rebuild]; }]];
+    UIButton *moreBtn = RYBtn(@"•••", NO, nil); moreBtn.menu = [UIMenu menuWithTitle:@"" children:more]; moreBtn.showsMenuAsPrimaryAction = YES;
+    [nameBtn setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[nameBtn, star, moreBtn], 8)])];
+    // ---- favourites (9 slots)
+    NSMutableArray *slots = [NSMutableArray new];
+    for (int i = 0; i < 9; i++) {
+        NSString *n = i < (int)fav.count ? fav[i] : nil;
+        UIButton *b = RYBtn(n ? [n substringToIndex:MIN((NSUInteger)2, n.length)] : @"", n && [n isEqualToString:cur], ^{
+            if (!n) return; for (NSDictionary *d in RYEqAllPresets()) if ([d[@"n"] isEqualToString:n]) { RYEqApplyDict(d); [ws rebuild]; return; }
+        });
+        b.enabled = n != nil; [slots addObject:b];
+    }
+    UIStackView *fs = RYHStack(slots, 6); fs.distribution = UIStackViewDistributionFillEqually; fs.alignment = UIStackViewAlignmentFill;
+    [self.stack addArrangedSubview:RYCard(@[RYLabel([NSString stringWithFormat:@"%@ (%d/9)", T(@"المفضلة", @"Favorites"), (int)fav.count], 12, UIFontWeightSemibold, RY_MUTED), fs])];
+    // ---- graph: on/off + edit button
+    RYEQView *gv = [[RYEQView alloc] initWithFrame:CGRectMake(0, 0, 300, 280)]; [gv.heightAnchor constraintEqualToConstant:280].active = YES; gv.editing = self.eqEdit;
     UILabel *st = RYLabel(@" ", 13, UIFontWeightMedium, RY_MUTED);
-    gv.onLive = ^(int b) { st.text = [NSString stringWithFormat:@"%.0f Hz    %+.1f dB", gEqF[b], gEqG[b]]; };
+    gv.onLive = ^(int b) { st.text = [NSString stringWithFormat:@"%.0f Hz    %+.1f dB    Q %.1f", gEqF[b], gEqG[b], gEqQ[b]]; };
     gv.onEnd = ^{ RYEqSave(); };
-    [self.stack addArrangedSubview:RYCard(@[on, gv, st])];
-    [self.stack addArrangedSubview:RYSlider(T(@"المستوى (Preamp)", @"Preamp"), -12, 12, gEqPre, ^(float v) { gEqPre = v; gEqVer++; CS(@"eqPre", @(v)); })];
-    [self.stack addArrangedSubview:RYBtn(T(@"رجوع للافتراضي", @"Reset"), NO, ^{ RYEqReset(); [ws rebuild]; })];
+    UIButton *edit = RYBtn(self.eqEdit ? T(@"تم", @"Done") : T(@"تعديل", @"Edit"), self.eqEdit, ^{ ws.eqEdit = !ws.eqEdit; [ws rebuild]; });
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYSw(T(@"الإيكولايزر", @"Equalizer"), gEqOn != 0, nil, ^(BOOL on) { RYEqSetOn(on); [gv setNeedsDisplay]; }), edit], 12), gv, st])];
+    [self.stack addArrangedSubview:RYCard(@[RYSl(T(@"المستوى", @"Preamp"), nil, @"dB", -12, 12, gEqPre, 1, YES, ^(float v) { gEqPre = v; gEqVer++; CS(@"eqPre", @(v)); [gv setNeedsDisplay]; })])];
+    // ---- Clearcast
+    [self.stack addArrangedSubview:RYCard(@[RYSw(@"Clearcast AI", gNcOn != 0, nil, ^(BOOL on) { gNcOn = on; CS(@"ncOn", @(on)); [ws rebuild]; }),
+        RYSl(@"Min", @"Max", nil, 0, 1, gNcAmt, 2, YES, ^(float v) { gNcAmt = v; CS(@"ncAmt", @(v)); })])];
+    // ---- Noise reduction (disabled while Clearcast is on, like Sonar)
+    BOOL nrOK = !gNcOn;
+    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"تقليل الضوضاء", @"Noise Reduction"), 15, UIFontWeightSemibold, nrOK ? nil : RY_MUTED),
+        RYSw(T(@"الخلفية", @"Background"), gNrBgOn != 0, nil, ^(BOOL on) { gNrBgOn = on; CS(@"nrBgOn", @(on)); }),
+        RYSl(nil, nil, nil, 0, 1, gNrBg, 2, nrOK, ^(float v) { gNrBg = v; CS(@"nrBg", @(v)); }),
+        RYSw(T(@"الارتطام", @"Impact"), gNrImpOn != 0, nil, ^(BOOL on) { gNrImpOn = on; CS(@"nrImpOn", @(on)); }),
+        RYSl(nil, nil, nil, 0, 1, gNrImp, 2, nrOK, ^(float v) { gNrImp = v; CS(@"nrImp", @(v)); })])];
+    // ---- Noise gate
+    [self.stack addArrangedSubview:RYCard(@[RYSw(T(@"بوابة الضوضاء", @"Noise Gate"), gGateOn != 0, nil, ^(BOOL on) { gGateOn = on; CS(@"gateOn", @(on)); }),
+        RYSl(T(@"العتبة", @"Threshold"), nil, @"dB", -80, -20, gGateThr, 1, !gGateAuto, ^(float v) { gGateThr = v; CS(@"gateThr", @(v)); }),
+        RYSw(T(@"تلقائي", @"Auto"), gGateAuto != 0, nil, ^(BOOL on) { gGateAuto = on; CS(@"gateAuto", @(on)); [ws rebuild]; })])];
+    // ---- Compressor
+    [self.stack addArrangedSubview:RYCard(@[RYSw(T(@"الكومبريسر", @"Compressor"), gCompOn != 0, nil, ^(BOOL on) { gCompOn = on; CS(@"compOn", @(on)); }),
+        RYSl(T(@"المستوى", @"Level"), nil, nil, 0, 1, gCompLvl, 2, YES, ^(float v) { gCompLvl = v; CS(@"compLvl", @(v)); })])];
+    // ---- Sonar import
+    UITextField *tf = [UITextField new]; tf.placeholder = @"Sonar link"; tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.layer.cornerRadius = 10; tf.clipsToBounds = YES;
+    tf.autocorrectionType = UITextAutocorrectionTypeNo; tf.autocapitalizationType = UITextAutocapitalizationTypeNone; tf.clearButtonMode = UITextFieldViewModeWhileEditing; tf.font = [UIFont systemFontOfSize:14];
+    tf.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 10)]; tf.leftViewMode = UITextFieldViewModeAlways; [tf.heightAnchor constraintEqualToConstant:42].active = YES;
+    __weak UITextField *wtf = tf;
+    UIButton *imp = RYBtn(T(@"استيراد", @"Import"), YES, ^{
+        NSString *t = wtf.text; if (!t.length) t = UIPasteboard.generalPasteboard.string;
+        if (!t.length) return;
+        [ws toast:T(@"جاري الاستيراد", @"Importing")];
+        RYEqImportLink(t, ^(NSString *err, NSString *name) { if (err) [ws toast:err]; else { [ws toast:name]; [ws rebuild]; } });
+    });
+    [self.stack addArrangedSubview:RYCard(@[tf, imp])];
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
 }
 - (void)renderCat {
