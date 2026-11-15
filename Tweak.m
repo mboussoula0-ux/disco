@@ -1515,6 +1515,7 @@ static NSString *RYStr(id v) {
 // ---- persistence: every recent message is remembered (compact JSON); when one is deleted by someone else it is copied to Documents/8ubah/data/deleted.json
 // and put back into the server's answer whenever the app asks for that channel's messages again (after a restart, scrolling, switching chats).
 static NSObject *gLogLock;
+static NSObject *gNetLock; static NSMutableDictionary<NSString *, NSMutableDictionary *> *gNetReq; static volatile int gNetBuf = 0;
 static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSData *> *> *gMsgCache;   // channel -> id -> JSON of a recently seen message
 static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSData *> *> *gDelStore;   // channel -> id -> JSON of a kept (deleted) message
 static NSMutableDictionary<NSString *, NSDate *> *gCacheTouch;
@@ -1809,7 +1810,6 @@ static NSData *RYMergeKept(NSData *data, NSURLResponse *resp) {
 // RCTNetworking.sendData: is not used for it. So the chunks of a message-list answer are held back, merged when the request completes and
 // handed over as one chunk right before "didCompleteNetworkResponse".
 static void (*orig_netEvt)(id, SEL, NSString *, id);
-static NSObject *gNetLock; static NSMutableDictionary<NSString *, NSMutableDictionary *> *gNetReq; static volatile int gNetBuf = 0;
 static BOOL RYIsMsgListURL(NSURL *u) {
     NSArray *c = [u.path componentsSeparatedByString:@"/"]; NSUInteger i = [c indexOfObject:@"channels"];
     return i != NSNotFound && i + 2 == c.count - 1 && [c[i + 2] isEqual:@"messages"];
