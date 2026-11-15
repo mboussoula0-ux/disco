@@ -1393,139 +1393,106 @@ static void RYTintText(UIView *v, UIColor *to, int d) {
 }
 
 
-#pragma mark - Message logger (every chat): a message someone deletes stays in the list, in red. Always on, no switch.
-// Hooks DCDChatViewController updateRows:... (the list JS sends to the native chat). Every update is compared with the previous one of the same
-// chat; a message that disappeared is a deleted one: its row object is kept and put back at its place.
-// Cheap on purpose: one pass over the rows, selector calls instead of KVC, a small LRU of chats. Anything unexpected = the call passes through untouched.
-static NSMutableDictionary<NSString *, NSDictionary *> *gLogPrev;           // channel -> {id -> row} exactly as JS last sent it
-static NSMutableDictionary<NSString *, NSMutableDictionary *> *gLogDel;     // channel -> {id -> {row, n (id number), before, after}}
-static NSMutableDictionary<NSString *, NSNumber *> *gLogAsc;                // channel -> list order seen (YES = oldest first)
-static NSMutableArray<NSString *> *gLogChans;                               // channels, least recently used first (max 12 kept)
-static NSMutableSet<NSString *> *gLogIds;                                   // ids of the kept messages (cells use it to paint red)
-static volatile int gLogUpd = 0, gLogKept = 0, gLogPut = 0, gLogSkip = 0; static char gLogLast[200] = "-";
-static void (*orig_updRows)(id, SEL, NSArray *, BOOL, id, id, BOOL, BOOL, BOOL);
+#pragma mark - Message logger (DMs): a message someone deletes stays in the chat, in red. Always on, no switch.
+// How Discord really works (read from the binary): the gateway event MESSAGE_DELETE arrives over RCTWebSocketModule (already decompressed
+// text, "encoding=json"), JS removes the message from its store, then sends the native chat a *changeset* (DCDRowUpdateModel rows with
+// index + changeType). Re-inserting rows natively would shift every later index, so we stop it at the source instead: the delete event is
+// renamed before JS sees it. JS, the native list and all indices stay exactly in sync; the message simply never gets removed.
+// Our own deletes (REST DELETE /channels/x/messages/y seen on the HTTP handler) are let through.
+static NSMutableSet<NSString *> *gLogIds;                      // ids of messages that were deleted by someone else and are kept
+static NSMutableDictionary<NSString *, NSDate *> *gOwnDel;     // ids we deleted ourselves (the matching gateway event passes)
+static volatile int gWsMsgs = 0, gLogSeen = 0, gLogKept = 0, gLogOwn = 0, gLogPass = 0; static char gLogLast[220] = "-";
 static void (*orig_cellCfg)(id, SEL, id, id, id);
-static SEL sLMsg, sLId, sLChan, sLNonce, sLInv;
+static void (*orig_wsSend)(id, SEL, NSString *, id);
+static id (*orig_httpSend)(id, SEL, id, id);
 #define RY_RED [UIColor colorWithRed:1.0 green:0.27 blue:0.27 alpha:1]
+static UIView *RYChatHost(void);
 static id RYKV(id o, NSString *k) { if (!o) return nil; @try { return [o valueForKey:k]; } @catch (__unused id e) { return nil; } }
 static NSString *RYStr(id v) {
     if (!v || v == NSNull.null) return nil;
     NSString *s = [v isKindOfClass:NSString.class] ? v : [v description]; return s.length ? s : nil;
 }
 static void RYLogInit(void) {
-    static dispatch_once_t once; dispatch_once(&once, ^{
-        sLMsg = NSSelectorFromString(@"message"); sLId = NSSelectorFromString(@"id"); sLChan = NSSelectorFromString(@"channelID");
-        sLNonce = NSSelectorFromString(@"nonce"); sLInv = NSSelectorFromString(@"inverted");
-        gLogPrev = [NSMutableDictionary new]; gLogDel = [NSMutableDictionary new]; gLogAsc = [NSMutableDictionary new];
-        gLogChans = [NSMutableArray new]; gLogIds = [NSMutableSet new];
-    });
+    static dispatch_once_t once; dispatch_once(&once, ^{ gLogIds = [NSMutableSet new]; gOwnDel = [NSMutableDictionary new]; });
 }
-static id RYGet(id o, SEL s) { return (o && s && [o respondsToSelector:s]) ? ((id (*)(id, SEL))objc_msgSend)(o, s) : nil; }
-static id RYRowMsg(id row) {
-    static Class mc; static dispatch_once_t once; dispatch_once(&once, ^{ mc = NSClassFromString(@"DCDMessageModel"); });
-    if (!row || !mc) return nil;
-    if (!sLMsg) sLMsg = NSSelectorFromString(@"message");
-    id m = RYGet(row, sLMsg); return (m && [m isKindOfClass:mc]) ? m : nil;
-}
-static unsigned long long RYNum(NSString *s) { return s.length ? strtoull(s.UTF8String, NULL, 10) : 0; }
-static BOOL RYIsPending(id m, NSString *mid) { NSString *n = RYStr(RYGet(m, sLNonce)); return n && [n isEqual:mid]; } // a message still being sent has id == nonce
-static void RYPaintRow(id m) { @try { [m setValue:RY_RED forKey:@"textColor"]; } @catch (__unused id e) {} }
+static BOOL RYIsKept(NSString *mid) { if (!mid || !gLogIds) return NO; @synchronized (gLogIds) { return [gLogIds containsObject:mid]; } }
 static NSString *RYLoggerStatus(void) {
-    return [NSString stringWithFormat:T(@"المسجّل: تحديثات %d، محفوظة %d، معادة %d", @"Logger: updates %d, kept %d, restored %d"), gLogUpd, gLogKept, gLogPut];
+    return [NSString stringWithFormat:T(@"المسجّل: رسائل %d، محفوظة %d، حذفي %d", @"Logger: ws %d, kept %d, own %d"), gWsMsgs, gLogKept, gLogOwn];
 }
 
-static void RYUpdRows(id self, SEL _cmd, NSArray *rows, BOOL top, id sc, id cs, BOOL hack, BOOL force, BOOL anim) {
-    NSArray *use = rows; BOOL reload = NO;
+// ---- own deletes: DELETE /channels/<c>/messages/<m> on the app's HTTP handler
+static id RYHttpSend(id self, SEL _cmd, id req, id delegate) {
     @try {
-        if ([rows isKindOfClass:NSArray.class] && rows.count) {
-            RYLogInit(); gLogUpd++;
-            // 1. what JS sent now: message rows with their ids, in list order
-            NSString *chan = nil; NSMutableArray<NSString *> *ids = [NSMutableArray new]; NSMutableDictionary *cur = [NSMutableDictionary new];
-            for (id row in rows) {
-                id m = RYRowMsg(row); if (!m) continue;
-                NSString *mid = RYStr(RYGet(m, sLId)); if (!mid) continue;
-                if (!chan) chan = RYStr(RYGet(m, sLChan));
-                [ids addObject:mid]; cur[mid] = row;
-            }
-            static BOOL logged; if (!logged) { logged = YES; RYLog(@"logger: first update, rows=%lu first=%@ msgRows=%lu chan=%@", (unsigned long)rows.count, NSStringFromClass([rows.firstObject class]), (unsigned long)ids.count, chan); }
-            if (chan && ids.count) @synchronized (gLogDel) {
-                unsigned long long mn = ULLONG_MAX, mx = 0;
-                for (NSString *k in ids) { unsigned long long v = RYNum(k); if (v < mn) mn = v; if (v > mx) mx = v; }
-                // small LRU of chats
-                [gLogChans removeObject:chan]; [gLogChans addObject:chan];
-                while (gLogChans.count > 12) {
-                    NSString *old = gLogChans.firstObject; for (NSString *q in gLogDel[old]) [gLogIds removeObject:q];
-                    [gLogDel removeObjectForKey:old]; [gLogPrev removeObjectForKey:old]; [gLogAsc removeObjectForKey:old]; [gLogChans removeObjectAtIndex:0];
-                }
-                NSMutableDictionary *del = gLogDel[chan]; if (!del) { del = [NSMutableDictionary new]; gLogDel[chan] = del; }
-                // list order: oldest first (asc) or newest first
-                BOOL asc;
-                if (ids.count >= 2 && RYNum(ids.firstObject) != RYNum(ids.lastObject)) { asc = RYNum(ids.firstObject) < RYNum(ids.lastObject); gLogAsc[chan] = @(asc); }
-                else if (gLogAsc[chan]) asc = [gLogAsc[chan] boolValue];
-                else { BOOL inv = NO; if ([self respondsToSelector:sLInv]) inv = ((BOOL (*)(id, SEL))objc_msgSend)(self, sLInv); asc = !inv; }
-                // 2. messages that were in the last list and are gone now
-                NSDictionary *prev = gLogPrev[chan];
-                if (prev.count) {
-                    NSUInteger added = 0; for (NSString *k in ids) if (!prev[k]) added++;
-                    NSMutableArray<NSString *> *missing = [NSMutableArray new];
-                    for (NSString *k in prev) if (!cur[k] && !del[k]) [missing addObject:k];
-                    // nothing new arrived and only a few rows vanished = a plain removal, wherever it is in the list
-                    BOOL pure = (added == 0 && missing.count <= 3 && prev.count >= 3);
-                    for (NSString *k in missing) {
-                        id row = prev[k]; id m = RYRowMsg(row);
-                        if (!m || RYIsPending(m, k)) { gLogSkip++; continue; }
-                        unsigned long long n = RYNum(k), before = 0, after = 0;
-                        for (NSString *q in prev) { unsigned long long v = RYNum(q); if (v < n && v > before) before = v; if (v > n && (!after || v < after)) after = v; }
-                        BOOL inside = n > mn && n < mx;
-                        BOOL tail = n > mx && before == mx;   // the newest message was deleted
-                        if (!(pure || inside || tail)) { gLogSkip++; continue; }
-                        del[k] = @{@"row": row, @"n": @(n), @"before": @(before), @"after": @(after)};
-                        [gLogIds addObject:k]; RYPaintRow(m); gLogKept++;
-                        const char *rule = pure ? "removed" : inside ? "inside" : "tail";
-                        snprintf(gLogLast, sizeof gLogLast, "kept %s rule=%s chan=%s", k.UTF8String, rule, chan.UTF8String);
-                        RYLog(@"logger: kept %@ (chan %@, %s)", k, chan, rule);
-                        if (del.count > 300) { NSString *oldest = nil; unsigned long long best = ULLONG_MAX; for (NSString *q in del) { unsigned long long v = RYNum(q); if (v < best) { best = v; oldest = q; } } if (oldest) { [del removeObjectForKey:oldest]; [gLogIds removeObject:oldest]; } }
-                    }
-                }
-                // 3. a kept message that JS sends again is not deleted after all
-                for (NSString *k in [del allKeys]) if (cur[k]) { [del removeObjectForKey:k]; [gLogIds removeObject:k]; }
-                gLogPrev[chan] = cur;
-                // 4. put the kept messages back at their place
-                if (del.count) {
-                    NSMutableArray *out = nil;
-                    NSArray *keys = [del.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) { unsigned long long x = RYNum(a), y = RYNum(b); return x < y ? NSOrderedAscending : x > y ? NSOrderedDescending : NSOrderedSame; }];
-                    for (NSString *k in keys) {
-                        NSDictionary *r = del[k]; unsigned long long n = [r[@"n"] unsignedLongLongValue], before = [r[@"before"] unsignedLongLongValue], after = [r[@"after"] unsignedLongLongValue];
-                        BOOL ok = (n > mn && n < mx) || (n > mx && before == mx) || (n < mn && after == mn);
-                        if (!ok) continue;
-                        if (!out) out = [rows mutableCopy];
-                        id m = RYRowMsg(r[@"row"]); RYPaintRow(m);
-                        NSInteger at = -1, lastMsg = -1;
-                        for (NSUInteger i = 0; i < out.count; i++) {
-                            id mm = RYRowMsg(out[i]); if (!mm) continue; lastMsg = (NSInteger)i;
-                            unsigned long long q = RYNum(RYStr(RYGet(mm, sLId)));
-                            if (asc ? q > n : q < n) { at = (NSInteger)i; break; }
-                        }
-                        if (at < 0) at = lastMsg + 1;
-                        [out insertObject:r[@"row"] atIndex:(NSUInteger)at]; gLogPut++; reload = YES;
-                    }
-                    if (reload) use = out;
-                }
+        if ([req isKindOfClass:NSURLRequest.class] && [[(NSURLRequest *)req HTTPMethod] isEqualToString:@"DELETE"]) {
+            NSArray *c = [[(NSURLRequest *)req URL].path componentsSeparatedByString:@"/"];
+            NSUInteger i = [c indexOfObject:@"messages"];
+            if (i != NSNotFound && i >= 2 && i + 1 < c.count && [c[i - 2] isEqual:@"channels"]) {
+                RYLogInit(); @synchronized (gOwnDel) { gOwnDel[c[i + 1]] = [NSDate date]; }
             }
         }
-        // chat text colour straight on the message models (wallpaper contrast / chosen colour); kept messages stay red
-        if (gBgActive) {
-            UIColor *tc = RYTextTarget();
-            if (tc) for (id row in use) { id m = RYRowMsg(row); NSString *mid = m ? RYStr(RYGet(m, sLId)) : nil; if (m && !(mid && [gLogIds containsObject:mid])) { @try { [m setValue:tc forKey:@"textColor"]; } @catch (__unused id e) {} } }
-        }
-    } @catch (NSException *e) { RYLog(@"logger: error %@", e); use = rows; reload = NO; }
-    // a list with put-back rows is reloaded in one go (no incremental row diff against the list the app expects) = no crash
-    orig_updRows(self, _cmd, use, top, sc, cs, hack, reload ? YES : force, reload ? NO : anim);
+    } @catch (__unused id e) {}
+    return orig_httpSend ? orig_httpSend(self, _cmd, req, delegate) : nil;
 }
-// every message cell: kept messages get a red wash and red text; every other cell gets the chat text colour
-// The username label above the message body already carries Discord's own per-sender colour (role
-// colour, etc). Rather than guess the private model path to that colour, we just read it straight off
-// the label Discord already rendered: the topmost UILabel in the cell that isn't the body label itself.
+static BOOL RYOwnDeleted(NSString *mid) {
+    if (!mid || !gOwnDel) return NO;
+    @synchronized (gOwnDel) {
+        NSDate *d = gOwnDel[mid]; if (!d) return NO;
+        [gOwnDel removeObjectForKey:mid];
+        if (-[d timeIntervalSinceNow] > 300) return NO;
+        return YES;
+    }
+}
+
+// ---- gateway: MESSAGE_DELETE of someone else's DM message becomes an unknown event that JS ignores (its sequence number still counts)
+static NSString *RYGatewayFilter(NSString *s) {
+    if ([s rangeOfString:@"\"MESSAGE_DELETE"].location == NSNotFound || s.length > 60000) return s;
+    NSData *dt = [s dataUsingEncoding:NSUTF8StringEncoding]; if (!dt) return s;
+    id j = [NSJSONSerialization JSONObjectWithData:dt options:NSJSONReadingMutableContainers error:nil];
+    if (![j isKindOfClass:NSMutableDictionary.class]) return s;
+    NSString *t = j[@"t"]; BOOL bulk = [t isEqual:@"MESSAGE_DELETE_BULK"];
+    if (!bulk && ![t isEqual:@"MESSAGE_DELETE"]) return s;
+    NSDictionary *d = j[@"d"]; if (![d isKindOfClass:NSDictionary.class]) return s;
+    RYLogInit(); gLogSeen++;
+    id gid = d[@"guild_id"];
+    if (gid && gid != NSNull.null && ![CF(@"delAll", @NO) boolValue]) { gLogPass++; return s; }      // a server message: deletes normally
+    NSArray *ids = bulk ? d[@"ids"] : (d[@"id"] ? @[d[@"id"]] : @[]);
+    if (![ids isKindOfClass:NSArray.class] || !ids.count) return s;
+    for (id x in ids) if (RYOwnDeleted(RYStr(x))) { gLogOwn++; return s; }                          // you deleted it yourself: deletes normally
+    @synchronized (gLogIds) { for (id x in ids) { NSString *m = RYStr(x); if (m) [gLogIds addObject:m]; } if (gLogIds.count > 4000) [gLogIds removeAllObjects]; }
+    gLogKept += (int)ids.count;
+    snprintf(gLogLast, sizeof gLogLast, "kept %s chan=%s", RYStr(ids.firstObject).UTF8String ?: "?", RYStr(d[@"channel_id"]).UTF8String ?: "?");
+    RYLog(@"logger: kept %@ (chan %@)", ids, d[@"channel_id"]);
+    j[@"t"] = bulk ? @"MESSAGE_DELETE_BULK_KEPT_8UBAH" : @"MESSAGE_DELETE_KEPT_8UBAH";
+    NSData *out = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
+    NSString *ns = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
+    return ns ?: s;
+}
+static void RYRefreshCells(void);
+static void RYWsSend(id self, SEL _cmd, NSString *name, id body) {
+    @try {
+        if ([name isEqual:@"websocketMessage"] && [body isKindOfClass:NSDictionary.class]) {
+            gWsMsgs++;
+            id d = body[@"data"]; NSString *newData = nil;
+            if ([d isKindOfClass:NSString.class]) {
+                if ([[body[@"type"] description] isEqual:@"binary"]) {                                   // base64 of the decompressed bytes
+                    NSData *raw = [[NSData alloc] initWithBase64EncodedString:d options:0];
+                    if (raw.length && raw.length < 60000 && memmem(raw.bytes, raw.length, "MESSAGE_DELETE", 14)) {
+                        NSString *txt = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding]; NSString *f = txt ? RYGatewayFilter(txt) : nil;
+                        if (f && f != txt) newData = [[f dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+                    }
+                } else { NSString *f = RYGatewayFilter(d); if (f != d) newData = f; }
+            }
+            if (newData) {
+                NSMutableDictionary *nb = [body mutableCopy]; nb[@"data"] = newData; body = nb;
+                dispatch_async(dispatch_get_main_queue(), ^{ RYRefreshCells(); });
+            }
+        }
+    } @catch (__unused id e) {}
+    if (orig_wsSend) orig_wsSend(self, _cmd, name, body);
+}
+
+// ---- cells: kept messages get a red wash and red text; every other cell gets the chat text colour
+// The username label above the message body already carries Discord's own per-sender colour (role colour, etc), read it off the label.
 static UILabel *RYFindUsernameLabel(UIView *root, UIView *exclude, int depth) {
     if (!root || depth > 6) return nil;
     UILabel *best = nil; CGFloat bestY = CGFLOAT_MAX;
@@ -1536,9 +1503,17 @@ static UILabel *RYFindUsernameLabel(UIView *root, UIView *exclude, int depth) {
     }
     return best;
 }
+static NSString *RYCellMsgId(UITableViewCell *cell, id vm) {
+    for (id o in @[vm ?: NSNull.null, RYKV(cell, @"viewModel") ?: NSNull.null, RYKV(cell, @"baseViewModel") ?: NSNull.null]) {
+        if (o == NSNull.null) continue;
+        NSString *mid = RYStr(RYKV(o, @"id")) ?: RYStr(RYKV(RYKV(o, @"message"), @"id"));
+        if (mid) return mid;
+    }
+    return nil;
+}
 static void RYDecorateCell(UITableViewCell *cell, id vm) {
-    id m = RYKV(vm, @"message"); NSString *mid = m ? RYStr(RYKV(m, @"id")) : nil;
-    BOOL del = mid && [gLogIds containsObject:mid];
+    NSString *mid = RYCellMsgId(cell, vm);
+    BOOL del = RYIsKept(mid);
     UIView *wash = [cell.contentView viewWithTag:8871];
     if (del) {
         if (!wash) { wash = [[UIView alloc] initWithFrame:cell.contentView.bounds]; wash.tag = 8871; wash.userInteractionEnabled = NO; wash.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [cell.contentView insertSubview:wash atIndex:0]; }
@@ -1555,18 +1530,36 @@ static void RYCellCfg(id self, SEL _cmd, id vm, id pool, id am) {
     orig_cellCfg(self, _cmd, vm, pool, am);
     @try { RYDecorateCell((UITableViewCell *)self, vm); } @catch (__unused id e) {}
 }
+static void RYCollectTables(UIView *v, NSMutableArray *o, int d) {
+    if (!v || d > 14) return;
+    if ([v isKindOfClass:UITableView.class]) [o addObject:v];
+    for (UIView *s in v.subviews) RYCollectTables(s, o, d + 1);
+}
+// cells already on screen are not re-configured by the app (nothing changed for it), so paint them directly
+static void RYRefreshCells(void) {
+    if (!gLogIds || !gLogIds.count) return;
+    UIView *host = RYChatHost(); if (!host) return;
+    NSMutableArray *tabs = [NSMutableArray new]; RYCollectTables(host, tabs, 0);
+    Class mc = NSClassFromString(@"DCDMessageTableViewCell");
+    for (UITableView *tv in tabs) for (UITableViewCell *c in tv.visibleCells) if (mc && [c isKindOfClass:mc]) { @try { RYDecorateCell(c, nil); } @catch (__unused id e) {} }
+}
 static void RYInstallLogger(void) {
-    static BOOL done; if (done) return;
-    Class vc = NSClassFromString(@"DCDChatViewController"), cc = NSClassFromString(@"DCDMessageTableViewCell");
-    if (!vc || !cc) return;
-    SEL us = NSSelectorFromString(@"updateRows:isLoadingAtTop:scrollData:changesetUpdateId:HACK_iOSForceAnimations:forceReload:isAnimated:");
-    SEL cs = NSSelectorFromString(@"configureWithViewModel:viewReusePoolManager:actionManager:");
-    Method um = class_getInstanceMethod(vc, us), cm = class_getInstanceMethod(cc, cs);
-    if (!um || method_getNumberOfArguments(um) != 9 || !cm || method_getNumberOfArguments(cm) != 5) { RYLog(@"logger: methods not found / different shape (update %d cell %d)", um ? (int)method_getNumberOfArguments(um) : -1, cm ? (int)method_getNumberOfArguments(cm) : -1); done = YES; return; }
-    done = YES;
-    orig_updRows = (void *)method_getImplementation(um); method_setImplementation(um, (IMP)RYUpdRows);
-    orig_cellCfg = (void *)method_getImplementation(cm); method_setImplementation(cm, (IMP)RYCellCfg);
-    RYLog(@"logger: installed");
+    static BOOL cellDone, wsDone, httpDone; RYLogInit();
+    if (!cellDone) {
+        Class cc = NSClassFromString(@"DCDMessageTableViewCell");
+        Method cm = cc ? class_getInstanceMethod(cc, NSSelectorFromString(@"configureWithViewModel:viewReusePoolManager:actionManager:")) : NULL;
+        if (cm && method_getNumberOfArguments(cm) == 5) { orig_cellCfg = (void *)method_getImplementation(cm); method_setImplementation(cm, (IMP)RYCellCfg); cellDone = YES; RYLog(@"logger: cell hook installed"); }
+    }
+    if (!wsDone) {
+        Class wc = NSClassFromString(@"RCTWebSocketModule"); SEL s = NSSelectorFromString(@"sendEventWithName:body:");
+        Method m = wc ? class_getInstanceMethod(wc, s) : NULL;
+        if (m && method_getNumberOfArguments(m) == 4) { orig_wsSend = (void *)method_getImplementation(m); class_replaceMethod(wc, s, (IMP)RYWsSend, method_getTypeEncoding(m)); wsDone = YES; RYLog(@"logger: websocket hook installed"); }
+    }
+    if (!httpDone) {
+        Class hc = NSClassFromString(@"RCTHTTPRequestHandler"); SEL s = NSSelectorFromString(@"sendRequest:withDelegate:");
+        Method m = hc ? class_getInstanceMethod(hc, s) : NULL;
+        if (m && method_getNumberOfArguments(m) == 4) { orig_httpSend = (void *)method_getImplementation(m); class_replaceMethod(hc, s, (IMP)RYHttpSend, method_getTypeEncoding(m)); httpDone = YES; RYLog(@"logger: http hook installed"); }
+    }
 }
 
 #pragma mark - Discord helpers (chat screen, send button, diagnostics)
@@ -1873,7 +1866,7 @@ static NSString *RYDiagReport(void) {
     [o appendString:@"\n== voice engine\n"]; [o appendString:RYDiagVoice()];
     [o appendString:@"\n== mic\n"]; [o appendString:RYMicReport()];
     [o appendString:@"\n== screen share\n"]; [o appendString:RYDiagBroadcast()];
-    [o appendFormat:@"\n== message logger\nupdates %d  kept %d  restored %d  skipped %d\nlast: %s\nvoice options last: %s (calls %d)\n", gLogUpd, gLogKept, gLogPut, gLogSkip, gLogLast, gTOLast, gTOCalls];
+    [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gTOLast, gTOCalls];
     { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
     return o;
 }
@@ -2368,6 +2361,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         RYBtn([NSString stringWithFormat:@"%@: %@", T(@"الخلفية", @"Background"), [CF(@"bgFull", @NO) boolValue] ? T(@"كل الشاشة", @"Full screen") : T(@"الدردشة فقط", @"Chat only")], NO, ^{
             CS(@"bgFull", @(![CF(@"bgFull", @NO) boolValue])); [[RYCore shared] bump]; RYRestoreAll(); [ws rebuild];
         }),
+        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @NO) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @NO) boolValue])); [ws rebuild]; }),
         RYBtn(RYAr() ? @"English" : @"العربية", NO, ^{ CS(@"lang", RYAr() ? @"en" : @"ar"); [ws rebuild]; })])];
     NSMutableArray *ac = [NSMutableArray new]; NSArray *cols = RYAccents();
     for (NSUInteger i = 0; i < cols.count; i++) {
