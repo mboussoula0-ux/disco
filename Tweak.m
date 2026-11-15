@@ -151,17 +151,33 @@
 #define RY_ROOM_DEFAULT @"ChatViewController" // matches DCDChatViewController, DiscordChat.ChatViewController and their containers; changeable in Diag
 
 static NSMutableDictionary *gCfg;
-
+// gCfg is read on EVERY audio buffer from the real-time CoreAudio render thread (RYMicFx/RYVoiceBlock
+// check gMicOn/gStOn/etc. via CF constantly while you're in a call) and written from the main thread
+// any time a setting changes, or from the 0.8 s tick. NSMutableDictionary is not safe for that: a write
+// landing mid-read (or mid-internal-rehash once the dict grows past a bucket threshold, which is exactly
+// what accumulates over a call's lifetime) can corrupt it, and a corrupted-dictionary read on the
+// real-time audio thread is a very plausible match for "crashes/kicks after sitting in a call a while,
+// chat freezes too" — CoreAudio tends to tear the whole process/session down hard when its thread faults.
+// Fix: a tiny, real-time-safe lock around the dictionary itself; the (slower) disk write in CS happens
+// on a snapshot COPY, outside the lock, so the audio thread's CF() never waits on disk I/O.
+static os_unfair_lock gCfgLock = OS_UNFAIR_LOCK_INIT;
 static void RYLoad(void) {
     @try {
         NSDictionary *d = [[NSUserDefaults standardUserDefaults] dictionaryForKey:RY_CFG];
         gCfg = d ? [d mutableCopy] : [NSMutableDictionary new];
     } @catch (__unused id e) { gCfg = [NSMutableDictionary new]; }
 }
-static id CF(NSString *k, id def) { id v = gCfg[k]; return v ?: def; }
+static id CF(NSString *k, id def) {
+    os_unfair_lock_lock(&gCfgLock); id v = gCfg[k]; os_unfair_lock_unlock(&gCfgLock);
+    return v ?: def;
+}
 static void CS(NSString *k, id v) {
+    NSDictionary *snap;
+    os_unfair_lock_lock(&gCfgLock);
     if (v) gCfg[k] = v; else [gCfg removeObjectForKey:k];
-    @try { [[NSUserDefaults standardUserDefaults] setObject:gCfg forKey:RY_CFG]; } @catch (__unused id e) {}
+    snap = [gCfg copy];
+    os_unfair_lock_unlock(&gCfgLock);
+    @try { [[NSUserDefaults standardUserDefaults] setObject:snap forKey:RY_CFG]; } @catch (__unused id e) {}
 }
 static NSString *RYDir(NSString *sub) {
     NSString *b = [[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"8ubah"] copy];
@@ -2196,11 +2212,24 @@ static NSString *RYCellMsgId(UITableViewCell *cell, id vm) {
     return mid;
 }
 static volatile int gPaintSeen = 0, gPaintNoId = 0, gPaintKept = 0;
+// A kept/red message is already gone on Discord's own server. Letting Discord's native reply/react/
+// context-menu gestures run against it (as if it were still real) is what was crashing/kicking the app
+// sometimes — Discord's own code doesn't expect to act on a message it no longer has. Rather than guess
+// at and swizzle Discord's private reply/context-menu methods (risky to get the exact ABI right without
+// a real device to test on, as the Fake Defen mistake showed), we just disable the EXISTING gesture
+// recognizers UIKit already attached to the cell — a message that's only a visual record becomes fully
+// read-only. This is reversible per cell (cells get reused for different messages), using only public,
+// stable UIKit API (no private selectors, no ABI guessing).
+static void RYSetCellInteractive(UITableViewCell *cell, BOOL on) {
+    for (UIGestureRecognizer *g in cell.gestureRecognizers) g.enabled = on;
+    for (UIGestureRecognizer *g in cell.contentView.gestureRecognizers) g.enabled = on;
+}
 static void RYDecorateCell(UITableViewCell *cell, id vm) {
     NSString *mid = RYCellMsgId(cell, vm);
     gPaintSeen++; if (!mid) gPaintNoId++;
     BOOL del = RYIsKept(mid);
     if (del) gPaintKept++;
+    RYSetCellInteractive(cell, !del);
     UIView *wash = [cell.contentView viewWithTag:8871];
     if (del) {
         if (!wash) { wash = [[UIView alloc] initWithFrame:cell.contentView.bounds]; wash.tag = 8871; wash.userInteractionEnabled = NO; wash.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [cell.contentView insertSubview:wash atIndex:0]; }
