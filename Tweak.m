@@ -75,7 +75,7 @@
 //     used only to see our own DELETE requests). [ASSUMED: which of the two answer paths Discord's REST client really uses; both are covered.]
 //
 // 5. MESSAGE LOGGER (kept deleted messages)  — the design and why
-//   Goal: a message somebody else deletes stays visible (red) in DMs, groups and servers, also after leaving / restarting the app.
+//   Goal: a message somebody else deletes stays visible (red) in DMs and group chats (never in servers: a delete with a guild_id always goes through), also after leaving / restarting the app.
 //   a) RYGatewayFilter sees MESSAGE_CREATE / MESSAGE_UPDATE and remembers the message JSON (RYCacheMsg, last 120 per channel, 60 channels) and
 //      every message-list REST answer too (RYMergeKeptRaw).
 //   b) MESSAGE_DELETE / MESSAGE_DELETE_BULK (not our own, see RYHttpSend/RYOwnDeleted): the remembered JSON is copied to
@@ -97,13 +97,19 @@
 //     Krisp/AGC run AFTER our injection point, which is why the engine options must be scrubbed too.
 //   * Safe mode: if the previous launch died within 10 s the audio hooks are skipped (key 8ubah.dc.launching).
 //
+// 6b. FAKE DEFEN (tab "Fake Defen")  [VERIFIED: the hooked selectors exist; behaviour on a phone ASSUMED until the Diag status line shows counters]
+//   Others see your mute/deafen badge only from the gateway frame op 4 (VOICE_STATE_UPDATE: self_mute/self_deaf) that JS sends through
+//   -[RCTWebSocketModule send:forSocketID:] (RYWsSendOut). While gFakeDef is on that one frame is rewritten to muted+deafened; the voice engine
+//   (capture / playback) is never touched, so you still talk and hear. RYFakeDefSet() also pushes a fresh op 4 immediately (built from gVSReal =
+//   the real state JS sent last) so the toggle takes effect without rejoining. Gateway socket id = any outgoing op 1/2/4/6 frame. Not persisted.
+//
 // 7. CODE MAP (search the #pragma mark lines)
 //   Config/storage (CF/CS, RYDir = Documents/8ubah), language T(ar,en), UI helpers (RYCard/RYBtn/...), view discovery (RYFindVC, RYAppWindows),
 //   background view + clearing (RYBGView, RYClear*), mic/stereo, voice hooks, message logger, Discord helpers (RYChatHost, RYLowestInput,
 //   RYPressSend, Diag report builders), RYWindow/RYCore (floating button, 0.8 s tick, background sync, sendMessage), quick-message loop,
-//   RYPanel (tabs: Mic, Stereo, Backgrounds, Quick messages, Diag), entry (__attribute__((constructor)) RYInit).
+//   RYPanel (tabs: Mic, Stereo, Backgrounds, Fake Defen), entry (__attribute__((constructor)) RYInit).
 //   Settings are stored with CS(key,value) / read with CF(key,default) (NSUserDefaults-like JSON, file ry.cfg.v1). Keys used by chat code:
-//   roomClass (chat class needle, default RY_ROOM_DEFAULT = "ChatViewController", a substring that matches DCDChatViewController), sendLabel, bgMode/bgFull, delAll (default YES = keep in servers too).
+//   roomClass (chat class needle, default RY_ROOM_DEFAULT = "ChatViewController", a substring that matches DCDChatViewController), sendLabel, bgMode/bgFull.
 //
 // 8. RULES / PITFALLS
 //   * UI rule at the top of this file (no explanatory text in the UI) is mandatory.
@@ -1493,7 +1499,7 @@ static void RYTintText(UIView *v, UIColor *to, int d) {
 }
 
 
-#pragma mark - Message logger (DMs): a message someone deletes stays in the chat, in red. Always on, no switch.
+#pragma mark - Message logger (DMs + group chats, never servers): a message someone deletes stays in the chat, in red. Always on, no switch.
 // How Discord really works (read from the binary): the gateway event MESSAGE_DELETE arrives over RCTWebSocketModule (already decompressed
 // text, "encoding=json"), JS removes the message from its store, then sends the native chat a *changeset* (DCDRowUpdateModel rows with
 // index + changeType). Re-inserting rows natively would shift every later index, so we stop it at the source instead: the delete event is
@@ -1504,6 +1510,76 @@ static NSMutableDictionary<NSString *, NSDate *> *gOwnDel;     // ids we deleted
 static volatile int gWsMsgs = 0, gLogSeen = 0, gLogKept = 0, gLogOwn = 0, gLogPass = 0; static char gLogLast[220] = "-";
 static void (*orig_cellCfg)(id, SEL, id, id, id);
 static void (*orig_wsSend)(id, SEL, NSString *, id);
+#pragma mark - Fake Deafen (voice): others see you as muted+deafened; your own mic/hearing are never touched.
+// Discord shows your mute/deafen badge to other people purely from the gateway's VOICE_STATE_UPDATE
+// (op 4) you send out — op:4,d:{...,self_mute,self_deaf,...}. We intercept that ONE outgoing frame and
+// force self_mute/self_deaf to true in it when the toggle is on. Nothing about the real voice engine
+// (RTC capture/playback, the real connectionInstanceSetSelfMute:/SetSelfDeafen: calls) is touched, so you
+// keep talking and hearing normally on your end the whole time.
+static id (*orig_wsSendOut)(id, SEL, id, id);
+static id (*orig_wsSendBinOut)(id, SEL, id, id);
+static NSString *const kFDLock = @"8ubah.fakedefen";
+static __weak id gWsMod;            // RCTWebSocketModule (seen on its first outgoing frame)
+static id gGwSock;                  // socket id of the gateway (seen on its heartbeat / identify / voice-state frames)
+static NSDictionary *gVSReal;       // the voice state JS really sent last (nil = not in a voice channel)
+static volatile BOOL gFakeDef = NO; // session only on purpose: after a restart you are never "deafened" by surprise
+static volatile int gFDSeen = 0, gFDForced = 0, gFDPushed = 0;
+static NSString *RYFakeDeafenFilter(NSString *s, id sockId) {
+    if (!s.length || s.length > 4000 || [s rangeOfString:@"\"op\""].location == NSNotFound) return s;
+    NSData *dt = [s dataUsingEncoding:NSUTF8StringEncoding]; if (!dt) return s;
+    id j = [NSJSONSerialization JSONObjectWithData:dt options:NSJSONReadingMutableContainers error:nil];
+    if (![j isKindOfClass:NSMutableDictionary.class]) return s;
+    NSInteger op = [j[@"op"] integerValue];
+    if (sockId && (op == 1 || op == 2 || op == 4 || op == 6)) @synchronized (kFDLock) { gGwSock = sockId; }   // only the gateway sends these
+    if (op != 4) return s;
+    id d = j[@"d"]; if (![d isKindOfClass:NSMutableDictionary.class]) return s;
+    gFDSeen++;
+    id ch = d[@"channel_id"];
+    @synchronized (kFDLock) { gVSReal = (ch && ch != NSNull.null) ? [d copy] : nil; }                    // what the app really wants (real mute / deafen)
+    if (!gFakeDef) return s;
+    d[@"self_mute"] = @YES; d[@"self_deaf"] = @YES; gFDForced++;
+    NSData *out = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
+    NSString *ns = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
+    return ns ?: s;
+}
+static id RYWsSendOut(id self, SEL _cmd, id data, id sockId) {
+    @try { gWsMod = self; if ([data isKindOfClass:NSString.class]) data = RYFakeDeafenFilter((NSString *)data, sockId); } @catch (__unused id e) {}
+    return orig_wsSendOut ? orig_wsSendOut(self, _cmd, data, sockId) : nil;
+}
+static id RYWsSendBinOut(id self, SEL _cmd, id data, id sockId) {
+    @try {
+        gWsMod = self;
+        if ([data isKindOfClass:NSString.class]) {
+            NSData *raw = [[NSData alloc] initWithBase64EncodedString:(NSString *)data options:0];
+            if (raw.length && raw.length < 4000) {
+                NSString *txt = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
+                NSString *f = txt ? RYFakeDeafenFilter(txt, sockId) : nil;
+                if (f && f != txt) data = [[f dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
+            }
+        }
+    } @catch (__unused id e) {}
+    return orig_wsSendBinOut ? orig_wsSendBinOut(self, _cmd, data, sockId) : nil;
+}
+// Switch on/off. If you are in a voice channel right now a fresh voice-state frame goes out at once (fake = muted+deafened, off = your real state);
+// otherwise it is only armed and applies to the next voice-state frame the app sends. Returns 1 = frame sent, 0 = armed only.
+static int RYFakeDefSet(BOOL on) {
+    gFakeDef = on;
+    id mod, sock; NSDictionary *real;
+    @synchronized (kFDLock) { mod = gWsMod; sock = gGwSock; real = gVSReal; }
+    if (!mod || !sock || !real || !orig_wsSendOut) return 0;
+    NSMutableDictionary *d = [real mutableCopy];
+    if (on) { d[@"self_mute"] = @YES; d[@"self_deaf"] = @YES; }
+    NSData *x = [NSJSONSerialization dataWithJSONObject:@{@"op": @4, @"d": d} options:0 error:nil];
+    NSString *s = x ? [[NSString alloc] initWithData:x encoding:NSUTF8StringEncoding] : nil; if (!s) return 0;
+    SEL mq = NSSelectorFromString(@"methodQueue");
+    dispatch_queue_t q = [mod respondsToSelector:mq] ? ((dispatch_queue_t (*)(id, SEL))objc_msgSend)(mod, mq) : nil;
+    dispatch_async(q ?: dispatch_get_main_queue(), ^{ @try { orig_wsSendOut(mod, NSSelectorFromString(@"send:forSocketID:"), s, sock); gFDPushed++; } @catch (__unused id e) {} });
+    return 1;
+}
+static NSString *RYFakeDefStatus(void) {
+    BOOL inV, gw; @synchronized (kFDLock) { inV = gVSReal != nil; gw = gGwSock != nil; }
+    return [NSString stringWithFormat:T(@"روم صوتي: %@ · البوابة: %@ · معدّلة %d · مرسلة %d", @"Voice channel: %@ · gateway: %@ · forced %d · sent %d"), inV ? @"✓" : @"✗", gw ? @"✓" : @"✗", gFDForced, gFDPushed];
+}
 static id (*orig_httpSend)(id, SEL, id, id);
 #define RY_RED [UIColor colorWithRed:1.0 green:0.27 blue:0.27 alpha:1]
 static UIView *RYChatHost(void);
@@ -1557,6 +1633,7 @@ static void RYDelLoad(void) {
             NSMutableDictionary *m = gDelStore[cid] ?: [NSMutableDictionary new];
             for (id o in a) {
                 if (![o isKindOfClass:NSDictionary.class]) continue;
+                if (o[@"guild_id"] && o[@"guild_id"] != NSNull.null) continue;                            // old server entries are dropped: servers are not kept any more
                 NSString *mid = RYStr(o[@"id"]); NSData *x = [NSJSONSerialization dataWithJSONObject:o options:0 error:nil];
                 if (mid && x) { m[mid] = x; [gLogIds addObject:mid]; }
             }
@@ -1650,7 +1727,7 @@ static NSString *RYGatewayFilter(NSString *s) {
     NSDictionary *d = j[@"d"]; if (![d isKindOfClass:NSDictionary.class]) return s;
     RYLogInit(); gLogSeen++;
     id gid = d[@"guild_id"];
-    if (gid && gid != NSNull.null && ![CF(@"delAll", @YES) boolValue]) { gLogPass++; return s; }      // kept everywhere by default; switch to "DMs only" in settings to exclude servers
+    if (gid && gid != NSNull.null) { gLogPass++; return s; }                                         // a server message (guild_id present): the delete goes through normally. Only DMs and group chats are kept.
     NSArray *ids = bulk ? d[@"ids"] : (d[@"id"] ? @[d[@"id"]] : @[]);
     if (![ids isKindOfClass:NSArray.class] || !ids.count) return s;
     NSString *cid0 = RYStr(d[@"channel_id"]), *mid0 = RYStr(ids.firstObject);
@@ -1856,7 +1933,15 @@ static void RYNetSendData(id self, SEL _cmd, NSData *data, NSString *type, id re
     if (orig_netData) orig_netData(self, _cmd, use, type, resp, task);
 }
 static void RYInstallLogger(void) {
-    static BOOL cellDone, wsDone, httpDone, netDone, evtDone; RYLogInit();
+    static BOOL cellDone, wsDone, httpDone, netDone, evtDone, outDone; RYLogInit();
+    if (!outDone) {
+        Class wc = NSClassFromString(@"RCTWebSocketModule");
+        SEL s1 = NSSelectorFromString(@"send:forSocketID:"), s2 = NSSelectorFromString(@"sendBinary:forSocketID:");
+        Method m1 = wc ? class_getInstanceMethod(wc, s1) : NULL, m2 = wc ? class_getInstanceMethod(wc, s2) : NULL;
+        if (m1 && method_getNumberOfArguments(m1) == 4) { orig_wsSendOut = (void *)method_getImplementation(m1); class_replaceMethod(wc, s1, (IMP)RYWsSendOut, method_getTypeEncoding(m1)); }
+        if (m2 && method_getNumberOfArguments(m2) == 4) { orig_wsSendBinOut = (void *)method_getImplementation(m2); class_replaceMethod(wc, s2, (IMP)RYWsSendBinOut, method_getTypeEncoding(m2)); }
+        if (m1 || m2) { outDone = YES; RYLog(@"logger: outgoing websocket hook installed (fake deafen)"); }
+    }
     if (!cellDone) {
         Class cc = NSClassFromString(@"DCDMessageTableViewCell");
         Method cm = cc ? class_getInstanceMethod(cc, NSSelectorFromString(@"configureWithViewModel:viewReusePoolManager:actionManager:")) : NULL;
@@ -2311,10 +2396,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds")];
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen"];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @1, @2];
-    if (self.tab < 0 || self.tab > 2) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @3];
+    if (self.tab < 0 || self.tab > 3) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -2344,7 +2429,7 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; default: [self renderBG]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; default: [self renderBG]; }
 }
 #pragma mark Locked
 - (void)renderLocked {
@@ -2663,6 +2748,21 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 }
 
 #pragma mark Diag
+- (void)renderFake {
+    __weak typeof(self) ws = self;
+    BOOL on = gFakeDef;
+    UIButton *b = RYBtn([NSString stringWithFormat:@"%@: %@", T(@"ميوت ودفن وهمي", @"Fake mute + deafen"), on ? T(@"شغّال", @"ON") : T(@"مطفي", @"OFF")], on, ^{
+        BOOL want = !gFakeDef; int r = RYFakeDefSet(want);
+        [ws toast:want ? (r ? T(@"الباقين يشوفونك ميوت ودفن", @"Others now see you muted + deafened") : T(@"جاهز — يشتغل أول ما تدخل روم صوتي", @"Armed — applies when you join a voice channel"))
+                       : (r ? T(@"رجعت حالتك الحقيقية", @"Your real state is back") : T(@"انطفى", @"Off"))];
+        [ws rebuild];
+    });
+    [self.stack addArrangedSubview:RYCard(@[b])];
+    self.invLabel = RYLabel(RYFakeDefStatus(), 13, UIFontWeightMedium, RY_MUTED);
+    [self.stack addArrangedSubview:RYCard(@[self.invLabel])];
+    [self.invUI invalidate];
+    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYFakeDefStatus(); }];
+}
 - (void)renderDiag {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYCard(@[
@@ -2684,7 +2784,6 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         RYBtn([NSString stringWithFormat:@"%@: %@", T(@"الخلفية", @"Background"), [CF(@"bgFull", @NO) boolValue] ? T(@"كل الشاشة", @"Full screen") : T(@"الدردشة فقط", @"Chat only")], NO, ^{
             CS(@"bgFull", @(![CF(@"bgFull", @NO) boolValue])); [[RYCore shared] bump]; RYRestoreAll(); [ws rebuild];
         }),
-        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @YES) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @YES) boolValue])); [ws rebuild]; }),
         RYBtn(RYAr() ? @"English" : @"العربية", NO, ^{ CS(@"lang", RYAr() ? @"en" : @"ar"); [ws rebuild]; })])];
     NSMutableArray *ac = [NSMutableArray new]; NSArray *cols = RYAccents();
     for (NSUInteger i = 0; i < cols.count; i++) {
