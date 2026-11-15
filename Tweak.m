@@ -1549,6 +1549,7 @@ static NSString *gFDOwnId;          // your user id (from READY)
 static NSDictionary *gVSReal;       // your REAL voice state {guild_id, channel_id, self_mute, self_deaf, self_video}; nil = not in a voice channel
 static volatile BOOL gFakeDef = NO, gFDPending = NO, gFDHooked = NO;   // session only; Pending = switched on outside a room, applies when you join
 static volatile int gFDSeen = 0, gFDForced = 0, gFDPushed = 0;
+static volatile BOOL gWsInHooked = NO, gSafeLaunch = NO;   // incoming gateway hook installed / this launch skipped the hooks (safe mode)
 static BOOL RYSendArgIsObj(Method m) { char *t = method_copyArgumentType(m, 3); BOOL o = t && t[0] == '@'; if (t) free(t); return o; }
 static Method RYSendMethod(void) {
     Class wc = NSClassFromString(@"RCTWebSocketModule"); if (!wc) return NULL;
@@ -1579,13 +1580,16 @@ static NSString *RYFakeDeafenFilter(NSString *s, BOOL hasSock, double sockId) { 
     NSString *ns = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
     return ns ?: s;
 }
+static void RYFDLearn(NSString *s, double sockId) {    // heartbeat {"op":1,...} always goes over the gateway socket: that is how we learn its id
+    if ([s isKindOfClass:NSString.class] && s.length < 60 && [s hasPrefix:@"{\"op\":1,"]) RYSetGwSock(sockId);
+}
 static void RYWsSendOutD(id self, SEL _cmd, id data, double sockId) {
-    @try { gWsMod = self; if (gFakeDef && [data isKindOfClass:NSString.class]) data = RYFakeDeafenFilter((NSString *)data, YES, sockId); } @catch (__unused id e) {}
+    @try { gWsMod = self; RYFDLearn(data, sockId); if (gFakeDef && [data isKindOfClass:NSString.class]) data = RYFakeDeafenFilter((NSString *)data, YES, sockId); } @catch (__unused id e) {}
     if (orig_wsSendOut) orig_wsSendOut(self, _cmd, data, sockId);
 }
 static void RYWsSendOutO(id self, SEL _cmd, id data, id sockId) {
     @try {
-        gWsMod = self;
+        gWsMod = self; if ([sockId respondsToSelector:@selector(doubleValue)]) RYFDLearn(data, [sockId doubleValue]);
         if (gFakeDef && [data isKindOfClass:NSString.class]) { BOOL h = [sockId respondsToSelector:@selector(doubleValue)]; data = RYFakeDeafenFilter((NSString *)data, h, h ? [sockId doubleValue] : 0); }
     } @catch (__unused id e) {}
     if (orig_wsSendOutO) orig_wsSendOutO(self, _cmd, data, sockId);
@@ -1690,18 +1694,21 @@ static void RYFDWatch(const char *p, size_t n, id sockId, id module) {
 // The switch. In a room: hook + one voice-state frame at once (off: your real state again, hook removed). Outside a room: only armed.
 static int RYFakeDefSet(BOOL on) {
     gFakeDef = on;
+    if (on) RYFDHook(YES);          // from this moment every outgoing op-4 frame is rewritten, even if the app never told us about the room (the incoming frames may not reach us)
     NSDictionary *real; @synchronized (kFDLock) { real = gVSReal; }
     if (!real && RYFDResolve()) { @synchronized (kFDLock) { real = gVSReal; } }
     if (!real) { gFDPending = on; if (!on) RYFDHook(NO); return 0; }
     gFDPending = NO;
-    if (on) RYFDHook(YES);
     int r = RYFDPush(on);
     if (!on) RYFDHook(NO);
     return r;
 }
 static NSString *RYFakeDefStatus(void) {
     BOOL idk, inV; int cached; @synchronized (kFDLock) { idk = gFDOwnId != nil; inV = gVSReal != nil; cached = (int)gFDVS.count; }
-    return [NSString stringWithFormat:T(@"حسابك: %@ · روم صوتي: %@ · الهوك: %@ · فريمات %d · حالات %d · معدّلة %d · مرسلة %d", @"Account: %@ · voice channel: %@ · hook: %@ · frames %d · states %d · forced %d · sent %d"), idk ? @"✓" : @"✗", inV ? @"✓" : @"✗", gFDHooked ? @"✓" : @"✗", gFDFrames, cached, gFDForced, gFDPushed];
+    NSString *hk = gFDHooked ? @"✓" : (RYSendMethod() ? @"✗" : @"✗ (no send:)");
+    NSString *l1 = [NSString stringWithFormat:T(@"حسابك: %@ · روم صوتي: %@ · الهوك: %@ · فريمات %d · حالات %d · معدّلة %d · مرسلة %d", @"Account: %@ · voice channel: %@ · hook: %@ · frames %d · states %d · forced %d · sent %d"), idk ? @"✓" : @"✗", inV ? @"✓" : @"✗", hk, gFDFrames, cached, gFDForced, gFDPushed];
+    NSString *l2 = [NSString stringWithFormat:T(@"استقبال: %@ · رسائل %d · op4 مرّت %d · وضع آمن: %@", @"incoming hook: %@ · ws msgs %d · op4 seen %d · safe mode: %@"), gWsInHooked ? @"✓" : @"✗", gWsMsgs, gFDSeen, gSafeLaunch ? @"✓" : @"✗"];
+    return [l1 stringByAppendingFormat:@"\n%@", l2];
 }
 static id (*orig_httpSend)(id, SEL, id, id);
 #define RY_RED [UIColor colorWithRed:1.0 green:0.27 blue:0.27 alpha:1]
@@ -2066,7 +2073,7 @@ static void RYInstallLogger(void) {
     if (!wsDone) {
         Class wc = NSClassFromString(@"RCTWebSocketModule"); SEL s = NSSelectorFromString(@"sendEventWithName:body:");
         Method m = wc ? class_getInstanceMethod(wc, s) : NULL;
-        if (m && method_getNumberOfArguments(m) == 4) { orig_wsSend = (void *)method_getImplementation(m); class_replaceMethod(wc, s, (IMP)RYWsSend, method_getTypeEncoding(m)); wsDone = YES; RYLog(@"logger: websocket hook installed"); }
+        if (m && method_getNumberOfArguments(m) == 4) { orig_wsSend = (void *)method_getImplementation(m); class_replaceMethod(wc, s, (IMP)RYWsSend, method_getTypeEncoding(m)); wsDone = YES; gWsInHooked = YES; RYLog(@"logger: websocket hook installed"); }
     }
     if (!netDone) {
         Class nc = NSClassFromString(@"RCTNetworking"); SEL ns = NSSelectorFromString(@"sendData:responseType:response:forTask:");
@@ -2869,7 +2876,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     BOOL on = gFakeDef;
     UIButton *b = RYBtn([NSString stringWithFormat:@"%@: %@", T(@"ميوت ودفن وهمي", @"Fake mute + deafen"), on ? T(@"شغّال", @"ON") : T(@"مطفي", @"OFF")], on, ^{
         BOOL want = !gFakeDef; int r = RYFakeDefSet(want);
-        [ws toast:want ? (r ? T(@"الباقين يشوفونك ميوت ودفن", @"Others now see you muted + deafened") : T(@"جاهز — يشتغل أول ما تدخل روم صوتي", @"Armed — applies when you join a voice channel"))
+        [ws toast:want ? (r ? T(@"الباقين يشوفونك ميوت ودفن", @"Others now see you muted + deafened") : T(@"جاهز — بدّل الميوت أو الديفن مرة وحدة (أو ادخل روم) وبيتطبق", @"Armed — toggle mute or deafen once (or join a room) and it applies"))
                        : (r ? T(@"رجعت حالتك الحقيقية", @"Your real state is back") : T(@"انطفى", @"Off"))];
         [ws rebuild];
     });
@@ -3047,7 +3054,7 @@ __attribute__((constructor)) static void RYInit(void) {
     RYLoad();
     // crash-loop guard: if the previous launch died within 10 seconds, this launch skips the audio hooks
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    BOOL safe = [ud boolForKey:@"8ubah.dc.launching"];
+    BOOL safe = [ud boolForKey:@"8ubah.dc.launching"]; gSafeLaunch = safe;
     [ud setBool:YES forKey:@"8ubah.dc.launching"]; [ud synchronize];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [ud setBool:NO forKey:@"8ubah.dc.launching"]; [ud synchronize]; });
     RYLog(@"=== launch (pid %d) mode: %@ ===", getpid(), safe ? @"SAFE (previous launch crashed)" : @"normal");
