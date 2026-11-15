@@ -1637,6 +1637,7 @@ static BOOL RYFDResolve(void) {     // build gVSReal (the real state) from the c
     return YES;
 }
 static int RYFDPush(BOOL fake);
+static void RYFPFrameAsync(NSData *raw);
 static void RYFDKick(void) {        // switched on outside a room: as soon as the room is known, hook + fake frame
     if (!gFakeDef || !gFDPending) return;
     NSDictionary *real; @synchronized (kFDLock) { real = gVSReal; }
@@ -1674,6 +1675,7 @@ static void RYFDWatch(const char *p, size_t n, id sockId, id module) {
     if (z == q || z - q > 24) return;
     NSString *uid = [[NSString alloc] initWithBytes:q length:(NSUInteger)(z - q) encoding:NSASCIIStringEncoding];
     NSData *raw = [NSData dataWithBytes:p length:n];
+    RYFPFrameAsync(raw);                                              // Follow / Pull
     BOOL own;
     @synchronized (kFDLock) {
         if (module) gWsMod = module; if ([sockId respondsToSelector:@selector(doubleValue)]) { gGwSock = [sockId doubleValue]; gGwSockSet = YES; }     // only the gateway carries voice states
@@ -1718,6 +1720,215 @@ static NSString *RYStr(id v) {
     if (!v || v == NSNull.null) return nil;
     NSString *s = [v isKindOfClass:NSString.class] ? v : [v description]; return s.length ? s : nil;
 }
+#pragma mark - Follow / Pull (voice): two buttons on a profile sheet. Session only: everything lives in memory and is gone when Discord is closed.
+// Follow = you join the voice channel the person joins (one person at a time, a new Follow replaces the old one).
+// Pull   = the person is moved to your voice channel, now and every time one of you changes channel (any number of people). Needs the Move Members permission.
+// Voice states of everybody come from the incoming gateway frames (RYFDWatch -> RYFPFrameAsync). Joining = the same op-4 frame the app itself sends (RYFPOp4),
+// moving someone = PATCH /guilds/<g>/members/<u> {channel_id} with the headers of a real request of the app (captured in RYHttpSend, never stored on disk).
+static NSObject *gFPLock;
+static NSString *gFPFollow, *gFPMyG, *gFPMyC, *gFPProfUid, *gApiBase;
+static NSDate *gFPProfAt;
+static NSMutableSet<NSString *> *gFPPull;
+static NSMutableDictionary<NSString *, NSDictionary *> *gFPUser;     // uid -> {c: channel, g: guild} of its last voice state ({} = not in voice)
+static NSMutableDictionary<NSString *, NSString *> *gFPNames;        // lowercase username / display name / nick -> uid
+static NSMutableDictionary<NSString *, NSDate *> *gFPCool;
+static NSMutableDictionary<NSString *, NSNumber *> *gFPFail;
+static NSDictionary *gApiHdr;
+static dispatch_queue_t gFPQ;
+static volatile int gFPJoins = 0, gFPMoves = 0, gFPErr = 0, gFPFrames = 0, gFPLastStatus = 0;
+static NSString *gFPSrc = @"-"; static NSInteger gFPLabelCount = 0;
+static void RYFPInit(void) {
+    static dispatch_once_t o; dispatch_once(&o, ^{
+        gFPLock = [NSObject new]; gFPPull = [NSMutableSet new]; gFPUser = [NSMutableDictionary new]; gFPNames = [NSMutableDictionary new];
+        gFPCool = [NSMutableDictionary new]; gFPFail = [NSMutableDictionary new]; gFPQ = dispatch_queue_create("8ubah.followpull", DISPATCH_QUEUE_SERIAL);
+    });
+}
+static void RYFPHud(NSString *s) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Class k = NSClassFromString(@"RYCore"); if (!k) return;
+        id c = ((id (*)(id, SEL))objc_msgSend)(k, NSSelectorFromString(@"shared"));
+        ((void (*)(id, SEL, id))objc_msgSend)(c, NSSelectorFromString(@"hud:"), s);
+    });
+}
+static BOOL RYFPOK(NSString *key, double sec) {        // cooldown per action: no hammering, no ping-pong
+    RYFPInit();
+    @synchronized (gFPLock) {
+        NSDate *d = gFPCool[key]; if (d && -[d timeIntervalSinceNow] < sec) return NO;
+        gFPCool[key] = [NSDate date]; if (gFPCool.count > 500) [gFPCool removeAllObjects];
+        return YES;
+    }
+}
+// called from the HTTP hook: keeps the headers of a real REST request (for Pull) and the id of the last opened profile (for the buttons)
+static void RYFPCaptureReq(NSURLRequest *r) {
+    NSURL *u = r.URL; NSString *host = u.host.lowercaseString; NSString *path = u.path;
+    if (!host.length || ![host hasSuffix:@"discord.com"] || ![path hasPrefix:@"/api/"]) return;
+    RYFPInit();
+    NSArray *pc = [path componentsSeparatedByString:@"/"];      // "", api, v9, users, <id>, profile
+    NSUInteger i = [pc indexOfObject:@"users"];
+    if (i != NSNotFound && i + 2 < pc.count && [pc[i + 2] isEqual:@"profile"] && [pc[i + 1] length] >= 15) @synchronized (gFPLock) { gFPProfUid = pc[i + 1]; gFPProfAt = [NSDate date]; }
+    NSDictionary *h = r.allHTTPHeaderFields; NSString *auth = nil;
+    for (NSString *k in h) if ([k caseInsensitiveCompare:@"authorization"] == NSOrderedSame) { auth = h[k]; break; }
+    if (!auth.length) return;
+    NSMutableDictionary *m = [NSMutableDictionary new];
+    for (NSString *k in h) { NSString *kl = k.lowercaseString; if ([kl isEqual:@"content-length"] || [kl isEqual:@"content-type"] || [kl isEqual:@"cookie"] || [kl hasPrefix:@"if-"]) continue; m[k] = h[k]; }
+    @synchronized (gFPLock) { gApiHdr = m; gApiBase = [NSString stringWithFormat:@"%@://%@/api/%@", u.scheme ?: @"https", u.host, pc.count > 2 ? pc[2] : @"v9"]; }
+}
+static BOOL RYFPOp4(NSString *g, NSString *c) {         // same frame the app sends when you click another voice channel
+    id mod; double sock; BOOL have; NSDictionary *real; @synchronized (kFDLock) { mod = gWsMod; sock = gGwSock; have = gGwSockSet; real = gVSReal; }
+    IMP send = RYSendOrig(); if (!mod || !have || !send) return NO;
+    BOOL mu = real ? [real[@"self_mute"] boolValue] : gFDRM, df = real ? [real[@"self_deaf"] boolValue] : gFDRD;
+    if (gFakeDef) { mu = YES; df = YES; }                // Fake Defean stays on while we move
+    NSData *x = [NSJSONSerialization dataWithJSONObject:@{@"op": @4, @"d": @{@"guild_id": g, @"channel_id": c, @"self_mute": @(mu), @"self_deaf": @(df), @"self_video": @NO}} options:0 error:nil];
+    NSString *s = x ? [[NSString alloc] initWithData:x encoding:NSUTF8StringEncoding] : nil; if (!s) return NO;
+    SEL mq = NSSelectorFromString(@"methodQueue");
+    dispatch_queue_t q = [mod respondsToSelector:mq] ? ((dispatch_queue_t (*)(id, SEL))objc_msgSend)(mod, mq) : nil;
+    BOOL obj = orig_wsSendOutO != NULL;
+    dispatch_async(q ?: dispatch_get_main_queue(), ^{
+        @try {
+            SEL ss = NSSelectorFromString(@"send:forSocketID:");
+            if (obj) ((void (*)(id, SEL, id, id))send)(mod, ss, s, @(sock)); else ((void (*)(id, SEL, id, double))send)(mod, ss, s, sock);
+        } @catch (__unused id e) {}
+    });
+    @synchronized (kFDLock) { if (gVSReal) { NSMutableDictionary *n = [gVSReal mutableCopy]; n[@"guild_id"] = g; n[@"channel_id"] = c; gVSReal = n; } }
+    return YES;
+}
+static void RYFPOpenLink(NSString *g, NSString *c) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"discord://discord.com/channels/%@/%@", g, c]];
+        if (u) [UIApplication.sharedApplication openURL:u options:@{} completionHandler:nil];
+    });
+}
+static void RYFPJoin(NSString *g, NSString *c) {
+    NSString *myC; @synchronized (gFPLock) { myC = gFPMyC; }
+    if (myC.length && RYFPOp4(g, c)) {                   // already in a voice channel: the server just moves us
+        gFPJoins++;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSString *now, *fol; @synchronized (gFPLock) { now = gFPMyC; fol = gFPFollow; }
+            if (fol && ![now isEqual:c]) RYFPOpenLink(g, c);   // no echo of our move: open the channel the normal way
+        });
+    } else { gFPJoins++; RYFPOpenLink(g, c); }
+}
+static void RYFPMove(NSString *uid, NSString *g, NSString *c) {
+    NSDictionary *h; NSString *base; @synchronized (gFPLock) { h = gApiHdr; base = gApiBase; }
+    if (!h || !base) { RYFPHud(T(@"افتح أي دردشة مرة وحدة وجرّب", @"Open any chat once, then try again")); return; }
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%@/guilds/%@/members/%@", base, g, uid]]; if (!url) return;
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:url]; r.HTTPMethod = @"PATCH"; r.timeoutInterval = 15;
+    [h enumerateKeysAndObjectsUsingBlock:^(id k, id v, BOOL *stop) { [r setValue:v forHTTPHeaderField:k]; }];
+    [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"channel_id": c} options:0 error:nil];
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        NSInteger st = [resp isKindOfClass:NSHTTPURLResponse.class] ? [(NSHTTPURLResponse *)resp statusCode] : 0; gFPLastStatus = (int)st;
+        @synchronized (gFPLock) {
+            if (st >= 200 && st < 300) { gFPMoves++; [gFPFail removeObjectForKey:uid]; return; }
+            gFPErr++; int n = [gFPFail[uid] intValue] + 1; gFPFail[uid] = @(n);
+            if (n >= 3 || st == 401 || st == 403) { [gFPPull removeObject:uid]; [gFPFail removeObjectForKey:uid]; RYFPHud([NSString stringWithFormat:T(@"Pull وقف (%ld)", @"Pull stopped (%ld)"), (long)st]); }
+        }
+    }] resume];
+}
+static void RYFPPullOne(NSString *p) {
+    NSString *myC, *myG; NSDictionary *u; @synchronized (gFPLock) { myC = gFPMyC; myG = gFPMyG; u = gFPUser[p]; }
+    NSString *c = u[@"c"], *g = u[@"g"];
+    if (!myC.length || !myG.length || !c.length || ![g isEqual:myG] || [c isEqual:myC]) return;     // not in voice / other server / already with us
+    if (!RYFPOK([@"m:" stringByAppendingString:p], 4)) return;
+    RYFPMove(p, myG, myC);
+}
+static void RYFPAct(NSString *uid) {                    // something changed for uid (or for us): do what Follow / Pull ask for
+    RYFPInit();
+    NSString *me = gFDOwnId, *myC, *fol; NSSet *pulls; NSDictionary *u;
+    @synchronized (gFPLock) { myC = gFPMyC; fol = gFPFollow; pulls = [gFPPull copy]; u = gFPUser[uid]; }
+    if (me && [uid isEqual:me]) { for (NSString *p in pulls) RYFPPullOne(p); return; }            // we changed channel: everybody on Pull comes along
+    NSString *c = u[@"c"], *g = u[@"g"];
+    if (fol && [uid isEqual:fol] && c.length && g.length && ![c isEqual:myC] && RYFPOK([@"j:" stringByAppendingString:c], 4)) RYFPJoin(g, c);
+    if ([pulls containsObject:uid]) RYFPPullOne(uid);
+}
+static void RYFPFrame(NSData *raw) {
+    id j = [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil];
+    id d = [j isKindOfClass:NSDictionary.class] ? j[@"d"] : nil; if (![d isKindOfClass:NSDictionary.class]) return;
+    NSString *uid = RYStr(d[@"user_id"]); if (!uid.length) return;
+    NSString *ch = RYStr(d[@"channel_id"]), *gd = RYStr(d[@"guild_id"]) ?: @"";
+    gFPFrames++;
+    @synchronized (gFPLock) {
+        if (gFPUser.count > 6000) [gFPUser removeAllObjects];
+        if (gFPNames.count > 4000) [gFPNames removeAllObjects];
+        gFPUser[uid] = ch.length ? @{@"c": ch, @"g": gd} : @{};
+        id mem0 = d[@"member"]; NSDictionary *mem = [mem0 isKindOfClass:NSDictionary.class] ? mem0 : nil; id usr = mem[@"user"];
+        for (id nm in @[mem[@"nick"] ?: NSNull.null, [usr isKindOfClass:NSDictionary.class] ? (usr[@"username"] ?: NSNull.null) : NSNull.null, [usr isKindOfClass:NSDictionary.class] ? (usr[@"global_name"] ?: NSNull.null) : NSNull.null]) {
+            NSString *k = [nm isKindOfClass:NSString.class] ? [(NSString *)nm lowercaseString] : nil; if (k.length) gFPNames[k] = uid;
+        }
+        if (gFDOwnId && [uid isEqual:gFDOwnId]) { gFPMyC = ch.length ? ch : nil; gFPMyG = ch.length ? gd : nil; }
+    }
+    RYFPAct(uid);
+}
+static void RYFPFrameAsync(NSData *raw) {
+    RYFPInit(); if (!raw.length) return;
+    dispatch_async(gFPQ, ^{ @try { RYFPFrame(raw); } @catch (__unused id e) {} });
+}
+static void RYFPToggleFollow(NSString *uid) {
+    RYFPInit(); BOOL on;
+    @synchronized (gFPLock) { if ([gFPFollow isEqual:uid]) { gFPFollow = nil; on = NO; } else { gFPFollow = uid; on = YES; } }
+    if (on) dispatch_async(gFPQ, ^{ @synchronized (gFPLock) { [gFPCool removeAllObjects]; } RYFPAct(uid); });
+}
+static void RYFPTogglePull(NSString *uid) {
+    RYFPInit(); BOOL on;
+    @synchronized (gFPLock) { if ([gFPPull containsObject:uid]) { [gFPPull removeObject:uid]; on = NO; } else { [gFPPull addObject:uid]; on = YES; } [gFPFail removeObjectForKey:uid]; }
+    if (on) dispatch_async(gFPQ, ^{ @synchronized (gFPLock) { [gFPCool removeAllObjects]; } RYFPAct(uid); });
+}
+// ---- finding the profile sheet on screen (main thread). Its text comes from the accessibility labels of the React Native text views.
+static NSString *RYFPText(UIView *v) {
+    NSString *t = v.accessibilityLabel;
+    if (![t isKindOfClass:NSString.class] || !t.length) { if ([v isKindOfClass:UILabel.class]) t = ((UILabel *)v).text; else if ([v isKindOfClass:UITextView.class]) t = ((UITextView *)v).text; else t = nil; }
+    return [t isKindOfClass:NSString.class] ? t : nil;
+}
+static BOOL RYFPSig(NSString *t) {
+    static NSSet *s; static dispatch_once_t o; dispatch_once(&o, ^{ s = [NSSet setWithArray:@[@"Member Since", @"Moderator Actions", @"About Me", @"Mutual Servers", @"Mutual Friends", @"Connections"]]; });
+    return [s containsObject:t];
+}
+static void RYFPFindAnchor(UIView *v, int d, int *budget, UIView **hit) {
+    if (*hit || !v || d > 70 || (*budget)-- <= 0 || v.hidden || v.alpha < 0.05) return;
+    NSString *t = RYFPText(v); if (t.length && t.length < 40 && RYFPSig(t)) { *hit = v; return; }
+    for (UIView *s in v.subviews) { RYFPFindAnchor(s, d + 1, budget, hit); if (*hit) return; }
+}
+static void RYFPLabels(UIView *v, int d, int *budget, NSMutableArray *out) {
+    if (!v || d > 50 || (*budget)-- <= 0 || v.hidden || v.alpha < 0.05) return;
+    NSString *t = RYFPText(v); if (t.length && t.length <= 80) [out addObject:t];
+    for (UIView *s in v.subviews) RYFPLabels(s, d + 1, budget, out);
+}
+static BOOL RYFPFindSheet(NSString **uidOut) {          // YES = a profile sheet is open; *uidOut = whose (nil if it could not be told)
+    RYFPInit(); *uidOut = nil;
+    UIView *anchor = nil; UIWindow *win = nil;
+    for (UIWindow *w in RYAppWindows()) { int b = 14000; RYFPFindAnchor(w, 0, &b, &anchor); if (anchor) { win = w; break; } }
+    if (!anchor) return NO;
+    CGSize ws = win.bounds.size; UIView *cont = anchor;
+    for (UIView *p = anchor.superview; p && p != win; p = p.superview) {
+        CGRect f = [p convertRect:p.bounds toView:nil];
+        if (f.size.width >= ws.width * 0.9 && f.size.height >= ws.height * 0.3 && f.size.height <= ws.height * 1.05) { cont = p; break; }
+    }
+    NSMutableArray *labels = [NSMutableArray new]; int b = 6000; RYFPLabels(cont, 0, &b, labels); gFPLabelCount = (NSInteger)labels.count;
+    NSMutableDictionary<NSString *, NSNumber *> *tally = [NSMutableDictionary new];
+    NSString *prof = nil;
+    @synchronized (gFPLock) {
+        for (NSString *t in labels) {
+            NSString *k = [[t stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] lowercaseString]; if ([k hasPrefix:@"@"]) k = [k substringFromIndex:1];
+            NSString *u = k.length ? gFPNames[k] : nil; if (u) tally[u] = @([tally[u] intValue] + 1);
+        }
+        if (gFPProfUid && gFPProfAt && -[gFPProfAt timeIntervalSinceNow] < 40) prof = gFPProfUid;
+    }
+    NSString *best = nil; int bc = 0; for (NSString *u in tally) if ([tally[u] intValue] > bc) { bc = [tally[u] intValue]; best = u; }
+    if (best) { gFPSrc = @"name"; *uidOut = best; } else if (prof) { gFPSrc = @"profile request"; *uidOut = prof; } else gFPSrc = @"none";
+    return YES;
+}
+static NSString *RYFPDiag(void) {
+    RYFPInit(); NSMutableString *o = [NSMutableString new];
+    NSString *fol, *myC, *myG; NSArray *pulls; BOOL auth; NSUInteger nn, nu; NSDate *pa; NSString *pu;
+    @synchronized (gFPLock) { fol = gFPFollow; myC = gFPMyC; myG = gFPMyG; pulls = gFPPull.allObjects; auth = gApiHdr != nil; nn = gFPNames.count; nu = gFPUser.count; pu = gFPProfUid; pa = gFPProfAt; }
+    [o appendFormat:@"follow: %@\npull: %@\nmy voice channel: %@ (guild %@)\nown id known: %d   voice frames handled %d   names %lu   users %lu\n", fol ?: @"-", pulls.count ? [pulls componentsJoinedByString:@","] : @"-", myC ?: @"-", myG ?: @"-", gFDOwnId != nil, gFPFrames, (unsigned long)nn, (unsigned long)nu];
+    [o appendFormat:@"request headers captured: %d   last profile request: %@ (%.0fs ago)\njoins %d   moves ok %d   move errors %d (last status %d)\nsheet id source: %@   labels in sheet %ld\n", auth, pu ?: @"-", pa ? -[pa timeIntervalSinceNow] : -1.0, gFPJoins, gFPMoves, gFPErr, gFPLastStatus, gFPSrc, (long)gFPLabelCount];
+    NSMutableArray *ls = [NSMutableArray new]; for (UIWindow *w in RYAppWindows()) { int b = 14000; RYFPLabels(w, 0, &b, ls); }
+    [o appendFormat:@"\ntext labels visible in the app: %lu (first 70)\n", (unsigned long)ls.count];
+    for (NSUInteger i = 0; i < ls.count && i < 70; i++) [o appendFormat:@"  %@\n", ls[i]];
+    return o;
+}
+
 // ---- persistence: every recent message is remembered (compact JSON); when one is deleted by someone else it is copied to Documents/8ubah/data/deleted.json
 // and put back into the server's answer whenever the app asks for that channel's messages again (after a restart, scrolling, switching chats).
 static NSObject *gLogLock;
@@ -1820,6 +2031,7 @@ static NSString *RYLoggerStatus(void) {
 // ---- own deletes: DELETE /channels/<c>/messages/<m> on the app's HTTP handler
 static id RYHttpSend(id self, SEL _cmd, id req, id delegate) {
     @try {
+        if ([req isKindOfClass:NSURLRequest.class]) RYFPCaptureReq((NSURLRequest *)req);
         if ([req isKindOfClass:NSURLRequest.class] && [[(NSURLRequest *)req HTTPMethod] isEqualToString:@"DELETE"]) {
             NSArray *c = [[(NSURLRequest *)req URL].path componentsSeparatedByString:@"/"];
             NSUInteger i = [c indexOfObject:@"messages"];
@@ -2396,6 +2608,7 @@ static NSString *RYDiagReport(void) {
     [o appendString:@"\n== voice engine\n"]; [o appendString:RYDiagVoice()];
     [o appendString:@"\n== mic\n"]; [o appendString:RYMicReport()];
     [o appendString:@"\n== screen share\n"]; [o appendString:RYDiagBroadcast()];
+    [o appendFormat:@"\n== fake defean\n%@\n", RYFakeDefStatus()]; [o appendString:@"\n== follow / pull\n"]; [o appendString:RYFPDiag()];
     [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nstored on disk: %d  remembered messages: %d  channel fetches seen: %d (incremental chunks held %d)  put back: %d\nlast put back: %s\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gStored, gNetCached, gNetSeen, gNetBuf, gNetInj, gNetLast, gTOLast, gTOCalls];
     [o appendFormat:@"cell paint: seen %d, no id resolved %d, painted red %d\n", gPaintSeen, gPaintNoId, gPaintKept];
     { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
@@ -2432,6 +2645,8 @@ static void RYShareText(UIViewController *from, NSString *name, NSString *text) 
 @property (nonatomic, weak) UIView *bgHost;
 @property (nonatomic) NSInteger missTicks;
 @property (nonatomic) NSInteger stamp;
+@property (nonatomic, strong) UIView *fpBar; @property (nonatomic, strong) UIButton *fpFollowBtn, *fpPullBtn; @property (nonatomic, copy) NSString *fpUid; @property (nonatomic) NSInteger fpMiss;
+- (void)fpTick;
 + (instancetype)shared;
 - (void)hud:(NSString *)s;
 - (void)start; - (void)openPanel; - (void)panelClosed; - (void)bump;
@@ -2874,17 +3089,14 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 - (void)renderFake {
     __weak typeof(self) ws = self;
     BOOL on = gFakeDef;
-    UIButton *b = RYBtn([NSString stringWithFormat:@"%@: %@", T(@"ميوت ودفن وهمي", @"Fake mute + deafen"), on ? T(@"شغّال", @"ON") : T(@"مطفي", @"OFF")], on, ^{
+    UIButton *b = RYBtn(@"Fake Defean", on, ^{            // purple = on, grey = off
         BOOL want = !gFakeDef; int r = RYFakeDefSet(want);
         [ws toast:want ? (r ? T(@"الباقين يشوفونك ميوت ودفن", @"Others now see you muted + deafened") : T(@"جاهز — بدّل الميوت أو الديفن مرة وحدة (أو ادخل روم) وبيتطبق", @"Armed — toggle mute or deafen once (or join a room) and it applies"))
                        : (r ? T(@"رجعت حالتك الحقيقية", @"Your real state is back") : T(@"انطفى", @"Off"))];
         [ws rebuild];
     });
     [self.stack addArrangedSubview:RYCard(@[b])];
-    self.invLabel = RYLabel(RYFakeDefStatus(), 13, UIFontWeightMedium, RY_MUTED);
-    [self.stack addArrangedSubview:RYCard(@[self.invLabel])];
-    [self.invUI invalidate];
-    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYFakeDefStatus(); }];
+    [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
 }
 - (void)renderDiag {
     __weak typeof(self) ws = self;
@@ -2894,6 +3106,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         RYBtn(T(@"محرك الصوت", @"Voice engine"), NO, ^{ RYShareText(ws, @"diag-voice.txt", RYDiagVoice()); }),
         RYBtn(T(@"المايك", @"Mic"), NO, ^{ RYShareText(ws, @"diag-mic.txt", RYMicReport()); }),
         RYBtn(T(@"مشاركة الشاشة", @"Screen share"), NO, ^{ RYShareText(ws, @"diag-screenshare.txt", RYDiagBroadcast()); }),
+        RYBtn(T(@"فولو / سحب", @"Follow / Pull"), NO, ^{ RYShareText(ws, @"diag-follow.txt", RYFPDiag()); }),
         RYBtn(T(@"كلاسات بكلمة", @"Classes by keyword"), NO, ^{
             [ws ask:T(@"الكلمة", @"Keyword") ph:@"chat" secure:NO ok:^(NSString *k) { RYShareText(ws, @"diag-classes.txt", RYDiagClasses(k)); }];
         })])];
@@ -2972,9 +3185,44 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     [root presentViewController:p animated:YES completion:^{ [self.win makeKeyWindow]; }];
 }
 - (void)panelClosed { [self.prevKey makeKeyWindow]; }
+- (void)fpBuild {
+    if (self.fpBar) return;
+    UIView *root = self.win.rootViewController.view; if (!root) return;
+    UIView *bar = [UIView new]; bar.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.94]; bar.layer.cornerRadius = 25; bar.layer.shadowOpacity = 0.35; bar.layer.shadowRadius = 8; bar.layer.shadowOffset = CGSizeMake(0, 3);
+    __weak typeof(self) ws = self;
+    UIButton *f = [UIButton buttonWithType:UIButtonTypeSystem], *p = [UIButton buttonWithType:UIButtonTypeSystem];
+    f.frame = CGRectMake(8, 6, 108, 38); p.frame = CGRectMake(124, 6, 108, 38); bar.frame = CGRectMake(0, 0, 240, 50);
+    [f addAction:[UIAction actionWithHandler:^(UIAction *a) { NSString *u = ws.fpUid; if (!u) { [ws hud:T(@"ما قدرت أحدد الحساب", @"Can't tell which account")]; return; } RYFPToggleFollow(u); [ws fpRefresh]; }] forControlEvents:UIControlEventTouchUpInside];
+    [p addAction:[UIAction actionWithHandler:^(UIAction *a) { NSString *u = ws.fpUid; if (!u) { [ws hud:T(@"ما قدرت أحدد الحساب", @"Can't tell which account")]; return; } RYFPTogglePull(u); [ws fpRefresh]; }] forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:f]; [bar addSubview:p]; [root addSubview:bar];
+    self.fpBar = bar; self.fpFollowBtn = f; self.fpPullBtn = p; bar.hidden = YES;
+}
+static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
+    UIButtonConfiguration *c = [UIButtonConfiguration filledButtonConfiguration]; c.title = title; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    c.baseBackgroundColor = bg; c.baseForegroundColor = UIColor.whiteColor; b.configuration = c;
+}
+- (void)fpRefresh {
+    NSString *u = self.fpUid; BOOL fo, pu;
+    @synchronized (gFPLock) { fo = u && [gFPFollow isEqual:u]; pu = u && [gFPPull containsObject:u]; }
+    RYFPStyle(self.fpFollowBtn, fo ? @"Unfollow" : @"Follow", fo ? RY_RED : RYAccent());
+    RYFPStyle(self.fpPullBtn, pu ? @"Unpull" : @"Pull", pu ? RY_RED : [UIColor colorWithWhite:0.26 alpha:1]);
+}
+- (void)fpTick {                // a profile sheet is open -> Follow / Pull buttons at the bottom of the screen
+    RYFPInit();
+    UIViewController *root = self.win.rootViewController;
+    if (!root || root.presentedViewController) { self.fpBar.hidden = YES; return; }
+    NSString *uid = nil; BOOL found = RYFPFindSheet(&uid);
+    if (found && uid && gFDOwnId && [uid isEqual:gFDOwnId]) found = NO;       // your own profile: nothing to follow
+    if (!found) { if (++self.fpMiss >= 2) self.fpBar.hidden = YES; return; }
+    self.fpMiss = 0; self.fpUid = uid; [self fpBuild]; if (!self.fpBar) return;
+    UIView *rv = root.view; UIEdgeInsets in = rv.safeAreaInsets;
+    self.fpBar.center = CGPointMake(rv.bounds.size.width / 2, rv.bounds.size.height - in.bottom - 52);
+    [self fpRefresh]; self.fpBar.hidden = NO; [rv bringSubviewToFront:self.fpBar];
+}
 - (void)tick {
     self.fab.hidden = NO; self.fab.backgroundColor = RYAccent(); RYHookInputs();
     [self syncBG:RYChatHost()];
+    [self fpTick];
     static int licTick = 0; if (++licTick % 144 == 0) RYLicRevalidate(); // ~every 72s
 }
 - (void)syncBG:(UIView *)chat {
