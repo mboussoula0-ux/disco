@@ -12,6 +12,106 @@
 //   follow an action; text-field placeholders; error messages.
 //   New feature? Put the explanation in your reply to the owner, never in the app. If you find an explanation label while editing, delete it.
 // =====================================================================================================================
+// =====================================================================================================================
+// AI HANDBOOK  —  everything a new AI (or person) needs before editing this file. Read it fully. Facts are marked
+//   [VERIFIED] = read from the Discord 329.0 (build 100971) binary / bundle with the tools in tools/, or from code that ran on the owner's phone
+//   [ASSUMED]  = reasoned from the above, never seen running. Treat as a hypothesis and check it in the Diag tab before building on it.
+//
+// 0. WHAT THIS IS
+//   One Objective-C file, built to 8ubahDiscord.dylib and injected into a *decrypted* Discord .ipa. No Substrate, no Logos, no Theos needed:
+//   hooks are done with the ObjC runtime (class_replaceMethod / method_setImplementation) and symbol-pointer rebinding (audio).
+//   Owner's workflow: edit Tweak.m -> push to GitHub -> Actions builds (clang, arm64, iOS 16+, workflow .github/workflows/build.yml) ->
+//   download 8ubahDiscord.dylib -> `py tools\build_ipa.py "Discord.ipa" "8ubahDiscord.dylib"` (adds one LC_LOAD_DYLIB, copies the dylib into
+//   Frameworks/) -> install the *-8ubah.ipa with Sideloadly. The owner writes Arabic (Gulf dialect), answer him in Arabic. There is NO compiler
+//   in the AI sandbox: every edit is compiled for the first time on GitHub, so keep edits small, re-read them, and say so when untested.
+//   IMPORTANT: the IPA already contains BTLoader.dylib (Pyoncord/Bunny JS loader) + CydiaSubstrate.framework; do not touch them.
+//
+// 1. TOOLS (all pure python, no packages; run on the IPA itself, they are the ground truth)
+//   tools/objc_dump.py  "Discord.ipa" <out.txt>        dump every ObjC class: props, ivars (offset/type in code), methods with type encodings + imp
+//                                                       "Discord.ipa" sel <text>   which classes implement selectors containing <text>
+//                                                       "Discord.ipa" cls <text>   full dump of classes whose name contains <text>
+//   tools/fn_calls.py   "Discord.ipa" <Class> <selector part>   what an ObjC method calls (objc_msgSend selectors, strings, sub_ calls) read
+//                                                       from the machine code. DEEP=3 py tools\fn_calls.py ... follows sub-calls.
+//   tools/scan_ipa.py   "Discord.ipa" kw1 kw2 ...       class names / selectors / React-Native export signatures matching keywords
+//   In-app: floating button -> "Diag" tab -> Full report (view controllers, chat view tree, input + send button candidates, voice engine
+//   methods, hook counters, logger state). The owner shares the .txt with the AI. Always ask for it when something does not work.
+//   The Hermes JS bundle (main.jsbundle) is bytecode: its strings are packed without separators, you cannot read logic from it.
+//
+// 2. APP FACTS  [VERIFIED]
+//   * Main binary: thin arm64, chained fixups (pointer format 6), LC_ENCRYPTION cryptid 0, ~117 KB free header space. React Native, new
+//     architecture (TurboModules: NativeNetworkingIOS, getTurboModule:). Native C++ voice engine (WebRTC, Krisp, AGC2) is statically linked.
+//   * ObjC class names are plain DCD* (Discord) or RCT* (React Native). Swift classes are _TtC... (e.g. DiscordChat.*). Many "DCD*Model"
+//     classes are Swift @objc: their stored properties are ivars WITHOUT ObjC getters (see 4.) so KVC / respondsToSelector can fail.
+//   * Never use KVC (valueForKey:) on ivars that are Swift structs/enums/Optionals: it can crash hard (not catchable by @try).
+//
+// 3. CHAT PIPELINE  [VERIFIED by fn_calls on DCDChatManager]
+//   JS (Hermes) builds rows -> RN view manager DCDChatManager  updateRows:rows:... receives a JSON *string* -> +[DCDRowModel
+//   makeRowModelArrayFromJSONString:error:] -> NSArray<DCDRowModel> -> for each: [[DCDRowUpdateModel alloc] initWithRowModel:viewDataManager:error:]
+//   -> -[DCDChatViewController updateRows:isLoadingAtTop:scrollData:changesetUpdateId:HACK_iOSForceAnimations:forceReload:isAnimated:]
+//   (type v56@0:8@16B24@28@36B44B48B52, 7 args) -> DCDChatDataManager (ivar viewModels, viewDataDidUpdateHandler) -> DCDTableView (UITableView)
+//   -> cells (message cells: DCDMessageTableViewCell, -configureWithViewModel:viewReusePoolManager:actionManager: has 5 args).
+//   * The array given to updateRows: contains DCDRowUpdateModel objects (Swift, opaque), NOT messages. There is no `message` selector on them.
+//   * It is a CHANGESET, not the whole list: each row carries index + changeType; Swift enum RowUpdateType = noop / insert / remove / update.
+//     Therefore NEVER re-insert / drop / reorder rows natively: every later index shifts and the chat corrupts (the first logger died of this).
+//   * DCDBaseRowModel ivars: index @8 (Optional<Int>, 9 bytes), changeType @24 (Int), type @32. DCDRowUpdateModel: update @8 (enum, 41 bytes),
+//     index @56. DCDRowModel has messageRowModel; DCDMessageRowModel : DCDBaseRowModel has message. DCDMessageRowViewModel has props id
+//     (message id string), message (DCDMessageModel), rowModel, baseMessageModel.
+//   * DCDMessageModel props: id, channelID, guildID, authorID, username, usernameColor, roleColor, content (DCDStructuredTextModel), textColor,
+//     timestamp, nonce, edited ... (read-only). Message cell: ivars viewModel / baseViewModel, YYLabel contentLabel (attributedText works).
+//   * Chat screen = DCDChatViewController (props tableView = DCDTableView, dataManager). It is also embedded in DCDChatViewControllerContainer.
+//   * Composer = DCDChatInput (RN native text input, property messageTextView is a UITextView; layout manager DCDChatInputLayoutManager).
+//     Text is set natively (RYSetText -> delegate textViewDidChange:). The send button is not always a UIControl: RYPressSend uses a control
+//     first, then an accessibility element named "send" (label tunable in Diag), then the return key. [ASSUMED: label/behaviour not confirmed]
+//
+// 4. NETWORK + GATEWAY  [VERIFIED unless marked]
+//   * Gateway: URL contains `encoding=json`, compression zlib-stream / zstd-stream is decoded NATIVELY (_DCDZLibContentHandler /
+//     _DCDZstdContentHandler processWebsocketMessage:forSocketID:withType:, RCTWebSocketModule). JS receives every gateway frame as plain JSON
+//     text through RCTWebSocketModule -sendEventWithName:body: with name "websocketMessage" and body {data, type, id}.
+//     -> RYWsSend hooks that call and can read/modify frames. Frame = {"t":EVENT,"s":seq,"op":0,"d":{...}}. Keep "s" (heartbeat sequence).
+//   * REST: RN RCTNetworking (class RCTNetworking : RCTEventEmitter) over RCTHTTPRequestHandler. Events to JS (standard RN): didReceiveNetworkResponse
+//     [requestID,status,headers,url], didReceiveNetworkIncrementalData [requestID,text,progress,total], didReceiveNetworkData [requestID,data],
+//     didCompleteNetworkResponse [requestID,error,timedOut]. Hooks: RYNetEvent (incremental text path, buffers message-list answers),
+//     RYNetSendData (-sendData:responseType:response:forTask: non-incremental path), RYHttpSend (-[RCTHTTPRequestHandler sendRequest:withDelegate:],
+//     used only to see our own DELETE requests). [ASSUMED: which of the two answer paths Discord's REST client really uses; both are covered.]
+//
+// 5. MESSAGE LOGGER (kept deleted messages)  — the design and why
+//   Goal: a message somebody else deletes stays visible (red) in DMs, groups and servers, also after leaving / restarting the app.
+//   a) RYGatewayFilter sees MESSAGE_CREATE / MESSAGE_UPDATE and remembers the message JSON (RYCacheMsg, last 120 per channel, 60 channels) and
+//      every message-list REST answer too (RYMergeKeptRaw).
+//   b) MESSAGE_DELETE / MESSAGE_DELETE_BULK (not our own, see RYHttpSend/RYOwnDeleted): the remembered JSON is copied to
+//      Documents/8ubah/data/deleted.json (RYKeepMsg, format {"channelId":[messageJSON,...]}) and the frame is REWRITTEN into a normal
+//      MESSAGE_UPDATE of the same message (full JSON if known, else {id,channel_id,guild_id}). JS therefore never deletes it, JS list, native
+//      changeset and indices stay in sync. Unknown event names were tried first and are suspected to have thrown the owner out of servers: don't.
+//   c) RYMergeKeptRaw adds the stored messages back into GET /channels/<id>/messages answers (respecting before/after/around/limit) so they
+//      reappear after a restart. Red wash/text: RYIsKept(id) in RYDecorateCell (called from the cell configure hook and from RYRefreshCells).
+//   d) Limits: a message that was never seen (deleted while the app was closed, or older than the remembered window) cannot be saved.
+//   Diag report section "message logger" shows counters (ws messages seen, delete events, kept, own, put back, incremental chunks held).
+//
+// 6. VOICE  [VERIFIED structure, behaviour ASSUMED]
+//   * Voice engine = DCDVoiceEngine (RN module, RCTEventEmitter). Settings reach the native engine through -setTransportOptions: (v24, 1 dict),
+//     -connectionInstanceSetTransportOptions:options: (v32, Q instance + dict, the live-call one), -createVoiceConnectionWithOptions:withUserId:
+//     withConnectionOptions:withCallback:, -setAVAudioSessionMode:, -setNoInputThreshold:. Keys scrubbed to NO: echoCancellation, noiseSuppression,
+//     noiseCancellation(+DuringProcessing), automaticGainControl(+Config.useAGC2/enableAnalog/enableDigital), builtInEchoCancellation, vadUseKrisp.
+//   * Capture path: the main binary imports AudioUnitRender / AudioUnitInitialize / AudioOutputUnitStart / AudioUnitSetProperty /
+//     AudioComponentInstanceNew -> RYRebindImage patches those lazy pointers (mic voice changer, Stereo file-through-mic, VPIO bypass).
+//     Krisp/AGC run AFTER our injection point, which is why the engine options must be scrubbed too.
+//   * Safe mode: if the previous launch died within 10 s the audio hooks are skipped (key 8ubah.dc.launching).
+//
+// 7. CODE MAP (search the #pragma mark lines)
+//   Config/storage (CF/CS, RYDir = Documents/8ubah), language T(ar,en), UI helpers (RYCard/RYBtn/...), view discovery (RYFindVC, RYAppWindows),
+//   background view + clearing (RYBGView, RYClear*), mic/stereo, voice hooks, message logger, Discord helpers (RYChatHost, RYLowestInput,
+//   RYPressSend, Diag report builders), RYWindow/RYCore (floating button, 0.8 s tick, background sync, sendMessage), quick-message loop,
+//   RYPanel (tabs: Mic, Stereo, Backgrounds, Quick messages, Diag), entry (__attribute__((constructor)) RYInit).
+//   Settings are stored with CS(key,value) / read with CF(key,default) (NSUserDefaults-like JSON, file ry.cfg.v1). Keys used by chat code:
+//   roomClass (chat class needle, default RY_ROOM_DEFAULT = "ChatViewController", a substring that matches DCDChatViewController), sendLabel, bgMode/bgFull, delAll (default YES = keep in servers too).
+//
+// 8. RULES / PITFALLS
+//   * UI rule at the top of this file (no explanatory text in the UI) is mandatory.
+//   * Hooks may run on RN module queues: never touch UIKit there (dispatch to main), never block, wrap in @try, always call the original.
+//   * Keep every hook idempotent and guarded by the method argument count; classes can load late (RYInstall* are retried at 2/6/15 s).
+//   * Do not add features the owner did not ask for. Report honestly what is untested. Ask for the Diag report when behaviour is unknown.
+//   * This file is also saved as a project: Tweak.m, Makefile (optional Theos), tools/, .github/workflows/build.yml, README.md.
+// =====================================================================================================================
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <PhotosUI/PhotosUI.h>
@@ -1502,7 +1602,7 @@ static void RYForgetMsg(NSString *mid) {                                        
     if (ch) RYDelSave();
 }
 static void RYLogInit(void) {
-    static dispatch_once_t once; dispatch_once(&once, ^{ gLogLock = [NSObject new]; gLogIds = [NSMutableSet new]; gOwnDel = [NSMutableDictionary new]; gMsgCache = [NSMutableDictionary new]; gDelStore = [NSMutableDictionary new]; gCacheTouch = [NSMutableDictionary new]; RYDelLoad(); });
+    static dispatch_once_t once; dispatch_once(&once, ^{ gNetLock = [NSObject new]; gNetReq = [NSMutableDictionary new]; gLogLock = [NSObject new]; gLogIds = [NSMutableSet new]; gOwnDel = [NSMutableDictionary new]; gMsgCache = [NSMutableDictionary new]; gDelStore = [NSMutableDictionary new]; gCacheTouch = [NSMutableDictionary new]; RYDelLoad(); });
 }
 static BOOL RYIsKept(NSString *mid) { if (!mid || !gLogIds) return NO; @synchronized (gLogIds) { return [gLogIds containsObject:mid]; } }
 static NSString *RYLoggerStatus(void) {
@@ -1552,13 +1652,24 @@ static NSString *RYGatewayFilter(NSString *s) {
     if (gid && gid != NSNull.null && ![CF(@"delAll", @YES) boolValue]) { gLogPass++; return s; }      // servers are kept too unless "DMs only" is chosen
     NSArray *ids = bulk ? d[@"ids"] : (d[@"id"] ? @[d[@"id"]] : @[]);
     if (![ids isKindOfClass:NSArray.class] || !ids.count) return s;
+    NSString *cid0 = RYStr(d[@"channel_id"]), *mid0 = RYStr(ids.firstObject);
+    if (!cid0 || !mid0) return s;
     for (id x in ids) if (RYOwnDeleted(RYStr(x))) { gLogOwn++; return s; }                          // you deleted it yourself: deletes normally
     @synchronized (gLogIds) { for (id x in ids) { NSString *m = RYStr(x); if (m) [gLogIds addObject:m]; } if (gLogIds.count > 4000) [gLogIds removeAllObjects]; }
     for (id x in ids) RYKeepMsg(RYStr(d[@"channel_id"]), RYStr(x));
     gLogKept += (int)ids.count;
     snprintf(gLogLast, sizeof gLogLast, "kept %s chan=%s", RYStr(ids.firstObject).UTF8String ?: "?", RYStr(d[@"channel_id"]).UTF8String ?: "?");
     RYLog(@"logger: kept %@ (chan %@)", ids, d[@"channel_id"]);
-    j[@"t"] = bulk ? @"MESSAGE_DELETE_BULK_KEPT_8UBAH" : @"MESSAGE_DELETE_KEPT_8UBAH";
+    // The delete is replaced by a perfectly normal MESSAGE_UPDATE of the same message (the JS store merges it into the message it already has,
+    // nothing is removed, guild_id stays, no unknown event type reaches JS). Full copy if we remember the message, else just ids.
+    id full = nil;
+    @synchronized (gLogLock) { NSData *x = gMsgCache[cid0][mid0] ?: gDelStore[cid0][mid0]; if (x) full = [NSJSONSerialization JSONObjectWithData:x options:NSJSONReadingMutableContainers error:nil]; }
+    if (![full isKindOfClass:NSDictionary.class]) {
+        NSMutableDictionary *pm = [@{@"id": mid0, @"channel_id": cid0} mutableCopy];
+        if (gid && gid != NSNull.null) pm[@"guild_id"] = gid;
+        full = pm;
+    }
+    j[@"t"] = @"MESSAGE_UPDATE"; j[@"d"] = full;
     NSData *out = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
     NSString *ns = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
     return ns ?: s;
@@ -1647,16 +1758,16 @@ static NSDictionary *RYQueryOf(NSURL *u) {
     for (NSURLQueryItem *i in [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO].queryItems) if (i.name && i.value) q[i.name] = i.value;
     return q;
 }
-static NSData *RYMergeKept(NSData *data, NSURLResponse *resp) {
-    if (![resp isKindOfClass:NSHTTPURLResponse.class] || [(NSHTTPURLResponse *)resp statusCode] != 200 || data.length < 2 || data.length > 4000000) return data;
-    NSArray *c = [resp.URL.path componentsSeparatedByString:@"/"];
+static NSData *RYMergeKeptRaw(NSData *data, NSURL *url) {
+    if (!url || data.length < 2 || data.length > 4000000) return data;
+    NSArray *c = [url.path componentsSeparatedByString:@"/"];
     NSUInteger i = [c indexOfObject:@"channels"];
     if (i == NSNotFound || i + 2 != c.count - 1 || ![c[i + 2] isEqual:@"messages"]) return data;      // exactly /channels/<id>/messages
     NSString *cid = c[i + 1]; if (!cid.length) return data;
     gNetSeen++;
     id arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
     if (![arr isKindOfClass:NSArray.class]) return data;
-    NSDictionary *q = RYQueryOf(resp.URL); NSInteger limit = q[@"limit"] ? [q[@"limit"] integerValue] : 50; if (limit < 1) limit = 50;
+    NSDictionary *q = RYQueryOf(url); NSInteger limit = q[@"limit"] ? [q[@"limit"] integerValue] : 50; if (limit < 1) limit = 50;
     NSMutableSet *have = [NSMutableSet new]; NSString *minId = nil, *maxId = nil;
     for (id m in arr) {
         RYCacheMsg(m);
@@ -1687,8 +1798,58 @@ static NSData *RYMergeKept(NSData *data, NSURLResponse *resp) {
     NSData *out = [NSJSONSerialization dataWithJSONObject:all options:0 error:nil]; if (!out) return data;
     gNetInj += (int)add.count;
     snprintf(gNetLast, sizeof gNetLast, "put back %d into %s", (int)add.count, cid.UTF8String);
-    RYLog(@"logger: put back %d kept message(s) into channel %@ (%@)", (int)add.count, cid, resp.URL.query ?: @"");
+    RYLog(@"logger: put back %d kept message(s) into channel %@ (%@)", (int)add.count, cid, url.query ?: @"");
     return out;
+}
+static NSData *RYMergeKept(NSData *data, NSURLResponse *resp) {
+    if (![resp isKindOfClass:NSHTTPURLResponse.class] || [(NSHTTPURLResponse *)resp statusCode] != 200) return data;
+    return RYMergeKeptRaw(data, resp.URL);
+}
+// The app's REST client asks RCTNetworking for *incremental text*: the answer reaches JS as "didReceiveNetworkIncrementalData" chunks and
+// RCTNetworking.sendData: is not used for it. So the chunks of a message-list answer are held back, merged when the request completes and
+// handed over as one chunk right before "didCompleteNetworkResponse".
+static void (*orig_netEvt)(id, SEL, NSString *, id);
+static NSObject *gNetLock; static NSMutableDictionary<NSString *, NSMutableDictionary *> *gNetReq; static volatile int gNetBuf = 0;
+static BOOL RYIsMsgListURL(NSURL *u) {
+    NSArray *c = [u.path componentsSeparatedByString:@"/"]; NSUInteger i = [c indexOfObject:@"channels"];
+    return i != NSNotFound && i + 2 == c.count - 1 && [c[i + 2] isEqual:@"messages"];
+}
+static void RYNetEvent(id self, SEL _cmd, NSString *name, id body) {
+    @try {
+        if ([body isKindOfClass:NSArray.class] && [body count] >= 1) {
+            NSString *rid = [[body objectAtIndex:0] description];
+            if ([name isEqual:@"didReceiveNetworkResponse"] && [body count] >= 4) {
+                NSURL *u = [NSURL URLWithString:RYStr([body objectAtIndex:3]) ?: @""];
+                if (u && [[body objectAtIndex:1] integerValue] == 200 && RYIsMsgListURL(u)) {
+                    RYLogInit(); @synchronized (gNetLock) { gNetReq[rid] = [@{@"url": u, @"buf": [NSMutableString new]} mutableCopy]; }
+                }
+            } else if ([name isEqual:@"didReceiveNetworkIncrementalData"] && [body count] >= 2 && [[body objectAtIndex:1] isKindOfClass:NSString.class]) {
+                NSMutableDictionary *e; @synchronized (gNetLock) { e = gNetReq[rid]; }
+                if (e) {
+                    NSMutableString *buf = e[@"buf"]; [buf appendString:[body objectAtIndex:1]]; gNetBuf++;
+                    if (buf.length > 4000000) {                                                             // too big to merge: hand it over as it is
+                        @synchronized (gNetLock) { [gNetReq removeObjectForKey:rid]; }
+                        if (orig_netEvt) orig_netEvt(self, _cmd, @"didReceiveNetworkIncrementalData", @[[body objectAtIndex:0], [buf copy], @(buf.length), @(buf.length)]);
+                    }
+                    return;                                                                                 // held back until the request completes
+                }
+            } else if ([name isEqual:@"didCompleteNetworkResponse"]) {
+                NSMutableDictionary *e; @synchronized (gNetLock) { e = gNetReq[rid]; if (e) [gNetReq removeObjectForKey:rid]; }
+                if (e) {
+                    NSString *text = [(NSMutableString *)e[@"buf"] copy];
+                    if (text.length) {
+                        NSString *out = text;
+                        @try {
+                            NSData *m = RYMergeKeptRaw([text dataUsingEncoding:NSUTF8StringEncoding], e[@"url"]);
+                            NSString *ms = m ? [[NSString alloc] initWithData:m encoding:NSUTF8StringEncoding] : nil; if (ms) out = ms;
+                        } @catch (__unused id ex) { out = text; }
+                        if (orig_netEvt) orig_netEvt(self, _cmd, @"didReceiveNetworkIncrementalData", @[[body objectAtIndex:0], out, @(out.length), @(out.length)]);
+                    }
+                }
+            }
+        }
+    } @catch (__unused id e) {}
+    if (orig_netEvt) orig_netEvt(self, _cmd, name, body);
 }
 static void RYNetSendData(id self, SEL _cmd, NSData *data, NSString *type, id resp, id task) {
     NSData *use = data;
@@ -1696,7 +1857,7 @@ static void RYNetSendData(id self, SEL _cmd, NSData *data, NSString *type, id re
     if (orig_netData) orig_netData(self, _cmd, use, type, resp, task);
 }
 static void RYInstallLogger(void) {
-    static BOOL cellDone, wsDone, httpDone, netDone; RYLogInit();
+    static BOOL cellDone, wsDone, httpDone, netDone, evtDone; RYLogInit();
     if (!cellDone) {
         Class cc = NSClassFromString(@"DCDMessageTableViewCell");
         Method cm = cc ? class_getInstanceMethod(cc, NSSelectorFromString(@"configureWithViewModel:viewReusePoolManager:actionManager:")) : NULL;
@@ -1711,6 +1872,11 @@ static void RYInstallLogger(void) {
         Class nc = NSClassFromString(@"RCTNetworking"); SEL ns = NSSelectorFromString(@"sendData:responseType:response:forTask:");
         Method nm = nc ? class_getInstanceMethod(nc, ns) : NULL;
         if (nm && method_getNumberOfArguments(nm) == 6) { orig_netData = (void *)method_getImplementation(nm); method_setImplementation(nm, (IMP)RYNetSendData); netDone = YES; RYLog(@"logger: network hook installed"); }
+    }
+    if (!evtDone) {
+        Class ec = NSClassFromString(@"RCTNetworking"); SEL es = NSSelectorFromString(@"sendEventWithName:body:");
+        Method em = ec ? class_getInstanceMethod(ec, es) : NULL;
+        if (em && method_getNumberOfArguments(em) == 4) { orig_netEvt = (void *)method_getImplementation(em); class_replaceMethod(ec, es, (IMP)RYNetEvent, method_getTypeEncoding(em)); evtDone = YES; RYLog(@"logger: network event hook installed"); }
     }
     if (!httpDone) {
         Class hc = NSClassFromString(@"RCTHTTPRequestHandler"); SEL s = NSSelectorFromString(@"sendRequest:withDelegate:");
@@ -2023,7 +2189,7 @@ static NSString *RYDiagReport(void) {
     [o appendString:@"\n== voice engine\n"]; [o appendString:RYDiagVoice()];
     [o appendString:@"\n== mic\n"]; [o appendString:RYMicReport()];
     [o appendString:@"\n== screen share\n"]; [o appendString:RYDiagBroadcast()];
-    [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nstored on disk: %d  remembered messages: %d  channel fetches seen: %d  put back: %d\nlast put back: %s\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gStored, gNetCached, gNetSeen, gNetInj, gNetLast, gTOLast, gTOCalls];
+    [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nstored on disk: %d  remembered messages: %d  channel fetches seen: %d (incremental chunks held %d)  put back: %d\nlast put back: %s\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gStored, gNetCached, gNetSeen, gNetBuf, gNetInj, gNetLast, gTOLast, gTOCalls];
     { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
     return o;
 }
