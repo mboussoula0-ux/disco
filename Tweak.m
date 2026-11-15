@@ -99,7 +99,7 @@
 //
 // 6b. FAKE DEFEN (tab "Fake Defen")  [VERIFIED: the hooked selectors exist; behaviour on a phone ASSUMED until the Diag status line shows counters]
 //   Others see your mute/deafen badge only from the gateway frame op 4 (VOICE_STATE_UPDATE: self_mute/self_deaf) that JS sends through
-//   -[RCTWebSocketModule send:forSocketID:] (RYWsSendOut). While gFakeDef is on that one frame is rewritten to muted+deafened; the voice engine
+//   -[RCTWebSocketModule send:forSocketID:] (RYWsSendOut, installed ONLY while Fake Defen is on: joining voice broke when it was always hooked). While gFakeDef is on that one frame is rewritten to muted+deafened; the voice engine
 //   (capture / playback) is never touched, so you still talk and hear. RYFakeDefSet() also pushes a fresh op 4 immediately (built from gVSReal =
 //   the real state JS sent last) so the toggle takes effect without rejoining. Gateway socket id = any outgoing op 1/2/4/6 frame. Not persisted.
 //
@@ -1521,25 +1521,30 @@ static void (*orig_wsSend)(id, SEL, NSString *, id);
 // (RTC capture/playback, the real connectionInstanceSetSelfMute:/SetSelfDeafen: calls) is touched, so you
 // keep talking and hearing normally on your end the whole time.
 static id (*orig_wsSendOut)(id, SEL, id, id);
-static id (*orig_wsSendBinOut)(id, SEL, id, id);
 static NSString *const kFDLock = @"8ubah.fakedefen";
-static __weak id gWsMod;            // RCTWebSocketModule (seen on its first outgoing frame)
-static id gGwSock;                  // socket id of the gateway (seen on its heartbeat / identify / voice-state frames)
-static NSDictionary *gVSReal;       // the voice state JS really sent last (nil = not in a voice channel)
-static volatile BOOL gFakeDef = NO; // session only on purpose: after a restart you are never "deafened" by surprise
+// Nothing here touches the app until you use it. At launch NO outgoing websocket hook exists. The only always-on part is a cheap look at the
+// INCOMING gateway frames (the hook the logger already has) to learn your user id (READY) and your own voice state (VOICE_STATE_UPDATE with your id).
+// The outgoing hook (rewrites your op-4 frame) is installed only while Fake Defen is ON and removed when it is switched off.
+static __weak id gWsMod;            // RCTWebSocketModule
+static id gGwSock;                  // socket id of the gateway
+static NSString *gFDOwnId;          // your user id (from READY)
+static NSDictionary *gVSReal;       // your REAL voice state {guild_id, channel_id, self_mute, self_deaf, self_video}; nil = not in a voice channel
+static volatile BOOL gFakeDef = NO, gFDPending = NO, gFDHooked = NO;   // session only; Pending = switched on outside a room, applies when you join
 static volatile int gFDSeen = 0, gFDForced = 0, gFDPushed = 0;
-static NSString *RYFakeDeafenFilter(NSString *s, id sockId) {
-    if (!s.length || s.length > 4000 || [s rangeOfString:@"\"op\""].location == NSNotFound) return s;
+static IMP RYSendOrig(void) {       // the app's own send:forSocketID: (captured before it is ever replaced)
+    if (!orig_wsSendOut) { Class wc = NSClassFromString(@"RCTWebSocketModule"); Method m = wc ? class_getInstanceMethod(wc, NSSelectorFromString(@"send:forSocketID:")) : NULL; if (m && method_getNumberOfArguments(m) == 4 && method_getImplementation(m) != (IMP)NULL) orig_wsSendOut = (void *)method_getImplementation(m); }
+    return (IMP)orig_wsSendOut;
+}
+static NSString *RYFakeDeafenFilter(NSString *s, id sockId) {   // only called while the outgoing hook exists (= Fake Defen is on)
+    if (!s.length || s.length > 2000 || [s rangeOfString:@"\"op\":4"].location == NSNotFound) return s;
     NSData *dt = [s dataUsingEncoding:NSUTF8StringEncoding]; if (!dt) return s;
     id j = [NSJSONSerialization JSONObjectWithData:dt options:NSJSONReadingMutableContainers error:nil];
-    if (![j isKindOfClass:NSMutableDictionary.class]) return s;
-    NSInteger op = [j[@"op"] integerValue];
-    if (sockId && (op == 1 || op == 2 || op == 4 || op == 6)) @synchronized (kFDLock) { gGwSock = sockId; }   // only the gateway sends these
-    if (op != 4) return s;
+    if (![j isKindOfClass:NSMutableDictionary.class] || [j[@"op"] integerValue] != 4) return s;
     id d = j[@"d"]; if (![d isKindOfClass:NSMutableDictionary.class]) return s;
     gFDSeen++;
+    if (sockId) @synchronized (kFDLock) { gGwSock = sockId; }
     id ch = d[@"channel_id"];
-    @synchronized (kFDLock) { gVSReal = (ch && ch != NSNull.null) ? [d copy] : nil; }                    // what the app really wants (real mute / deafen)
+    @synchronized (kFDLock) { gVSReal = (ch && ch != NSNull.null) ? [d copy] : nil; }                     // what the app really wants (real mute / deafen)
     if (!gFakeDef) return s;
     d[@"self_mute"] = @YES; d[@"self_deaf"] = @YES; gFDForced++;
     NSData *out = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
@@ -1547,42 +1552,73 @@ static NSString *RYFakeDeafenFilter(NSString *s, id sockId) {
     return ns ?: s;
 }
 static id RYWsSendOut(id self, SEL _cmd, id data, id sockId) {
-    @try { gWsMod = self; if ([data isKindOfClass:NSString.class]) data = RYFakeDeafenFilter((NSString *)data, sockId); } @catch (__unused id e) {}
+    @try { gWsMod = self; if (gFakeDef && [data isKindOfClass:NSString.class]) data = RYFakeDeafenFilter((NSString *)data, sockId); } @catch (__unused id e) {}
     return orig_wsSendOut ? orig_wsSendOut(self, _cmd, data, sockId) : nil;
 }
-static id RYWsSendBinOut(id self, SEL _cmd, id data, id sockId) {
-    @try {
-        gWsMod = self;
-        if ([data isKindOfClass:NSString.class]) {
-            NSData *raw = [[NSData alloc] initWithBase64EncodedString:(NSString *)data options:0];
-            if (raw.length && raw.length < 4000) {
-                NSString *txt = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-                NSString *f = txt ? RYFakeDeafenFilter(txt, sockId) : nil;
-                if (f && f != txt) data = [[f dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
-            }
-        }
-    } @catch (__unused id e) {}
-    return orig_wsSendBinOut ? orig_wsSendBinOut(self, _cmd, data, sockId) : nil;
+static void RYFDHook(BOOL on) {     // install / remove the outgoing hook
+    Class wc = NSClassFromString(@"RCTWebSocketModule"); if (!wc) return;
+    Method m = class_getInstanceMethod(wc, NSSelectorFromString(@"send:forSocketID:")); if (!m || method_getNumberOfArguments(m) != 4) return;
+    if (on && !gFDHooked) { if (!RYSendOrig()) return; method_setImplementation(m, (IMP)RYWsSendOut); gFDHooked = YES; RYLog(@"fake defen: outgoing hook on"); }
+    else if (!on && gFDHooked) { if (orig_wsSendOut) method_setImplementation(m, (IMP)orig_wsSendOut); gFDHooked = NO; RYLog(@"fake defen: outgoing hook off"); }
 }
-// Switch on/off. If you are in a voice channel right now a fresh voice-state frame goes out at once (fake = muted+deafened, off = your real state);
-// otherwise it is only armed and applies to the next voice-state frame the app sends. Returns 1 = frame sent, 0 = armed only.
-static int RYFakeDefSet(BOOL on) {
-    gFakeDef = on;
-    id mod, sock; NSDictionary *real;
-    @synchronized (kFDLock) { mod = gWsMod; sock = gGwSock; real = gVSReal; }
-    if (!mod || !sock || !real || !orig_wsSendOut) return 0;
+static int RYFDPush(BOOL fake) {    // send one voice-state frame now: fake = muted + deafened, else your real state
+    id mod, sock; NSDictionary *real; @synchronized (kFDLock) { mod = gWsMod; sock = gGwSock; real = gVSReal; }
+    IMP send = RYSendOrig();
+    if (!mod || !sock || !real || !send) return 0;
     NSMutableDictionary *d = [real mutableCopy];
-    if (on) { d[@"self_mute"] = @YES; d[@"self_deaf"] = @YES; }
+    if (fake) { d[@"self_mute"] = @YES; d[@"self_deaf"] = @YES; }
     NSData *x = [NSJSONSerialization dataWithJSONObject:@{@"op": @4, @"d": d} options:0 error:nil];
     NSString *s = x ? [[NSString alloc] initWithData:x encoding:NSUTF8StringEncoding] : nil; if (!s) return 0;
     SEL mq = NSSelectorFromString(@"methodQueue");
     dispatch_queue_t q = [mod respondsToSelector:mq] ? ((dispatch_queue_t (*)(id, SEL))objc_msgSend)(mod, mq) : nil;
-    dispatch_async(q ?: dispatch_get_main_queue(), ^{ @try { orig_wsSendOut(mod, NSSelectorFromString(@"send:forSocketID:"), s, sock); gFDPushed++; } @catch (__unused id e) {} });
+    dispatch_async(q ?: dispatch_get_main_queue(), ^{ @try { ((id (*)(id, SEL, id, id))send)(mod, NSSelectorFromString(@"send:forSocketID:"), s, sock); gFDPushed++; } @catch (__unused id e) {} });
     return 1;
 }
+// incoming gateway frame (bytes of the decompressed JSON), called from RYWsSend. Cheap: a few memmem calls, JSON only for your own small voice-state frame.
+static void RYFDWatch(const char *p, size_t n, id sockId, id module) {
+    if (!p || n < 30) return;
+    if (!gFDOwnId) {                                                   // your user id: the first "user":{"id":"..."} of the READY frame
+        if (!memmem(p, n < 600 ? n : 600, "\"READY\"", 7)) return;
+        const char *k = (const char *)memmem(p, n, "\"user\":{\"id\":\"", 14); if (!k) return;
+        const char *q = k + 14, *e = p + n; const char *z = q; while (z < e && *z >= '0' && *z <= '9') z++;
+        if (z > q && z - q < 24 && z < e && *z == '"') gFDOwnId = [[NSString alloc] initWithBytes:q length:(NSUInteger)(z - q) encoding:NSASCIIStringEncoding];
+        return;
+    }
+    if (n > 3000 || !memmem(p, n, "VOICE_STATE_UPDATE", 18)) return;
+    char key[64]; int kl = snprintf(key, sizeof key, "\"user_id\":\"%s\"", gFDOwnId.UTF8String); if (kl <= 0 || !memmem(p, n, key, (size_t)kl)) return;
+    id j = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytesNoCopy:(void *)p length:n freeWhenDone:NO] options:0 error:nil];
+    id d = [j isKindOfClass:NSDictionary.class] ? j[@"d"] : nil; if (![d isKindOfClass:NSDictionary.class]) return;
+    id ch = d[@"channel_id"]; BOOL inRoom = ch && ch != NSNull.null;
+    BOOL start = NO;
+    @synchronized (kFDLock) {
+        if (module) gWsMod = module; if (sockId) gGwSock = sockId;
+        if (!inRoom) gVSReal = nil;
+        else {
+            NSMutableDictionary *v = [NSMutableDictionary new];
+            v[@"guild_id"] = d[@"guild_id"] ?: NSNull.null; v[@"channel_id"] = ch;
+            if (gFakeDef && gVSReal) { v[@"self_mute"] = gVSReal[@"self_mute"] ?: @NO; v[@"self_deaf"] = gVSReal[@"self_deaf"] ?: @NO; }   // while faking, the echo of our own fake frame is not "real"
+            else { v[@"self_mute"] = d[@"self_mute"] ?: @NO; v[@"self_deaf"] = d[@"self_deaf"] ?: @NO; }
+            v[@"self_video"] = d[@"self_video"] ?: @NO;
+            gVSReal = v;
+            if (gFDPending) { gFDPending = NO; start = YES; }
+        }
+    }
+    if (start) dispatch_async(dispatch_get_main_queue(), ^{ if (gFakeDef) { RYFDHook(YES); RYFDPush(YES); } });   // you switched it on outside a room and have just joined one
+}
+// The switch. In a room: hook + one voice-state frame at once (off: your real state again, hook removed). Outside a room: only armed.
+static int RYFakeDefSet(BOOL on) {
+    gFakeDef = on;
+    NSDictionary *real; @synchronized (kFDLock) { real = gVSReal; }
+    if (!real) { gFDPending = on; if (!on) RYFDHook(NO); return 0; }
+    gFDPending = NO;
+    if (on) RYFDHook(YES);
+    int r = RYFDPush(on);
+    if (!on) RYFDHook(NO);
+    return r;
+}
 static NSString *RYFakeDefStatus(void) {
-    BOOL inV, gw; @synchronized (kFDLock) { inV = gVSReal != nil; gw = gGwSock != nil; }
-    return [NSString stringWithFormat:T(@"روم صوتي: %@ · البوابة: %@ · معدّلة %d · مرسلة %d", @"Voice channel: %@ · gateway: %@ · forced %d · sent %d"), inV ? @"✓" : @"✗", gw ? @"✓" : @"✗", gFDForced, gFDPushed];
+    BOOL idk, inV; @synchronized (kFDLock) { idk = gFDOwnId != nil; inV = gVSReal != nil; }
+    return [NSString stringWithFormat:T(@"حسابك: %@ · روم صوتي: %@ · الهوك: %@ · معدّلة %d · مرسلة %d", @"Account: %@ · voice channel: %@ · hook: %@ · forced %d · sent %d"), idk ? @"✓" : @"✗", inV ? @"✓" : @"✗", gFDHooked ? @"✓" : @"✗", gFDForced, gFDPushed];
 }
 static id (*orig_httpSend)(id, SEL, id, id);
 #define RY_RED [UIColor colorWithRed:1.0 green:0.27 blue:0.27 alpha:1]
@@ -1761,11 +1797,12 @@ static void RYWsSend(id self, SEL _cmd, NSString *name, id body) {
             if ([d isKindOfClass:NSString.class]) {
                 if ([[body[@"type"] description] isEqual:@"binary"]) {                                   // base64 of the decompressed bytes
                     NSData *raw = [[NSData alloc] initWithBase64EncodedString:d options:0];
+                    if (raw.length) RYFDWatch((const char *)raw.bytes, raw.length, body[@"id"], self);
                     if (raw.length && raw.length < 60000 && memmem(raw.bytes, raw.length, "MESSAGE_DELETE", 14)) {
                         NSString *txt = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding]; NSString *f = txt ? RYGatewayFilter(txt) : nil;
                         if (f && f != txt) newData = [[f dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
                     }
-                } else { NSString *f = RYGatewayFilter(d); if (f != d) newData = f; }
+                } else { const char *u = [(NSString *)d UTF8String]; if (u) RYFDWatch(u, strlen(u), body[@"id"], self); NSString *f = RYGatewayFilter(d); if (f != d) newData = f; }
             }
             if (newData) {
                 NSMutableDictionary *nb = [body mutableCopy]; nb[@"data"] = newData; body = nb;
@@ -1937,15 +1974,7 @@ static void RYNetSendData(id self, SEL _cmd, NSData *data, NSString *type, id re
     if (orig_netData) orig_netData(self, _cmd, use, type, resp, task);
 }
 static void RYInstallLogger(void) {
-    static BOOL cellDone, wsDone, httpDone, netDone, evtDone, outDone; RYLogInit();
-    if (!outDone) {
-        Class wc = NSClassFromString(@"RCTWebSocketModule");
-        SEL s1 = NSSelectorFromString(@"send:forSocketID:"), s2 = NSSelectorFromString(@"sendBinary:forSocketID:");
-        Method m1 = wc ? class_getInstanceMethod(wc, s1) : NULL, m2 = wc ? class_getInstanceMethod(wc, s2) : NULL;
-        if (m1 && method_getNumberOfArguments(m1) == 4) { orig_wsSendOut = (void *)method_getImplementation(m1); class_replaceMethod(wc, s1, (IMP)RYWsSendOut, method_getTypeEncoding(m1)); }
-        if (m2 && method_getNumberOfArguments(m2) == 4) { orig_wsSendBinOut = (void *)method_getImplementation(m2); class_replaceMethod(wc, s2, (IMP)RYWsSendBinOut, method_getTypeEncoding(m2)); }
-        if (m1 || m2) { outDone = YES; RYLog(@"logger: outgoing websocket hook installed (fake deafen)"); }
-    }
+    static BOOL cellDone, wsDone, httpDone, netDone, evtDone; RYLogInit();
     if (!cellDone) {
         Class cc = NSClassFromString(@"DCDMessageTableViewCell");
         Method cm = cc ? class_getInstanceMethod(cc, NSSelectorFromString(@"configureWithViewModel:viewReusePoolManager:actionManager:")) : NULL;
