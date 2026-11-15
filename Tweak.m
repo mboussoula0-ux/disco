@@ -1387,10 +1387,23 @@ static void RYIsoPushNow(void) {   // switch turned on while a voice call is run
     };
     dispatch_async(q ?: dispatch_get_main_queue(), blk);
 }
+// Fake Defen needs three facts from the voice engine itself: your user id (at join), and your real self-mute / self-deafen. Pass-through only.
+static void RYFDOnCreate(id a, id b);
+static void RYFDOnSelf(BOOL deaf, BOOL v);
+static void (*orig_createVC)(id, SEL, NSUInteger, id, id, id);
+static void RYCreateVC(id self, SEL _cmd, NSUInteger i, id a, id b, id cb) { @try { RYFDOnCreate(a, b); } @catch (__unused id e) {} if (orig_createVC) orig_createVC(self, _cmd, i, a, b, cb); }
+static void (*orig_selfMute)(id, SEL, NSUInteger, BOOL);
+static void RYSelfMute(id self, SEL _cmd, NSUInteger i, BOOL v) { RYFDOnSelf(NO, v); if (orig_selfMute) orig_selfMute(self, _cmd, i, v); }
+static void (*orig_selfDeaf)(id, SEL, NSUInteger, BOOL);
+static void RYSelfDeaf(id self, SEL _cmd, NSUInteger i, BOOL v) { RYFDOnSelf(YES, v); if (orig_selfDeaf) orig_selfDeaf(self, _cmd, i, v); }
 static void RYInstallVoiceHook2(void) {
     Class c = NSClassFromString(@"DCDVoiceEngine"); if (!c) return;
     static BOOL a, b;
     if (!a) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"connectionInstanceSetTransportOptions:options:")); if (m && method_getNumberOfArguments(m) == 4) { orig_connTO = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYConnTO); a = YES; } }
+    static BOOL f1, f2, f3;
+    if (!f1) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"createVoiceConnectionWithOptions:withUserId:withConnectionOptions:withCallback:")); if (m && method_getNumberOfArguments(m) == 6) { orig_createVC = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYCreateVC); f1 = YES; } }
+    if (!f2) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"connectionInstanceSetSelfMute:muted:")); if (m && method_getNumberOfArguments(m) == 4) { orig_selfMute = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSelfMute); f2 = YES; } }
+    if (!f3) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"connectionInstanceSetSelfDeafen:deafened:")); if (m && method_getNumberOfArguments(m) == 4) { orig_selfDeaf = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSelfDeaf); f3 = YES; } }
     if (!b) { Method m = class_getInstanceMethod(c, NSSelectorFromString(@"setSidechainCompression:")); if (m && method_getNumberOfArguments(m) == 3) { orig_sidechain = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSidechain); b = YES; } }
 }
 static void RYInstallVoiceHook(void) {
@@ -1574,41 +1587,83 @@ static int RYFDPush(BOOL fake) {    // send one voice-state frame now: fake = mu
     dispatch_async(q ?: dispatch_get_main_queue(), ^{ @try { ((id (*)(id, SEL, id, id))send)(mod, NSSelectorFromString(@"send:forSocketID:"), s, sock); gFDPushed++; } @catch (__unused id e) {} });
     return 1;
 }
-// incoming gateway frame (bytes of the decompressed JSON), called from RYWsSend. Cheap: a few memmem calls, JSON only for your own small voice-state frame.
-static void RYFDWatch(const char *p, size_t n, id sockId, id module) {
-    if (!p || n < 30) return;
-    if (!gFDOwnId) {                                                   // your user id: the first "user":{"id":"..."} of the READY frame
-        if (!memmem(p, n < 600 ? n : 600, "\"READY\"", 7)) return;
-        const char *k = (const char *)memmem(p, n, "\"user\":{\"id\":\"", 14); if (!k) return;
-        const char *q = k + 14, *e = p + n; const char *z = q; while (z < e && *z >= '0' && *z <= '9') z++;
-        if (z > q && z - q < 24 && z < e && *z == '"') gFDOwnId = [[NSString alloc] initWithBytes:q length:(NSUInteger)(z - q) encoding:NSASCIIStringEncoding];
-        return;
-    }
-    if (n > 3000 || !memmem(p, n, "VOICE_STATE_UPDATE", 18)) return;
-    char key[64]; int kl = snprintf(key, sizeof key, "\"user_id\":\"%s\"", gFDOwnId.UTF8String); if (kl <= 0 || !memmem(p, n, key, (size_t)kl)) return;
-    id j = [NSJSONSerialization JSONObjectWithData:[NSData dataWithBytesNoCopy:(void *)p length:n freeWhenDone:NO] options:0 error:nil];
-    id d = [j isKindOfClass:NSDictionary.class] ? j[@"d"] : nil; if (![d isKindOfClass:NSDictionary.class]) return;
-    id ch = d[@"channel_id"]; BOOL inRoom = ch && ch != NSNull.null;
-    BOOL start = NO;
-    @synchronized (kFDLock) {
-        if (module) gWsMod = module; if (sockId) gGwSock = sockId;
-        if (!inRoom) gVSReal = nil;
-        else {
-            NSMutableDictionary *v = [NSMutableDictionary new];
-            v[@"guild_id"] = d[@"guild_id"] ?: NSNull.null; v[@"channel_id"] = ch;
-            if (gFakeDef && gVSReal) { v[@"self_mute"] = gVSReal[@"self_mute"] ?: @NO; v[@"self_deaf"] = gVSReal[@"self_deaf"] ?: @NO; }   // while faking, the echo of our own fake frame is not "real"
-            else { v[@"self_mute"] = d[@"self_mute"] ?: @NO; v[@"self_deaf"] = d[@"self_deaf"] ?: @NO; }
-            v[@"self_video"] = d[@"self_video"] ?: @NO;
-            gVSReal = v;
-            if (gFDPending) { gFDPending = NO; start = YES; }
+// Last small VOICE_STATE_UPDATE frame of every user, raw bytes (no JSON work for other people). Your own join echo arrives BEFORE your user id is
+// known, so it is looked up here afterwards.
+static NSMutableDictionary<NSString *, NSData *> *gFDVS;
+static volatile BOOL gFDFlags = NO, gFDRM = NO, gFDRD = NO;   // real self mute / deafen as the voice engine last got them
+static volatile int gFDFrames = 0;
+static BOOL RYFDResolve(void) {     // build gVSReal (the real state) from the cached frame of your own user
+    NSString *me; NSData *raw; @synchronized (kFDLock) { me = gFDOwnId; raw = me ? gFDVS[me] : nil; }
+    if (!raw) return NO;
+    id j = [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil];
+    id d = [j isKindOfClass:NSDictionary.class] ? j[@"d"] : nil; if (![d isKindOfClass:NSDictionary.class]) return NO;
+    id ch = d[@"channel_id"]; if (!ch || ch == NSNull.null) return NO;
+    NSMutableDictionary *v = [NSMutableDictionary new];
+    v[@"guild_id"] = d[@"guild_id"] ?: NSNull.null; v[@"channel_id"] = ch; v[@"self_video"] = d[@"self_video"] ?: @NO;
+    v[@"self_mute"] = gFDFlags ? @(gFDRM) : (d[@"self_mute"] ?: @NO); v[@"self_deaf"] = gFDFlags ? @(gFDRD) : (d[@"self_deaf"] ?: @NO);
+    @synchronized (kFDLock) { gVSReal = v; }
+    return YES;
+}
+static int RYFDPush(BOOL fake);
+static void RYFDKick(void) {        // switched on outside a room: as soon as the room is known, hook + fake frame
+    if (!gFakeDef || !gFDPending) return;
+    NSDictionary *real; @synchronized (kFDLock) { real = gVSReal; }
+    if (!real && !RYFDResolve()) return;
+    gFDPending = NO;
+    dispatch_async(dispatch_get_main_queue(), ^{ if (gFakeDef) { RYFDHook(YES); RYFDPush(YES); } });
+}
+static void RYFDOnCreate(id a, id b) {   // createVoiceConnection...: one of the object arguments is your user id (digits) or a dictionary holding it
+    for (id x in @[a ?: NSNull.null, b ?: NSNull.null]) {
+        NSString *s = [x isKindOfClass:NSString.class] ? x : ([x isKindOfClass:NSDictionary.class] ? [(x[@"userId"] ?: x[@"user_id"]) description] : nil);
+        if (s.length >= 15 && s.length <= 22 && [s rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location == NSNotFound) {
+            @synchronized (kFDLock) { gFDOwnId = s; } break;
         }
     }
-    if (start) dispatch_async(dispatch_get_main_queue(), ^{ if (gFakeDef) { RYFDHook(YES); RYFDPush(YES); } });   // you switched it on outside a room and have just joined one
+    RYFDKick();
+}
+static void RYFDOnSelf(BOOL deaf, BOOL v) {   // your real self mute / deafen (the engine is told by the app on every change)
+    gFDFlags = YES; if (deaf) gFDRD = v; else gFDRM = v;
+    if (!gFakeDef) @synchronized (kFDLock) { if (gVSReal) { NSMutableDictionary *m = [gVSReal mutableCopy]; m[deaf ? @"self_deaf" : @"self_mute"] = @(v); gVSReal = m; } }
+}
+// incoming gateway frame (bytes of the decompressed JSON), called from RYWsSend. Cheap: memmem only; JSON just for your own state later.
+static void RYFDWatch(const char *p, size_t n, id sockId, id module) {
+    if (!p || n < 30) return;
+    gFDFrames++;
+    if (!gFDOwnId && n > 600 && memmem(p, 600, "\"READY\"", 7)) {       // fallback id source: the "user":{...,"id":"<digits>"} object of READY
+        const char *u = (const char *)memmem(p, n, "\"user\":{", 8);
+        if (u) { size_t rem = n - (size_t)(u - p); if (rem > 3000) rem = 3000; const char *k = (const char *)memmem(u, rem, "\"id\":\"", 6);
+            if (k) { const char *q = k + 6, *e = p + n, *z = q; while (z < e && *z >= '0' && *z <= '9') z++;
+                if (z > q && z - q >= 15 && z - q <= 22 && z < e && *z == '"') @synchronized (kFDLock) { if (!gFDOwnId) gFDOwnId = [[NSString alloc] initWithBytes:q length:(NSUInteger)(z - q) encoding:NSASCIIStringEncoding]; } } }
+        return;
+    }
+    if (n > 10000 || !memmem(p, n, "VOICE_STATE_UPDATE", 18)) return;
+    const char *k = (const char *)memmem(p, n, "\"user_id\":\"", 11); if (!k) return;
+    const char *q = k + 11, *e = p + n, *z = q; while (z < e && *z >= '0' && *z <= '9') z++;
+    if (z == q || z - q > 24) return;
+    NSString *uid = [[NSString alloc] initWithBytes:q length:(NSUInteger)(z - q) encoding:NSASCIIStringEncoding];
+    NSData *raw = [NSData dataWithBytes:p length:n];
+    BOOL own;
+    @synchronized (kFDLock) {
+        if (module) gWsMod = module; if (sockId) gGwSock = sockId;     // only the gateway carries voice states
+        if (!gFDVS) gFDVS = [NSMutableDictionary new];
+        if (gFDVS.count > 300) [gFDVS removeAllObjects];
+        gFDVS[uid] = raw;
+        own = gFDOwnId && [uid isEqual:gFDOwnId];
+    }
+    if (!own) return;
+    id j = [NSJSONSerialization JSONObjectWithData:raw options:0 error:nil];
+    id d = [j isKindOfClass:NSDictionary.class] ? j[@"d"] : nil; if (![d isKindOfClass:NSDictionary.class]) return;
+    id ch = d[@"channel_id"]; BOOL inRoom = ch && ch != NSNull.null;
+    if (!inRoom) { @synchronized (kFDLock) { gVSReal = nil; } return; }
+    if (!gFakeDef) RYFDResolve();                                      // keeps the real state fresh; while faking the echo of our own fake frame is not "real"
+    else { NSDictionary *r; @synchronized (kFDLock) { r = gVSReal; } if (!r) RYFDResolve(); }
+    RYFDKick();
 }
 // The switch. In a room: hook + one voice-state frame at once (off: your real state again, hook removed). Outside a room: only armed.
 static int RYFakeDefSet(BOOL on) {
     gFakeDef = on;
     NSDictionary *real; @synchronized (kFDLock) { real = gVSReal; }
+    if (!real && RYFDResolve()) { @synchronized (kFDLock) { real = gVSReal; } }
     if (!real) { gFDPending = on; if (!on) RYFDHook(NO); return 0; }
     gFDPending = NO;
     if (on) RYFDHook(YES);
@@ -1617,8 +1672,8 @@ static int RYFakeDefSet(BOOL on) {
     return r;
 }
 static NSString *RYFakeDefStatus(void) {
-    BOOL idk, inV; @synchronized (kFDLock) { idk = gFDOwnId != nil; inV = gVSReal != nil; }
-    return [NSString stringWithFormat:T(@"حسابك: %@ · روم صوتي: %@ · الهوك: %@ · معدّلة %d · مرسلة %d", @"Account: %@ · voice channel: %@ · hook: %@ · forced %d · sent %d"), idk ? @"✓" : @"✗", inV ? @"✓" : @"✗", gFDHooked ? @"✓" : @"✗", gFDForced, gFDPushed];
+    BOOL idk, inV; int cached; @synchronized (kFDLock) { idk = gFDOwnId != nil; inV = gVSReal != nil; cached = (int)gFDVS.count; }
+    return [NSString stringWithFormat:T(@"حسابك: %@ · روم صوتي: %@ · الهوك: %@ · فريمات %d · حالات %d · معدّلة %d · مرسلة %d", @"Account: %@ · voice channel: %@ · hook: %@ · frames %d · states %d · forced %d · sent %d"), idk ? @"✓" : @"✗", inV ? @"✓" : @"✗", gFDHooked ? @"✓" : @"✗", gFDFrames, cached, gFDForced, gFDPushed];
 }
 static id (*orig_httpSend)(id, SEL, id, id);
 #define RY_RED [UIColor colorWithRed:1.0 green:0.27 blue:0.27 alpha:1]
