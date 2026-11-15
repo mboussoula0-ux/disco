@@ -1650,7 +1650,7 @@ static NSString *RYGatewayFilter(NSString *s) {
     NSDictionary *d = j[@"d"]; if (![d isKindOfClass:NSDictionary.class]) return s;
     RYLogInit(); gLogSeen++;
     id gid = d[@"guild_id"];
-    if (gid && gid != NSNull.null && ![CF(@"delAll", @NO) boolValue]) { gLogPass++; return s; }      // DMs/groups always kept; servers only if explicitly switched to "all chats"
+    if (gid && gid != NSNull.null && ![CF(@"delAll", @YES) boolValue]) { gLogPass++; return s; }      // kept everywhere by default; switch to "DMs only" in settings to exclude servers
     NSArray *ids = bulk ? d[@"ids"] : (d[@"id"] ? @[d[@"id"]] : @[]);
     if (![ids isKindOfClass:NSArray.class] || !ids.count) return s;
     NSString *cid0 = RYStr(d[@"channel_id"]), *mid0 = RYStr(ids.firstObject);
@@ -1715,9 +1715,12 @@ static NSString *RYCellMsgId(UITableViewCell *cell, id vm) {
     }
     return nil;
 }
+static volatile int gPaintSeen = 0, gPaintNoId = 0, gPaintKept = 0;
 static void RYDecorateCell(UITableViewCell *cell, id vm) {
     NSString *mid = RYCellMsgId(cell, vm);
+    gPaintSeen++; if (!mid) gPaintNoId++;
     BOOL del = RYIsKept(mid);
+    if (del) gPaintKept++;
     UIView *wash = [cell.contentView viewWithTag:8871];
     if (del) {
         if (!wash) { wash = [[UIView alloc] initWithFrame:cell.contentView.bounds]; wash.tag = 8871; wash.userInteractionEnabled = NO; wash.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [cell.contentView insertSubview:wash atIndex:0]; }
@@ -2186,6 +2189,7 @@ static NSString *RYDiagReport(void) {
     [o appendString:@"\n== mic\n"]; [o appendString:RYMicReport()];
     [o appendString:@"\n== screen share\n"]; [o appendString:RYDiagBroadcast()];
     [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nstored on disk: %d  remembered messages: %d  channel fetches seen: %d (incremental chunks held %d)  put back: %d\nlast put back: %s\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gStored, gNetCached, gNetSeen, gNetBuf, gNetInj, gNetLast, gTOLast, gTOCalls];
+    [o appendFormat:@"cell paint: seen %d, no id resolved %d, painted red %d\n", gPaintSeen, gPaintNoId, gPaintKept];
     { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
     return o;
 }
@@ -2680,7 +2684,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         RYBtn([NSString stringWithFormat:@"%@: %@", T(@"الخلفية", @"Background"), [CF(@"bgFull", @NO) boolValue] ? T(@"كل الشاشة", @"Full screen") : T(@"الدردشة فقط", @"Chat only")], NO, ^{
             CS(@"bgFull", @(![CF(@"bgFull", @NO) boolValue])); [[RYCore shared] bump]; RYRestoreAll(); [ws rebuild];
         }),
-        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @NO) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @NO) boolValue])); [ws rebuild]; }),
+        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @YES) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @YES) boolValue])); [ws rebuild]; }),
         RYBtn(RYAr() ? @"English" : @"العربية", NO, ^{ CS(@"lang", RYAr() ? @"en" : @"ar"); [ws rebuild]; })])];
     NSMutableArray *ac = [NSMutableArray new]; NSArray *cols = RYAccents();
     for (NSUInteger i = 0; i < cols.count; i++) {
