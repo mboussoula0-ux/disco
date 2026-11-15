@@ -1190,7 +1190,10 @@ static void RYIsoApplySession(void) { if (!gIsoSess) return; dispatch_async(disp
 // (2) the voice-processing audio unit (VPIO): switch its processing off (properties 2100 = bypass, 2101 = AGC) before it initialises / starts
 static OSStatus (*orig_auinit)(AudioUnit); static OSStatus (*orig_austart)(AudioUnit);
 static void RYBypassVP(AudioUnit u) {
-    if (!gIsoVP || !u) return; UInt32 one = 1, zero = 0;
+    if (!gIsoVP || !u) return;
+    AudioComponent comp = AudioComponentInstanceGetComponent(u); AudioComponentDescription cd; memset(&cd, 0, sizeof cd);
+    if (!comp || AudioComponentGetDescription(comp, &cd) != noErr || cd.componentSubType != kAudioUnitSubType_VoiceProcessingIO) return;
+    UInt32 one = 1, zero = 0;
     OSStatus a = AudioUnitSetProperty(u, 2100, kAudioUnitScope_Global, 0, &one, sizeof one);
     AudioUnitSetProperty(u, 2101, kAudioUnitScope_Global, 0, &zero, sizeof zero);
     if (a == noErr) gIsoVPN++; else gIsoVPFail++;
@@ -1212,6 +1215,7 @@ static id RYRTCInit(id self, SEL _cmd, NSDictionary *m, NSDictionary *o) {
 }
 static void RYInstallIso(void) {
     static BOOL done; if (done) return; done = YES;
+    return;   // session-mode / RTC-constraint / AVAudioEngine hooks are not installed any more: the join-voice button stopped working with them
     Class S = [AVAudioSession class]; Method m;
     if ((m = class_getInstanceMethod(S, @selector(setMode:error:)))) { orig_setMode = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSetMode); }
     if ((m = class_getInstanceMethod(S, @selector(setCategory:mode:options:error:)))) { orig_setCatMode = (void *)method_getImplementation(m); method_setImplementation(m, (IMP)RYSetCatMode); }
@@ -1237,7 +1241,7 @@ static void RYMicLoad(void) {
       if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
       else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
     gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
-    gIsoOn = [CF(@"isoOn", @YES) boolValue]; gIsoSess = gIsoVP = gIsoRTC = gIsoOn ? 1 : 0; // switch in the Mic tab
+    gIsoOn = [CF(@"isoOn", @YES) boolValue]; gIsoVP = gIsoOn ? 1 : 0; gIsoSess = gIsoRTC = 0; // switch in the Mic tab. Session-mode override + RTC constraints are never used (they can stop a voice join)
 }
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
@@ -1248,8 +1252,8 @@ static BOOL RYRevIsDefault(void) { for (int i = 0; i < RV_N; i++) if (fabsf(gRv[
 static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"الافتراضي ✓", @"Default ✓") : T(@"معدّل", @"Changed"); }
 static void RYIsoPushNow(void);
 static void RYMicSetIso(BOOL on) {
-    gIsoOn = on ? 1 : 0; gIsoSess = gIsoVP = gIsoRTC = gIsoOn; CS(@"isoOn", @(on));
-    if (on) { RYIsoApplySession(); RYIsoPushNow(); }
+    gIsoOn = on ? 1 : 0; gIsoVP = gIsoOn; gIsoSess = gIsoRTC = 0; CS(@"isoOn", @(on));
+    if (on) RYIsoPushNow();
 }
 static void RYIsoSave(void) { CS(@"isoSess", @(gIsoSess != 0)); CS(@"isoVP", @(gIsoVP != 0)); CS(@"isoRTC", @(gIsoRTC != 0)); }
 static void RYMicApplyPreset(int i) {
@@ -1331,9 +1335,9 @@ static NSArray<NSString *> *RYVoiceKeys(void) {
     return @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"automaticGainControlConfig", @"vadUseKrisp", @"vadKrispActivationThreshold"];
 }
 static __weak id gVoiceEng;   // the DCDVoiceEngine the app talks to (seen on its first setTransportOptions call)
-static NSDictionary *RYScrubOpts(NSDictionary *o) {
+static NSDictionary *RYScrubOpts(NSDictionary *o, BOOL addMissing) {
     NSMutableDictionary *m = [o mutableCopy];
-    for (NSString *k in @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"vadUseKrisp"]) m[k] = @NO;
+    for (NSString *k in @[@"echoCancellation", @"noiseSuppression", @"noiseCancellation", @"noiseCancellationDuringProcessing", @"automaticGainControl", @"builtInEchoCancellation", @"vadUseKrisp"]) if (addMissing || m[k]) m[k] = @NO;
     if (m[@"vadKrispActivationThreshold"]) m[@"vadKrispActivationThreshold"] = @0;
     NSDictionary *a = m[@"automaticGainControlConfig"];
     if ([a isKindOfClass:NSDictionary.class]) {
@@ -1350,7 +1354,7 @@ static void RYTransportHook(id self, SEL _cmd, NSDictionary *o) {
     NSDictionary *n = o; BOOL has = NO;
     if ([o isKindOfClass:NSDictionary.class]) for (NSString *k in RYVoiceKeys()) if (o[k]) { has = YES; break; }
     if (has && gIsoOn) {
-        gTOCalls++; n = RYScrubOpts(o);
+        gTOCalls++; n = RYScrubOpts(o, NO);
         snprintf(gTOLast, sizeof gTOLast, "%s", [[NSString stringWithFormat:@"in: %@", o] UTF8String] ?: "-");
     }
     if (orig) ((void (*)(id, SEL, NSDictionary *))orig)(self, _cmd, n);
@@ -1361,7 +1365,7 @@ static void RYConnTO(id self, SEL _cmd, NSUInteger cid, NSDictionary *o) {
     NSDictionary *n = o; BOOL has = NO;
     if ([NSStringFromClass(object_getClass(self)) isEqual:@"DCDVoiceEngine"]) gVoiceEng = self;
     if ([o isKindOfClass:NSDictionary.class]) for (NSString *k in RYVoiceKeys()) if (o[k]) { has = YES; break; }
-    if (has && gIsoOn) { gTOCalls++; n = RYScrubOpts(o); snprintf(gTOLast, sizeof gTOLast, "%s", [[NSString stringWithFormat:@"conn %lu: %@", (unsigned long)cid, o] UTF8String] ?: "-"); }
+    if (has && gIsoOn) { gTOCalls++; n = RYScrubOpts(o, NO); snprintf(gTOLast, sizeof gTOLast, "%s", [[NSString stringWithFormat:@"conn %lu: %@", (unsigned long)cid, o] UTF8String] ?: "-"); }
     if (orig_connTO) orig_connTO(self, _cmd, cid, n);
 }
 static void (*orig_sidechain)(id, SEL, BOOL);
