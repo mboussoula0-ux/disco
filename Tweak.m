@@ -1546,7 +1546,7 @@ static void RYTintText(UIView *v, UIColor *to, int d) {
 // Our own deletes (REST DELETE /channels/x/messages/y seen on the HTTP handler) are let through.
 static NSMutableSet<NSString *> *gLogIds;                      // ids of messages that were deleted by someone else and are kept
 static NSMutableDictionary<NSString *, NSDate *> *gOwnDel;     // ids we deleted ourselves (the matching gateway event passes)
-static volatile int gWsMsgs = 0, gLogSeen = 0, gLogKept = 0, gLogOwn = 0, gLogPass = 0; static char gLogLast[220] = "-";
+static volatile int gWsMsgs = 0, gLogSeen = 0, gLogKept = 0, gLogOwn = 0, gLogPass = 0, gLogKeptFull = 0, gLogKeptStub = 0; static char gLogLast[220] = "-";
 static void (*orig_cellCfg)(id, SEL, id, id, id);
 static void (*orig_wsSend)(id, SEL, NSString *, id);
 #pragma mark - Fake Deafen (voice): others see you as muted+deafened; your own mic/hearing are never touched.
@@ -2048,7 +2048,7 @@ static void RYDelLoad(void) {
                 if (![o isKindOfClass:NSDictionary.class]) continue;
                 if (o[@"guild_id"] && o[@"guild_id"] != NSNull.null) continue;                            // old server entries are dropped: servers are not kept any more
                 NSString *mid = RYStr(o[@"id"]); NSData *x = [NSJSONSerialization dataWithJSONObject:o options:0 error:nil];
-                if (mid && x) { m[mid] = x; [gLogIds addObject:mid]; }
+                if (mid && x) { m[mid] = x; @synchronized (gLogIds) { [gLogIds addObject:mid]; } }
             }
             if (m.count) gDelStore[cid] = m;
         }
@@ -2089,7 +2089,7 @@ static void RYForgetMsg(NSString *mid) {                                        
     @synchronized (gLogLock) {
         for (NSString *cid in gDelStore.allKeys) if (gDelStore[cid][mid]) { [gDelStore[cid] removeObjectForKey:mid]; ch = YES; }
         for (NSString *cid in gMsgCache) [gMsgCache[cid] removeObjectForKey:mid];
-        [gLogIds removeObject:mid];
+        @synchronized (gLogIds) { [gLogIds removeObject:mid]; }
     }
     if (ch) RYDelSave();
 }
@@ -2159,7 +2159,9 @@ static NSString *RYGatewayFilter(NSString *s) {
     // nothing is removed, guild_id stays, no unknown event type reaches JS). Full copy if we remember the message, else just ids.
     id full = nil;
     @synchronized (gLogLock) { NSData *x = gMsgCache[cid0][mid0] ?: gDelStore[cid0][mid0]; if (x) full = [NSJSONSerialization JSONObjectWithData:x options:NSJSONReadingMutableContainers error:nil]; }
-    if (![full isKindOfClass:NSDictionary.class]) full = @{@"id": mid0, @"channel_id": cid0};   // never saw it: a partial update (same shape Discord uses for embed updates) still stops the delete, the message stays where it is
+    BOOL hadFull = [full isKindOfClass:NSDictionary.class];
+    if (!hadFull) full = @{@"id": mid0, @"channel_id": cid0};   // never saw it: a partial update (same shape Discord uses for embed updates) still stops the delete, the message stays where it is
+    if (hadFull) gLogKeptFull++; else gLogKeptStub++;   // split so the Diag report can show which path each case went through
     j[@"t"] = @"MESSAGE_UPDATE"; j[@"d"] = full;
     NSData *out = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
     NSString *ns = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
@@ -2183,7 +2185,7 @@ static void RYWsSend(id self, SEL _cmd, NSString *name, id body) {
             }
             if (newData) {
                 NSMutableDictionary *nb = [body mutableCopy]; nb[@"data"] = newData; body = nb;
-                dispatch_async(dispatch_get_main_queue(), ^{ RYRefreshCells(); });
+                for (NSNumber *dl in @[@0.0, @0.35, @1.0, @2.2]) dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(dl.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYRefreshCells(); });
             }
         }
     } @catch (__unused id e) {}
@@ -2221,8 +2223,7 @@ static volatile int gPaintSeen = 0, gPaintNoId = 0, gPaintKept = 0;
 // read-only. This is reversible per cell (cells get reused for different messages), using only public,
 // stable UIKit API (no private selectors, no ABI guessing).
 static void RYSetCellInteractive(UITableViewCell *cell, BOOL on) {
-    for (UIGestureRecognizer *g in cell.gestureRecognizers) g.enabled = on;
-    for (UIGestureRecognizer *g in cell.contentView.gestureRecognizers) g.enabled = on;
+    if (cell.userInteractionEnabled != on) cell.userInteractionEnabled = on;
 }
 static void RYDecorateCell(UITableViewCell *cell, id vm) {
     NSString *mid = RYCellMsgId(cell, vm);
@@ -2273,7 +2274,7 @@ static NSData *RYMergeKeptRaw(NSData *data, NSURL *url) {
     if (!url || data.length < 2 || data.length > 4000000) return data;
     NSArray *c = [url.path componentsSeparatedByString:@"/"];
     NSUInteger i = [c indexOfObject:@"channels"];
-    if (i == NSNotFound || i + 2 != c.count - 1 || ![c[i + 2] isEqual:@"messages"]) return data;      // exactly /channels/<id>/messages
+    if (i == NSNotFound || i + 2 != c.count - 1 || ![c[i + 2] isEqual:@"messages"] || ![url.query containsString:@"limit="]) return data;   // exactly the list /channels/<id>/messages?limit=..
     NSString *cid = c[i + 1]; if (!cid.length) return data;
     gNetSeen++;
     id arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -2322,7 +2323,7 @@ static NSData *RYMergeKept(NSData *data, NSURLResponse *resp) {
 static void (*orig_netEvt)(id, SEL, NSString *, id);
 static BOOL RYIsMsgListURL(NSURL *u) {
     NSArray *c = [u.path componentsSeparatedByString:@"/"]; NSUInteger i = [c indexOfObject:@"channels"];
-    return i != NSNotFound && i + 2 == c.count - 1 && [c[i + 2] isEqual:@"messages"];
+    return i != NSNotFound && i + 2 == c.count - 1 && [c[i + 2] isEqual:@"messages"] && [u.query containsString:@"limit="];
 }
 static void RYNetEvent(id self, SEL _cmd, NSString *name, id body) {
     gCrumb = "network event";
@@ -2705,6 +2706,7 @@ static NSString *RYDiagReport(void) {
     [o appendFormat:@"\n== last crash\n%@\n", RYCrashText()];
     [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nstored on disk: %d  remembered messages: %d  channel fetches seen: %d (incremental chunks held %d)  put back: %d\nlast put back: %s\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gStored, gNetCached, gNetSeen, gNetBuf, gNetInj, gNetLast, gTOLast, gTOCalls];
     [o appendFormat:@"cell paint: seen %d, no id resolved %d, painted red %d\n", gPaintSeen, gPaintNoId, gPaintKept];
+    [o appendFormat:@"kept via: full message %d, partial stub %d\n", gLogKeptFull, gLogKeptStub];
     { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
     return o;
 }
