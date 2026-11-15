@@ -140,6 +140,10 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreMedia/CoreMedia.h>
 #import <os/lock.h>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <signal.h>
 
 #pragma mark - Config / storage
 
@@ -423,7 +427,7 @@ static NSArray<UIWindow *> *RYAppWindows(void) {
     NSMutableArray *a = [NSMutableArray new];
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) {
         if (![s isKindOfClass:UIWindowScene.class]) continue;
-        for (UIWindow *w in ((UIWindowScene *)s).windows) { if (![NSStringFromClass(w.class) isEqual:@"RYWindow"]) [a addObject:w]; }
+        for (UIWindow *w in ((UIWindowScene *)s).windows) { NSString *wc = NSStringFromClass(w.class); if (![wc isEqual:@"RYWindow"] && ![wc isEqual:@"RYCatWindow"]) [a addObject:w]; }
     }
     return a;
 }
@@ -491,10 +495,11 @@ static void RYLog(NSString *fmt, ...) {
 #pragma mark - Room helpers (see-through views, chat input, diagnostics)
 
 static NSMapTable *gOrigBG;
-static NSHashTable *gKeepClear; static BOOL gBgActive = NO; // views we made see-through stay see-through even when the app paints them again
+static NSHashTable *gKeepClear; static os_unfair_lock gKCLock = OS_UNFAIR_LOCK_INIT; static BOOL gBgActive = NO; // views we made see-through stay see-through even when the app paints them again
+static BOOL RYKeepHas(id v) { if (!gKeepClear || !v) return NO; os_unfair_lock_lock(&gKCLock); BOOL r = [gKeepClear containsObject:v]; os_unfair_lock_unlock(&gKCLock); return r; }
 static void (*orig_setBGC)(id, SEL, UIColor *);
 static void RYSetBGC(id self, SEL _cmd, UIColor *c) {
-    if (gBgActive && gKeepClear && c && [gKeepClear containsObject:self]) c = UIColor.clearColor;
+    if (gBgActive && gKeepClear && c && RYKeepHas(self)) c = UIColor.clearColor;
     orig_setBGC(self, _cmd, c);
 }
 // RN / Discord views can paint straight onto the layer (or override setBackgroundColor: without calling UIView's), which skipped the hook above and
@@ -503,7 +508,7 @@ static void (*orig_layerSetBGC)(id, SEL, CGColorRef);
 static void RYLayerSetBGC(id self, SEL _cmd, CGColorRef c) {
     if (gBgActive && c && gKeepClear) {
         id d = ((CALayer *)self).delegate;
-        if (d && [d isKindOfClass:UIView.class] && ((UIView *)d).layer == (CALayer *)self && [gKeepClear containsObject:d] && CGColorGetAlpha(c) > 0.001) c = UIColor.clearColor.CGColor;
+        if (d && [d isKindOfClass:UIView.class] && ((UIView *)d).layer == (CALayer *)self && RYKeepHas(d) && CGColorGetAlpha(c) > 0.001) c = UIColor.clearColor.CGColor;
     }
     orig_layerSetBGC(self, _cmd, c);
 }
@@ -512,7 +517,7 @@ static void RYHookOwnBGC(Class c) {
     Method m = class_getInstanceMethod(c, s); if (!m) return;
     IMP orig = method_getImplementation(m);
     void (^blk)(id, UIColor *) = ^(id me, UIColor *col) {
-        if (gBgActive && col && gKeepClear && [gKeepClear containsObject:me]) col = UIColor.clearColor;
+        if (gBgActive && col && gKeepClear && RYKeepHas(me)) col = UIColor.clearColor;
         ((void (*)(id, SEL, UIColor *))orig)(me, s, col);
     };
     method_setImplementation(m, imp_implementationWithBlock(blk));
@@ -547,9 +552,9 @@ static BOOL RYSkipClass(UIView *v) {
 }
 static void RYClear(UIView *v) {
     if (!gOrigBG) gOrigBG = [NSMapTable weakToStrongObjectsMapTable];
-    if (!gKeepClear) gKeepClear = [NSHashTable weakObjectsHashTable];
+    if (!gKeepClear) gKeepClear = [NSHashTable hashTableWithOptions:NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality];
     if (![gOrigBG objectForKey:v]) [gOrigBG setObject:(v.backgroundColor ?: (id)NSNull.null) forKey:v];
-    [gKeepClear addObject:v];
+    os_unfair_lock_lock(&gKCLock); [gKeepClear addObject:v]; os_unfair_lock_unlock(&gKCLock);
     v.backgroundColor = UIColor.clearColor;
 }
 static void RYRestoreAll(void) {
@@ -557,7 +562,7 @@ static void RYRestoreAll(void) {
     for (UIView *v in [gOrigBG.keyEnumerator allObjects]) {
         id o = [gOrigBG objectForKey:v]; v.backgroundColor = [o isKindOfClass:UIColor.class] ? o : nil;
     }
-    [gOrigBG removeAllObjects]; [gKeepClear removeAllObjects];
+    [gOrigBG removeAllObjects]; os_unfair_lock_lock(&gKCLock); [gKeepClear removeAllObjects]; os_unfair_lock_unlock(&gKCLock);
     gBgActive = was;
 }
 static BOOL RYHasBG(UIView *v) { return v.backgroundColor && CGColorGetAlpha(v.backgroundColor.CGColor) > 0.05; }
@@ -1715,7 +1720,17 @@ static NSString *RYFakeDefStatus(void) {
 static id (*orig_httpSend)(id, SEL, id, id);
 #define RY_RED [UIColor colorWithRed:1.0 green:0.27 blue:0.27 alpha:1]
 static UIView *RYChatHost(void);
-static id RYKV(id o, NSString *k) { if (!o) return nil; @try { return [o valueForKey:k]; } @catch (__unused id e) { return nil; } }
+// Only a real getter that returns an object is called. NEVER valueForKey: (it falls back to reading the ivar, and Swift ivars such as
+// DCDMessageTableViewCell.viewModel have an EMPTY type encoding: reading them through KVC is a hard crash that @try cannot catch).
+static id RYKV(id o, NSString *k) {
+    if (!o || !k.length) return nil;
+    @try {
+        SEL sel = NSSelectorFromString(k); Method m = class_getInstanceMethod(object_getClass(o), sel);
+        if (!m || method_getNumberOfArguments(m) != 2) return nil;
+        char t[8] = {0}; method_getReturnType(m, t, sizeof t); if (t[0] != '@') return nil;
+        return ((id (*)(id, SEL))objc_msgSend)(o, sel);
+    } @catch (__unused id e) { return nil; }
+}
 static NSString *RYStr(id v) {
     if (!v || v == NSNull.null) return nil;
     NSString *s = [v isKindOfClass:NSString.class] ? v : [v description]; return s.length ? s : nil;
@@ -1932,6 +1947,47 @@ static NSString *RYFPDiag(void) {
 // ---- persistence: every recent message is remembered (compact JSON); when one is deleted by someone else it is copied to Documents/8ubah/data/deleted.json
 // and put back into the server's answer whenever the app asks for that channel's messages again (after a restart, scrolling, switching chats).
 static NSObject *gLogLock;
+// ---- crash recorder: when Discord dies, the reason + the last hook that was running is written to Documents/8ubah/data/crash.txt.
+// On the next launch it is moved to crash-last.txt and shown in the Diag report ("last crash"). This is how the real cause of a crash is found.
+static const char *volatile gCrumb = "start";
+static char gCrashPath[1100]; static NSUncaughtExceptionHandler *gPrevExc; static struct sigaction gPrevSig[32];
+static void RYCrashSig(int sig) {
+    int fd = open(gCrashPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        char head[240]; int n = snprintf(head, sizeof head, "SIGNAL %d (%s)\nlast hook: %s\ntime: %ld\n", sig, sig == SIGSEGV ? "SEGV" : sig == SIGBUS ? "BUS" : sig == SIGABRT ? "ABRT" : sig == SIGILL ? "ILL" : sig == SIGTRAP ? "TRAP" : "other", gCrumb ?: "-", (long)time(NULL));
+        if (n > 0) (void)!write(fd, head, (size_t)MIN(n, (int)sizeof head - 1));
+        void *bt[40]; int c = backtrace(bt, 40); backtrace_symbols_fd(bt, c, fd); close(fd);
+    }
+    if (sig > 0 && sig < 32) sigaction(sig, &gPrevSig[sig], NULL);
+    raise(sig);
+}
+static void RYCrashExc(NSException *e) {
+    @try {
+        NSString *t = [NSString stringWithFormat:@"EXCEPTION %@\n%@\nlast hook: %s\n%@\n", e.name, e.reason, gCrumb ?: "-", [e.callStackSymbols componentsJoinedByString:@"\n"]];
+        [t writeToFile:[NSString stringWithUTF8String:gCrashPath] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    } @catch (__unused id x) {}
+    if (gPrevExc) gPrevExc(e);
+}
+static void RYInstallCrashLog(void) {
+    static BOOL first = YES;
+    NSString *dir = RYDir(@"data"), *p = [dir stringByAppendingPathComponent:@"crash.txt"];
+    if (first) { first = NO; NSString *last = [dir stringByAppendingPathComponent:@"crash-last.txt"]; NSFileManager *fm = NSFileManager.defaultManager; if ([fm fileExistsAtPath:p]) { [fm removeItemAtPath:last error:nil]; [fm moveItemAtPath:p toPath:last error:nil]; } }
+    strlcpy(gCrashPath, p.fileSystemRepresentation, sizeof gCrashPath);
+    int sigs[] = {SIGSEGV, SIGBUS, SIGABRT, SIGILL, SIGTRAP, SIGFPE};
+    for (size_t i = 0; i < sizeof sigs / sizeof sigs[0]; i++) {
+        struct sigaction cur; if (sigaction(sigs[i], NULL, &cur) == 0 && cur.sa_handler == RYCrashSig) continue;   // already ours (second install after the app's own crash reporter)
+        struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = RYCrashSig; sigemptyset(&sa.sa_mask);
+        sigaction(sigs[i], &sa, &gPrevSig[sigs[i]]);
+    }
+    NSUncaughtExceptionHandler *cur = NSGetUncaughtExceptionHandler(); if (cur != RYCrashExc) { gPrevExc = cur; NSSetUncaughtExceptionHandler(RYCrashExc); }
+}
+static NSString *RYCrashText(void) {
+    NSString *t = [NSString stringWithContentsOfFile:[RYDir(@"data") stringByAppendingPathComponent:@"crash-last.txt"] encoding:NSUTF8StringEncoding error:nil];
+    NSString *u = [NSString stringWithContentsOfFile:[RYDir(@"data") stringByAppendingPathComponent:@"crash.txt"] encoding:NSUTF8StringEncoding error:nil];
+    NSMutableString *o = [NSMutableString new];
+    if (t.length) [o appendFormat:@"previous launch:\n%@\n", t]; if (u.length) [o appendFormat:@"this launch:\n%@\n", u];
+    return o.length ? o : @"(none)";
+}
 static NSObject *gNetLock; static NSMutableDictionary<NSString *, NSMutableDictionary *> *gNetReq; static volatile int gNetBuf = 0;
 static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSData *> *> *gMsgCache;   // channel -> id -> JSON of a recently seen message
 static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSData *> *> *gDelStore;   // channel -> id -> JSON of a kept (deleted) message
@@ -1985,6 +2041,7 @@ static void RYDelLoad(void) {
 }
 static void RYCacheMsg(id o) {
     if (![o isKindOfClass:NSDictionary.class]) return;
+    if (o[@"guild_id"] && o[@"guild_id"] != NSNull.null) return;                                    // server messages are never remembered, never saved
     NSString *mid = RYStr(o[@"id"]), *cid = RYStr(o[@"channel_id"]);
     if (!mid || !cid || !o[@"author"] || !o[@"timestamp"]) return;                                  // partial updates (embeds only) are ignored
     NSData *x = [NSJSONSerialization dataWithJSONObject:o options:0 error:nil]; if (!x) return;
@@ -2030,6 +2087,7 @@ static NSString *RYLoggerStatus(void) {
 
 // ---- own deletes: DELETE /channels/<c>/messages/<m> on the app's HTTP handler
 static id RYHttpSend(id self, SEL _cmd, id req, id delegate) {
+    gCrumb = "http send";
     @try {
         if ([req isKindOfClass:NSURLRequest.class]) RYFPCaptureReq((NSURLRequest *)req);
         if ([req isKindOfClass:NSURLRequest.class] && [[(NSURLRequest *)req HTTPMethod] isEqualToString:@"DELETE"]) {
@@ -2054,6 +2112,7 @@ static BOOL RYOwnDeleted(NSString *mid) {
 
 // ---- gateway: MESSAGE_DELETE of someone else's DM message becomes an unknown event that JS ignores (its sequence number still counts)
 static NSString *RYGatewayFilter(NSString *s) {
+    gCrumb = "gateway filter";
     if (s.length > 60000) return s;
     BOOL isDel = [s rangeOfString:@"\"MESSAGE_DELETE"].location != NSNotFound;
     BOOL isNew = !isDel && ([s rangeOfString:@"\"MESSAGE_CREATE\""].location != NSNotFound || [s rangeOfString:@"\"MESSAGE_UPDATE\""].location != NSNotFound);
@@ -2084,7 +2143,7 @@ static NSString *RYGatewayFilter(NSString *s) {
     // nothing is removed, guild_id stays, no unknown event type reaches JS). Full copy if we remember the message, else just ids.
     id full = nil;
     @synchronized (gLogLock) { NSData *x = gMsgCache[cid0][mid0] ?: gDelStore[cid0][mid0]; if (x) full = [NSJSONSerialization JSONObjectWithData:x options:NSJSONReadingMutableContainers error:nil]; }
-    if (![full isKindOfClass:NSDictionary.class]) { gLogPass++; return s; }   // never saw the full message: let the real delete through rather than fake an incomplete one
+    if (![full isKindOfClass:NSDictionary.class]) full = @{@"id": mid0, @"channel_id": cid0};   // never saw it: a partial update (same shape Discord uses for embed updates) still stops the delete, the message stays where it is
     j[@"t"] = @"MESSAGE_UPDATE"; j[@"d"] = full;
     NSData *out = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
     NSString *ns = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
@@ -2100,7 +2159,7 @@ static void RYWsSend(id self, SEL _cmd, NSString *name, id body) {
                 if ([[body[@"type"] description] isEqual:@"binary"]) {                                   // base64 of the decompressed bytes
                     NSData *raw = [[NSData alloc] initWithBase64EncodedString:d options:0];
                     if (raw.length) RYFDWatch((const char *)raw.bytes, raw.length, body[@"id"], self);
-                    if (raw.length && raw.length < 60000 && memmem(raw.bytes, raw.length, "MESSAGE_DELETE", 14)) {
+                    if (raw.length && raw.length < 60000 && (memmem(raw.bytes, raw.length, "MESSAGE_DELETE", 14) || memmem(raw.bytes, raw.length, "MESSAGE_CREATE", 14) || memmem(raw.bytes, raw.length, "MESSAGE_UPDATE", 14))) {
                         NSString *txt = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding]; NSString *f = txt ? RYGatewayFilter(txt) : nil;
                         if (f && f != txt) newData = [[f dataUsingEncoding:NSUTF8StringEncoding] base64EncodedStringWithOptions:0];
                     }
@@ -2127,13 +2186,14 @@ static UILabel *RYFindUsernameLabel(UIView *root, UIView *exclude, int depth) {
     }
     return best;
 }
+static const void *kRYMid = &kRYMid;    // the message id is remembered ON the cell each time the app configures it
 static NSString *RYCellMsgId(UITableViewCell *cell, id vm) {
-    for (id o in @[vm ?: NSNull.null, RYKV(cell, @"viewModel") ?: NSNull.null, RYKV(cell, @"baseViewModel") ?: NSNull.null]) {
-        if (o == NSNull.null) continue;
-        NSString *mid = RYStr(RYKV(o, @"id")) ?: RYStr(RYKV(RYKV(o, @"message"), @"id"));
-        if (mid) return mid;
-    }
-    return nil;
+    NSString *mid = nil;
+    if (vm) mid = RYStr(RYKV(vm, @"id")) ?: RYStr(RYKV(RYKV(vm, @"message"), @"id"));
+    if (!mid) mid = RYStr(RYKV(RYKV(RYKV(cell, @"baseViewModel"), @"message"), @"id"));
+    if (mid) objc_setAssociatedObject(cell, kRYMid, mid, OBJC_ASSOCIATION_COPY_NONATOMIC);
+    else mid = objc_getAssociatedObject(cell, kRYMid);
+    return mid;
 }
 static volatile int gPaintSeen = 0, gPaintNoId = 0, gPaintKept = 0;
 static void RYDecorateCell(UITableViewCell *cell, id vm) {
@@ -2154,6 +2214,7 @@ static void RYDecorateCell(UITableViewCell *cell, id vm) {
     }
 }
 static void RYCellCfg(id self, SEL _cmd, id vm, id pool, id am) {
+    gCrumb = "cell configure";
     orig_cellCfg(self, _cmd, vm, pool, am);
     @try { RYDecorateCell((UITableViewCell *)self, vm); } @catch (__unused id e) {}
 }
@@ -2164,6 +2225,7 @@ static void RYCollectTables(UIView *v, NSMutableArray *o, int d) {
 }
 // cells already on screen are not re-configured by the app (nothing changed for it), so paint them directly
 static void RYRefreshCells(void) {
+    gCrumb = "refresh cells";
     if (!gLogIds || !gLogIds.count) return;
     UIView *host = RYChatHost(); if (!host) return;
     NSMutableArray *tabs = [NSMutableArray new]; RYCollectTables(host, tabs, 0);
@@ -2234,6 +2296,7 @@ static BOOL RYIsMsgListURL(NSURL *u) {
     return i != NSNotFound && i + 2 == c.count - 1 && [c[i + 2] isEqual:@"messages"];
 }
 static void RYNetEvent(id self, SEL _cmd, NSString *name, id body) {
+    gCrumb = "network event";
     @try {
         if ([body isKindOfClass:NSArray.class] && [body count] >= 1) {
             NSString *rid = [[body objectAtIndex:0] description];
@@ -2271,6 +2334,7 @@ static void RYNetEvent(id self, SEL _cmd, NSString *name, id body) {
     if (orig_netEvt) orig_netEvt(self, _cmd, name, body);
 }
 static void RYNetSendData(id self, SEL _cmd, NSData *data, NSString *type, id resp, id task) {
+    gCrumb = "network data";
     NSData *use = data;
     @try { RYLogInit(); if ([data isKindOfClass:NSData.class]) use = RYMergeKept(data, resp); } @catch (__unused id e) { use = data; }
     if (orig_netData) orig_netData(self, _cmd, use, type, resp, task);
@@ -2609,6 +2673,7 @@ static NSString *RYDiagReport(void) {
     [o appendString:@"\n== mic\n"]; [o appendString:RYMicReport()];
     [o appendString:@"\n== screen share\n"]; [o appendString:RYDiagBroadcast()];
     [o appendFormat:@"\n== fake defean\n%@\n", RYFakeDefStatus()]; [o appendString:@"\n== follow / pull\n"]; [o appendString:RYFPDiag()];
+    [o appendFormat:@"\n== last crash\n%@\n", RYCrashText()];
     [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nstored on disk: %d  remembered messages: %d  channel fetches seen: %d (incremental chunks held %d)  put back: %d\nlast put back: %s\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gStored, gNetCached, gNetSeen, gNetBuf, gNetInj, gNetLast, gTOLast, gTOCalls];
     [o appendFormat:@"cell paint: seen %d, no id resolved %d, painted red %d\n", gPaintSeen, gPaintNoId, gPaintKept];
     { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
@@ -2622,6 +2687,115 @@ static void RYShareText(UIViewController *from, NSString *name, NSString *text) 
         a.popoverPresentationController.sourceView = from.view; [from presentViewController:a animated:YES completion:nil];
     });
 }
+
+#pragma mark - Cat (oneko): a small cat runs to wherever you tap on the screen. One switch in the Cat tab, off = gone.
+static const void *kRYCatTap = &kRYCatTap;
+@interface RYCatView : UIView @property (nonatomic) CGFloat phase; @property (nonatomic) int facing, mode; @property (nonatomic) BOOL blink; @end
+@implementation RYCatView
+- (instancetype)initWithFrame:(CGRect)f { self = [super initWithFrame:f]; self.opaque = NO; self.backgroundColor = UIColor.clearColor; self.userInteractionEnabled = NO; self.facing = 1; return self; }
+- (void)drawRect:(CGRect)r {
+    CGContextRef c = UIGraphicsGetCurrentContext(); if (!c) return;
+    if (self.facing < 0) { CGContextTranslateCTM(c, self.bounds.size.width, 0); CGContextScaleCTM(c, -1, 1); }
+    UIColor *fur = [UIColor colorWithWhite:0.97 alpha:1], *ink = [UIColor colorWithWhite:0.12 alpha:1], *pink = [UIColor colorWithRed:1 green:0.6 blue:0.7 alpha:1];
+    int mode = self.mode; CGFloat ph = self.phase; BOOL shut = mode == 2 || self.blink; UIBezierPath *p;
+    CGFloat wag = (CGFloat)sin(ph * (mode == 0 ? 0.7 : 0.25)) * 4;
+    p = [UIBezierPath bezierPath]; p.lineCapStyle = kCGLineCapRound;
+    if (mode == 2) { [p moveToPoint:CGPointMake(10, 30)]; [p addQuadCurveToPoint:CGPointMake(32, 37) controlPoint:CGPointMake(14, 39)]; }
+    else { [p moveToPoint:CGPointMake(10, 24)]; [p addQuadCurveToPoint:CGPointMake(4 + wag * 0.3, 8) controlPoint:CGPointMake(-2 + wag, 18)]; }
+    p.lineWidth = 5; [ink setStroke]; [p stroke]; p.lineWidth = 2.8; [fur setStroke]; [p stroke];
+    [ink setStroke]; CGContextSetLineWidth(c, 1.5); CGContextSetLineJoin(c, kCGLineJoinRound); CGContextSetLineCap(c, kCGLineCapRound);
+    if (mode != 2) {
+        CGFloat xs[4] = {12, 18, 29, 35};
+        for (int i = 0; i < 4; i++) {
+            CGFloat sw = mode == 0 ? (CGFloat)sin(ph + (i % 2) * M_PI) * 3 : 0;
+            UIBezierPath *l = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(xs[i] - 2.5 + sw, 27, 5, 9) cornerRadius:2.5]; [fur setFill]; [l fill]; [ink setStroke]; [l stroke];
+        }
+    }
+    UIBezierPath *body = [UIBezierPath bezierPathWithOvalInRect:mode == 2 ? CGRectMake(6, 22, 38, 14) : CGRectMake(8, 16, 34, 16)]; [fur setFill]; [body fill]; [ink setStroke]; [body stroke];
+    CGPoint hc = mode == 2 ? CGPointMake(38, 28) : CGPointMake(41, 17);
+    UIBezierPath *ears = [UIBezierPath bezierPath];
+    [ears moveToPoint:CGPointMake(hc.x - 8, hc.y - 3)]; [ears addLineToPoint:CGPointMake(hc.x - 6, hc.y - 13)]; [ears addLineToPoint:CGPointMake(hc.x - 1, hc.y - 8)];
+    [ears moveToPoint:CGPointMake(hc.x + 1, hc.y - 8)]; [ears addLineToPoint:CGPointMake(hc.x + 6, hc.y - 13)]; [ears addLineToPoint:CGPointMake(hc.x + 8, hc.y - 3)];
+    [fur setFill]; [ears fill]; [ink setStroke]; [ears stroke];
+    UIBezierPath *head = [UIBezierPath bezierPathWithOvalInRect:CGRectMake(hc.x - 9, hc.y - 8.5, 18, 17)]; [fur setFill]; [head fill]; [ink setStroke]; [head stroke];
+    if (shut) { UIBezierPath *e = [UIBezierPath bezierPath]; [e moveToPoint:CGPointMake(hc.x - 5, hc.y - 1)]; [e addLineToPoint:CGPointMake(hc.x - 1.5, hc.y - 1)]; [e moveToPoint:CGPointMake(hc.x + 2, hc.y - 1)]; [e addLineToPoint:CGPointMake(hc.x + 5.5, hc.y - 1)]; e.lineWidth = 1.4; [ink setStroke]; [e stroke]; }
+    else { [ink setFill]; [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(hc.x - 4.5, hc.y - 2.5, 3, 3.4)] fill]; [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(hc.x + 2.5, hc.y - 2.5, 3, 3.4)] fill]; }
+    [pink setFill]; [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(hc.x - 0.2, hc.y + 2, 3, 2.4)] fill];
+    UIBezierPath *w = [UIBezierPath bezierPath]; w.lineWidth = 0.8;
+    [w moveToPoint:CGPointMake(hc.x + 6, hc.y + 3)]; [w addLineToPoint:CGPointMake(hc.x + 13, hc.y + 1)]; [w moveToPoint:CGPointMake(hc.x + 6, hc.y + 4.5)]; [w addLineToPoint:CGPointMake(hc.x + 13, hc.y + 5.5)];
+    [ink setStroke]; [w stroke];
+}
+@end
+
+@interface RYCatWindow : UIWindow @end
+@implementation RYCatWindow
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e { return nil; }
+- (BOOL)canBecomeKeyWindow { return NO; }
+@end
+
+@interface RYCatCtl : NSObject <UIGestureRecognizerDelegate>
+@property (nonatomic, strong) RYCatWindow *win; @property (nonatomic, strong) RYCatView *cat; @property (nonatomic, strong) CADisplayLink *link;
+@property (nonatomic) CGPoint pos, target; @property (nonatomic) BOOL moving; @property (nonatomic) CFTimeInterval last, idleSince; @property (nonatomic) long key;
+@property (nonatomic, strong) NSHashTable *taps;
++ (instancetype)shared; - (void)ensure; - (void)stop;
+@end
+@implementation RYCatCtl
++ (instancetype)shared { static RYCatCtl *c; static dispatch_once_t t; dispatch_once(&t, ^{ c = [RYCatCtl new]; c.taps = [NSHashTable weakObjectsHashTable]; }); return c; }
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o { return YES; }
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldReceiveTouch:(UITouch *)t { return YES; }
+- (void)tapped:(UITapGestureRecognizer *)g {
+    if (!self.win || g.state != UIGestureRecognizerStateRecognized || ![g.view isKindOfClass:UIWindow.class]) return;
+    CGPoint p = [(UIWindow *)g.view convertPoint:[g locationInView:g.view] toWindow:self.win];
+    self.target = p; self.moving = YES; self.link.preferredFramesPerSecond = 30;
+}
+- (void)ensure {
+    if (!self.win) {
+        UIWindowScene *sc = nil;
+        for (UIScene *s in UIApplication.sharedApplication.connectedScenes) if ([s isKindOfClass:UIWindowScene.class] && s.activationState == UISceneActivationStateForegroundActive) { sc = (UIWindowScene *)s; break; }
+        if (!sc) return;
+        self.win = [[RYCatWindow alloc] initWithWindowScene:sc]; self.win.windowLevel = UIWindowLevelAlert + 40; self.win.backgroundColor = UIColor.clearColor; self.win.userInteractionEnabled = NO;
+        UIViewController *root = [UIViewController new]; root.view.backgroundColor = UIColor.clearColor; root.view.userInteractionEnabled = NO; self.win.rootViewController = root; self.win.hidden = NO;
+        self.cat = [[RYCatView alloc] initWithFrame:CGRectMake(0, 0, 52, 40)]; [root.view addSubview:self.cat];
+        CGSize z = self.win.bounds.size; self.pos = CGPointMake(z.width - 60, z.height * 0.72); self.target = self.pos; self.moving = NO; self.idleSince = CACurrentMediaTime(); self.last = 0; self.key = -1;
+        self.cat.center = self.pos;
+        self.link = [CADisplayLink displayLinkWithTarget:self selector:@selector(step:)]; self.link.preferredFramesPerSecond = 10; [self.link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+    }
+    for (UIWindow *w in RYAppWindows()) {                               // a tap anywhere in the app, without touching its own touch handling
+        if (objc_getAssociatedObject(w, kRYCatTap)) continue;
+        UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapped:)];
+        t.cancelsTouchesInView = NO; t.delaysTouchesBegan = NO; t.delaysTouchesEnded = NO; t.delegate = self;
+        [w addGestureRecognizer:t]; objc_setAssociatedObject(w, kRYCatTap, t, OBJC_ASSOCIATION_RETAIN_NONATOMIC); [self.taps addObject:t];
+    }
+}
+- (void)step:(CADisplayLink *)l {
+    CFTimeInterval now = CACurrentMediaTime(), dt = self.last ? MIN(now - self.last, 0.05) : 0.016; self.last = now;
+    if (self.moving) {
+        CGFloat dx = self.target.x - self.pos.x, dy = self.target.y - self.pos.y, d = (CGFloat)sqrt(dx * dx + dy * dy);
+        if (d <= 26) { self.moving = NO; self.idleSince = now; self.link.preferredFramesPerSecond = 10; }
+        else {
+            CGFloat st = MIN(170 * (CGFloat)dt, d - 25); self.pos = CGPointMake(self.pos.x + dx / d * st, self.pos.y + dy / d * st);
+            if (fabs(dx) > 2) self.cat.facing = dx >= 0 ? 1 : -1; self.cat.mode = 0; self.cat.phase += (CGFloat)dt * 14;
+        }
+    }
+    if (!self.moving) {
+        CFTimeInterval t = now - self.idleSince; self.cat.mode = t > 12 ? 2 : 1; self.cat.phase += (CGFloat)dt * 3;
+        self.cat.blink = self.cat.mode == 1 && fmod(now, 3.4) < 0.16;
+    }
+    CGSize z = self.win.bounds.size; self.pos = CGPointMake(MIN(MAX(self.pos.x, 26), z.width - 26), MIN(MAX(self.pos.y, 20), z.height - 20)); self.cat.center = self.pos;
+    long k = self.cat.mode * 100000L + (self.cat.facing > 0 ? 1 : 0) * 10000L + (long)(self.cat.phase * (self.cat.mode == 0 ? 0.9 : 0.4)) % 1000 + (self.cat.blink ? 5000 : 0);
+    if (k != self.key) { self.key = k; [self.cat setNeedsDisplay]; }
+}
+- (void)stop {
+    [self.link invalidate]; self.link = nil;
+    for (UIWindow *w in RYAppWindows()) { UIGestureRecognizer *t = objc_getAssociatedObject(w, kRYCatTap); if (t) { [w removeGestureRecognizer:t]; objc_setAssociatedObject(w, kRYCatTap, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); } }
+    self.win.hidden = YES; self.win = nil; self.cat = nil;
+}
+@end
+static void RYCatTick(void) {
+    BOOL want = !RYLocked() && [CF(@"cat", @YES) boolValue]; RYCatCtl *c = [RYCatCtl shared];
+    if (want) [c ensure]; else if (c.win) [c stop];
+}
+static void RYCatSet(BOOL on) { CS(@"cat", @(on)); RYCatTick(); }
 
 #pragma mark - Window / root
 
@@ -2734,10 +2908,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen"];
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat")];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @3];
-    if (self.tab < 0 || self.tab > 3) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @4];
+    if (self.tab < 0 || self.tab > 4) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -2767,7 +2941,7 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; default: [self renderBG]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; default: [self renderBG]; }
 }
 #pragma mark Locked
 - (void)renderLocked {
@@ -3086,6 +3260,12 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 }
 
 #pragma mark Diag
+- (void)renderCat {
+    __weak typeof(self) ws = self; BOOL on = [CF(@"cat", @YES) boolValue];
+    UIButton *b = RYBtn(T(@"القطوة", @"Cat"), on, ^{ RYCatSet(![CF(@"cat", @YES) boolValue]); [ws rebuild]; });   // purple = on, grey = off
+    [self.stack addArrangedSubview:RYCard(@[b])];
+    [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
+}
 - (void)renderFake {
     __weak typeof(self) ws = self;
     BOOL on = gFakeDef;
@@ -3221,6 +3401,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 }
 - (void)tick {
     self.fab.hidden = NO; self.fab.backgroundColor = RYAccent(); RYHookInputs();
+    RYCatTick();
     [self syncBG:RYChatHost()];
     [self fpTick];
     static int licTick = 0; if (++licTick % 144 == 0) RYLicRevalidate(); // ~every 72s
@@ -3299,7 +3480,8 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 
 __attribute__((constructor)) static void RYInit(void) {
     if (![[NSBundle mainBundle].bundlePath.pathExtension isEqual:@"app"]) return; // skip app extensions
-    RYLoad();
+    RYLoad(); RYInstallCrashLog();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYInstallCrashLog(); });
     // crash-loop guard: if the previous launch died within 10 seconds, this launch skips the audio hooks
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
     BOOL safe = [ud boolForKey:@"8ubah.dc.launching"]; gSafeLaunch = safe;
