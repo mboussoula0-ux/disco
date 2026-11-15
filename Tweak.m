@@ -2225,17 +2225,42 @@ static volatile int gPaintSeen = 0, gPaintNoId = 0, gPaintKept = 0;
 static void RYSetCellInteractive(UITableViewCell *cell, BOOL on) {
     if (cell.userInteractionEnabled != on) cell.userInteractionEnabled = on;
 }
+// The "deleted" mark is made of CALayers only (red wash, side bar, "Deleted" badge). Not one view is added to Discord's cell: its own layout code
+// walks contentView.subviews, and an extra subview there is what hung / crashed the app when the list updated.
+static NSString *const kRYMark = @"8ubah.mark";
+static CALayer *RYMarkLayer(CALayer *host, NSString *name) { for (CALayer *l in host.sublayers) if ([l.name isEqual:name]) return l; return nil; }
+static void RYMarkCell(UITableViewCell *cell, BOOL on) {
+    CALayer *host = cell.contentView.layer; if (!host) return;
+    NSString *kw = [kRYMark stringByAppendingString:@".wash"], *kd = [kRYMark stringByAppendingString:@".deco"];
+    CALayer *wash = RYMarkLayer(host, kw), *deco = RYMarkLayer(host, kd);
+    [CATransaction begin]; [CATransaction setDisableActions:YES];
+    if (!on) { [wash removeFromSuperlayer]; [deco removeFromSuperlayer]; [CATransaction commit]; return; }
+    CGRect cb = cell.contentView.bounds; CGFloat sc = UIScreen.mainScreen.scale;
+    if (!wash) { wash = [CALayer layer]; wash.name = kw; [host insertSublayer:wash atIndex:0]; }
+    wash.frame = cb; wash.backgroundColor = [RY_RED colorWithAlphaComponent:0.22].CGColor;
+    if (!deco) {
+        deco = [CALayer layer]; deco.name = kd; deco.zPosition = 50;
+        CALayer *bar = [CALayer layer]; bar.name = @"bar"; bar.backgroundColor = RY_RED.CGColor; [deco addSublayer:bar];
+        CALayer *pill = [CALayer layer]; pill.name = @"pill"; pill.backgroundColor = RY_RED.CGColor; pill.cornerRadius = 8; [deco addSublayer:pill];
+        CATextLayer *tx = [CATextLayer layer]; tx.name = @"txt"; tx.contentsScale = sc; tx.alignmentMode = kCAAlignmentCenter; tx.truncationMode = kCATruncationNone;
+        NSString *t = T(@"🗑 محذوفة", @"🗑 Deleted");
+        tx.string = [[NSAttributedString alloc] initWithString:t attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:10 weight:UIFontWeightHeavy], NSForegroundColorAttributeName: UIColor.whiteColor}];
+        [deco addSublayer:tx]; [host addSublayer:deco];
+    }
+    deco.frame = cb;
+    CALayer *bar = RYMarkLayer(deco, @"bar"), *pill = RYMarkLayer(deco, @"pill"), *tx = RYMarkLayer(deco, @"txt");
+    bar.frame = CGRectMake(0, 0, 4, cb.size.height);
+    CGFloat w = [(NSAttributedString *)((CATextLayer *)tx).string size].width + 16;
+    pill.frame = CGRectMake(cb.size.width - w - 8, 3, w, 16); tx.frame = CGRectMake(pill.frame.origin.x, pill.frame.origin.y + 2, w, 13);
+    [CATransaction commit];
+}
 static void RYDecorateCell(UITableViewCell *cell, id vm) {
     NSString *mid = RYCellMsgId(cell, vm);
     gPaintSeen++; if (!mid) gPaintNoId++;
     BOOL del = RYIsKept(mid);
     if (del) gPaintKept++;
     RYSetCellInteractive(cell, !del);
-    UIView *wash = [cell.contentView viewWithTag:8871];
-    if (del) {
-        if (!wash) { wash = [[UIView alloc] initWithFrame:cell.contentView.bounds]; wash.tag = 8871; wash.userInteractionEnabled = NO; wash.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; [cell.contentView insertSubview:wash atIndex:0]; }
-        wash.backgroundColor = [RY_RED colorWithAlphaComponent:0.16];
-    } else if (wash) [wash removeFromSuperview];
+    RYMarkCell(cell, del);
     id lab = RYKV(cell, @"contentLabel");
     if ([lab isKindOfClass:UIView.class]) {
         if (del) RYTintYY(lab, RY_RED, YES);
@@ -2254,9 +2279,10 @@ static void RYCollectTables(UIView *v, NSMutableArray *o, int d) {
     for (UIView *s in v.subviews) RYCollectTables(s, o, d + 1);
 }
 // cells already on screen are not re-configured by the app (nothing changed for it), so paint them directly
+static NSUInteger RYKeptCount(void) { if (!gLogIds) return 0; @synchronized (gLogIds) { return gLogIds.count; } }
 static void RYRefreshCells(void) {
     gCrumb = "refresh cells";
-    if (!gLogIds || !gLogIds.count) return;
+    if (!RYKeptCount()) return;
     UIView *host = RYChatHost(); if (!host) return;
     NSMutableArray *tabs = [NSMutableArray new]; RYCollectTables(host, tabs, 0);
     Class mc = NSClassFromString(@"DCDMessageTableViewCell");
@@ -2274,7 +2300,7 @@ static NSData *RYMergeKeptRaw(NSData *data, NSURL *url) {
     if (!url || data.length < 2 || data.length > 4000000) return data;
     NSArray *c = [url.path componentsSeparatedByString:@"/"];
     NSUInteger i = [c indexOfObject:@"channels"];
-    if (i == NSNotFound || i + 2 != c.count - 1 || ![c[i + 2] isEqual:@"messages"] || ![url.query containsString:@"limit="]) return data;   // exactly the list /channels/<id>/messages?limit=..
+    if (i == NSNotFound || i + 2 != c.count - 1 || ![c[i + 2] isEqual:@"messages"] || !([url.query containsString:@"limit="] || [url.query containsString:@"before="] || [url.query containsString:@"after="] || [url.query containsString:@"around="])) return data;   // exactly the list /channels/<id>/messages?limit=..
     NSString *cid = c[i + 1]; if (!cid.length) return data;
     gNetSeen++;
     id arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
@@ -2323,7 +2349,7 @@ static NSData *RYMergeKept(NSData *data, NSURLResponse *resp) {
 static void (*orig_netEvt)(id, SEL, NSString *, id);
 static BOOL RYIsMsgListURL(NSURL *u) {
     NSArray *c = [u.path componentsSeparatedByString:@"/"]; NSUInteger i = [c indexOfObject:@"channels"];
-    return i != NSNotFound && i + 2 == c.count - 1 && [c[i + 2] isEqual:@"messages"] && [u.query containsString:@"limit="];
+    return i != NSNotFound && i + 2 == c.count - 1 && [c[i + 2] isEqual:@"messages"] && ([u.query containsString:@"limit="] || [u.query containsString:@"before="] || [u.query containsString:@"after="] || [u.query containsString:@"around="]);
 }
 static void RYNetEvent(id self, SEL _cmd, NSString *name, id body) {
     gCrumb = "network event";
@@ -2369,8 +2395,12 @@ static void RYNetSendData(id self, SEL _cmd, NSData *data, NSString *type, id re
     @try { RYLogInit(); if ([data isKindOfClass:NSData.class]) use = RYMergeKept(data, resp); } @catch (__unused id e) { use = data; }
     if (orig_netData) orig_netData(self, _cmd, use, type, resp, task);
 }
+static void RYStartMarkTimer(void) {
+    static BOOL on; if (on) return; on = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{ [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { if (RYKeptCount()) RYRefreshCells(); }]; });
+}
 static void RYInstallLogger(void) {
-    static BOOL cellDone, wsDone, httpDone, netDone, evtDone; RYLogInit();
+    static BOOL cellDone, wsDone, httpDone, netDone, evtDone; RYLogInit(); RYStartMarkTimer();
     if (!cellDone) {
         Class cc = NSClassFromString(@"DCDMessageTableViewCell");
         Method cm = cc ? class_getInstanceMethod(cc, NSSelectorFromString(@"configureWithViewModel:viewReusePoolManager:actionManager:")) : NULL;
