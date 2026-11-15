@@ -1412,12 +1412,101 @@ static NSString *RYStr(id v) {
     if (!v || v == NSNull.null) return nil;
     NSString *s = [v isKindOfClass:NSString.class] ? v : [v description]; return s.length ? s : nil;
 }
+// ---- persistence: every recent message is remembered (compact JSON); when one is deleted by someone else it is copied to Documents/8ubah/data/deleted.json
+// and put back into the server's answer whenever the app asks for that channel's messages again (after a restart, scrolling, switching chats).
+static NSObject *gLogLock;
+static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSData *> *> *gMsgCache;   // channel -> id -> JSON of a recently seen message
+static NSMutableDictionary<NSString *, NSMutableDictionary<NSString *, NSData *> *> *gDelStore;   // channel -> id -> JSON of a kept (deleted) message
+static NSMutableDictionary<NSString *, NSDate *> *gCacheTouch;
+static volatile int gNetSeen = 0, gNetInj = 0, gNetCached = 0, gStored = 0; static BOOL gSaveQueued = NO; static char gNetLast[200] = "-";
+static NSComparisonResult RYSnowCmp(NSString *a, NSString *b) {                                    // snowflakes: longer = bigger, then text order
+    if (a.length != b.length) return a.length < b.length ? NSOrderedAscending : NSOrderedDescending;
+    return [a compare:b];
+}
+static NSString *RYDelPath(void) { return [RYDir(@"data") stringByAppendingPathComponent:@"deleted.json"]; }
+static void RYDelSave(void) {
+    @synchronized (gLogLock) {
+        if (gSaveQueued) return; gSaveQueued = YES;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSMutableData *out = [NSMutableData dataWithBytes:"{" length:1]; BOOL firstC = YES; int n = 0;
+        @synchronized (gLogLock) {
+            gSaveQueued = NO;
+            for (NSString *cid in gDelStore) {
+                NSDictionary *m = gDelStore[cid]; if (!m.count) continue;
+                if (!firstC) [out appendBytes:"," length:1]; firstC = NO;
+                [out appendData:[[NSString stringWithFormat:@"\"%@\":[", cid] dataUsingEncoding:NSUTF8StringEncoding]];
+                BOOL firstM = YES;
+                for (NSString *mid in m) { if (!firstM) [out appendBytes:"," length:1]; firstM = NO; [out appendData:m[mid]]; n++; }
+                [out appendBytes:"]" length:1];
+            }
+            gStored = n;
+        }
+        [out appendBytes:"}" length:1];
+        [out writeToFile:RYDelPath() atomically:YES];
+    });
+}
+static void RYDelLoad(void) {
+    NSData *d = [NSData dataWithContentsOfFile:RYDelPath()]; if (!d.length) return;
+    id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    if (![j isKindOfClass:NSDictionary.class]) return;
+    @synchronized (gLogLock) {
+        for (NSString *cid in j) {
+            NSArray *a = j[cid]; if (![a isKindOfClass:NSArray.class]) continue;
+            NSMutableDictionary *m = gDelStore[cid] ?: [NSMutableDictionary new];
+            for (id o in a) {
+                if (![o isKindOfClass:NSDictionary.class]) continue;
+                NSString *mid = RYStr(o[@"id"]); NSData *x = [NSJSONSerialization dataWithJSONObject:o options:0 error:nil];
+                if (mid && x) { m[mid] = x; [gLogIds addObject:mid]; }
+            }
+            if (m.count) gDelStore[cid] = m;
+        }
+        int n = 0; for (NSString *c in gDelStore) n += (int)gDelStore[c].count; gStored = n;
+    }
+}
+static void RYCacheMsg(id o) {
+    if (![o isKindOfClass:NSDictionary.class]) return;
+    NSString *mid = RYStr(o[@"id"]), *cid = RYStr(o[@"channel_id"]);
+    if (!mid || !cid || !o[@"author"] || !o[@"timestamp"]) return;                                  // partial updates (embeds only) are ignored
+    NSData *x = [NSJSONSerialization dataWithJSONObject:o options:0 error:nil]; if (!x) return;
+    @synchronized (gLogLock) {
+        NSMutableDictionary *m = gMsgCache[cid]; if (!m) { m = [NSMutableDictionary new]; gMsgCache[cid] = m; }
+        m[mid] = x; gCacheTouch[cid] = [NSDate date]; gNetCached++;
+        if (m.count > 150) {                                                                         // keep the newest 120 of a channel
+            NSArray *ids = [m.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) { return RYSnowCmp(a, b); }];
+            for (NSUInteger i = 0; i + 120 < ids.count; i++) [m removeObjectForKey:ids[i]];
+        }
+        if (gMsgCache.count > 80) {                                                                  // and the 60 most recently used channels
+            NSArray *cs = [gCacheTouch keysSortedByValueUsingSelector:@selector(compare:)];
+            for (NSUInteger i = 0; i + 60 < cs.count; i++) { [gMsgCache removeObjectForKey:cs[i]]; [gCacheTouch removeObjectForKey:cs[i]]; }
+        }
+    }
+}
+// called when a delete from somebody else is kept: copy the remembered message to the permanent store
+static void RYKeepMsg(NSString *cid, NSString *mid) {
+    if (!cid || !mid) return;
+    @synchronized (gLogLock) {
+        NSData *x = gMsgCache[cid][mid]; if (!x) return;
+        NSMutableDictionary *m = gDelStore[cid]; if (!m) { m = [NSMutableDictionary new]; gDelStore[cid] = m; }
+        m[mid] = x;
+    }
+    RYDelSave();
+}
+static void RYForgetMsg(NSString *mid) {                                                             // you deleted it yourself: it must really go
+    BOOL ch = NO;
+    @synchronized (gLogLock) {
+        for (NSString *cid in gDelStore.allKeys) if (gDelStore[cid][mid]) { [gDelStore[cid] removeObjectForKey:mid]; ch = YES; }
+        for (NSString *cid in gMsgCache) [gMsgCache[cid] removeObjectForKey:mid];
+        [gLogIds removeObject:mid];
+    }
+    if (ch) RYDelSave();
+}
 static void RYLogInit(void) {
-    static dispatch_once_t once; dispatch_once(&once, ^{ gLogIds = [NSMutableSet new]; gOwnDel = [NSMutableDictionary new]; });
+    static dispatch_once_t once; dispatch_once(&once, ^{ gLogLock = [NSObject new]; gLogIds = [NSMutableSet new]; gOwnDel = [NSMutableDictionary new]; gMsgCache = [NSMutableDictionary new]; gDelStore = [NSMutableDictionary new]; gCacheTouch = [NSMutableDictionary new]; RYDelLoad(); });
 }
 static BOOL RYIsKept(NSString *mid) { if (!mid || !gLogIds) return NO; @synchronized (gLogIds) { return [gLogIds containsObject:mid]; } }
 static NSString *RYLoggerStatus(void) {
-    return [NSString stringWithFormat:T(@"المسجّل: رسائل %d، محفوظة %d، حذفي %d", @"Logger: ws %d, kept %d, own %d"), gWsMsgs, gLogKept, gLogOwn];
+    return [NSString stringWithFormat:T(@"المسجّل: محفوظة %d، مخزنة %d، رجعت %d", @"Logger: kept %d, stored %d, restored %d"), gLogKept, gStored, gNetInj];
 }
 
 // ---- own deletes: DELETE /channels/<c>/messages/<m> on the app's HTTP handler
@@ -1427,7 +1516,7 @@ static id RYHttpSend(id self, SEL _cmd, id req, id delegate) {
             NSArray *c = [[(NSURLRequest *)req URL].path componentsSeparatedByString:@"/"];
             NSUInteger i = [c indexOfObject:@"messages"];
             if (i != NSNotFound && i >= 2 && i + 1 < c.count && [c[i - 2] isEqual:@"channels"]) {
-                RYLogInit(); @synchronized (gOwnDel) { gOwnDel[c[i + 1]] = [NSDate date]; }
+                RYLogInit(); @synchronized (gOwnDel) { gOwnDel[c[i + 1]] = [NSDate date]; } RYForgetMsg(c[i + 1]);
             }
         }
     } @catch (__unused id e) {}
@@ -1445,20 +1534,27 @@ static BOOL RYOwnDeleted(NSString *mid) {
 
 // ---- gateway: MESSAGE_DELETE of someone else's DM message becomes an unknown event that JS ignores (its sequence number still counts)
 static NSString *RYGatewayFilter(NSString *s) {
-    if ([s rangeOfString:@"\"MESSAGE_DELETE"].location == NSNotFound || s.length > 60000) return s;
+    if (s.length > 60000) return s;
+    BOOL isDel = [s rangeOfString:@"\"MESSAGE_DELETE"].location != NSNotFound;
+    BOOL isNew = !isDel && ([s rangeOfString:@"\"MESSAGE_CREATE\""].location != NSNotFound || [s rangeOfString:@"\"MESSAGE_UPDATE\""].location != NSNotFound);
+    if (!isDel && !isNew) return s;
     NSData *dt = [s dataUsingEncoding:NSUTF8StringEncoding]; if (!dt) return s;
+    RYLogInit();
     id j = [NSJSONSerialization JSONObjectWithData:dt options:NSJSONReadingMutableContainers error:nil];
     if (![j isKindOfClass:NSMutableDictionary.class]) return s;
-    NSString *t = j[@"t"]; BOOL bulk = [t isEqual:@"MESSAGE_DELETE_BULK"];
+    NSString *t = j[@"t"];
+    if (isNew) { if ([t isEqual:@"MESSAGE_CREATE"] || [t isEqual:@"MESSAGE_UPDATE"]) RYCacheMsg(j[@"d"]); return s; }
+    BOOL bulk = [t isEqual:@"MESSAGE_DELETE_BULK"];
     if (!bulk && ![t isEqual:@"MESSAGE_DELETE"]) return s;
     NSDictionary *d = j[@"d"]; if (![d isKindOfClass:NSDictionary.class]) return s;
     RYLogInit(); gLogSeen++;
     id gid = d[@"guild_id"];
-    if (gid && gid != NSNull.null && ![CF(@"delAll", @NO) boolValue]) { gLogPass++; return s; }      // a server message: deletes normally
+    if (gid && gid != NSNull.null && ![CF(@"delAll", @YES) boolValue]) { gLogPass++; return s; }      // servers are kept too unless "DMs only" is chosen
     NSArray *ids = bulk ? d[@"ids"] : (d[@"id"] ? @[d[@"id"]] : @[]);
     if (![ids isKindOfClass:NSArray.class] || !ids.count) return s;
     for (id x in ids) if (RYOwnDeleted(RYStr(x))) { gLogOwn++; return s; }                          // you deleted it yourself: deletes normally
     @synchronized (gLogIds) { for (id x in ids) { NSString *m = RYStr(x); if (m) [gLogIds addObject:m]; } if (gLogIds.count > 4000) [gLogIds removeAllObjects]; }
+    for (id x in ids) RYKeepMsg(RYStr(d[@"channel_id"]), RYStr(x));
     gLogKept += (int)ids.count;
     snprintf(gLogLast, sizeof gLogLast, "kept %s chan=%s", RYStr(ids.firstObject).UTF8String ?: "?", RYStr(d[@"channel_id"]).UTF8String ?: "?");
     RYLog(@"logger: kept %@ (chan %@)", ids, d[@"channel_id"]);
@@ -1543,8 +1639,64 @@ static void RYRefreshCells(void) {
     Class mc = NSClassFromString(@"DCDMessageTableViewCell");
     for (UITableView *tv in tabs) for (UITableViewCell *c in tv.visibleCells) if (mc && [c isKindOfClass:mc]) { @try { RYDecorateCell(c, nil); } @catch (__unused id e) {} }
 }
+
+// ---- REST answers: GET /channels/<id>/messages comes back from RCTNetworking as raw bytes; kept messages are merged in (sorted newest first)
+static void (*orig_netData)(id, SEL, NSData *, NSString *, id, id);
+static NSDictionary *RYQueryOf(NSURL *u) {
+    NSMutableDictionary *q = [NSMutableDictionary new];
+    for (NSURLQueryItem *i in [NSURLComponents componentsWithURL:u resolvingAgainstBaseURL:NO].queryItems) if (i.name && i.value) q[i.name] = i.value;
+    return q;
+}
+static NSData *RYMergeKept(NSData *data, NSURLResponse *resp) {
+    if (![resp isKindOfClass:NSHTTPURLResponse.class] || [(NSHTTPURLResponse *)resp statusCode] != 200 || data.length < 2 || data.length > 4000000) return data;
+    NSArray *c = [resp.URL.path componentsSeparatedByString:@"/"];
+    NSUInteger i = [c indexOfObject:@"channels"];
+    if (i == NSNotFound || i + 2 != c.count - 1 || ![c[i + 2] isEqual:@"messages"]) return data;      // exactly /channels/<id>/messages
+    NSString *cid = c[i + 1]; if (!cid.length) return data;
+    gNetSeen++;
+    id arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![arr isKindOfClass:NSArray.class]) return data;
+    NSDictionary *q = RYQueryOf(resp.URL); NSInteger limit = q[@"limit"] ? [q[@"limit"] integerValue] : 50; if (limit < 1) limit = 50;
+    NSMutableSet *have = [NSMutableSet new]; NSString *minId = nil, *maxId = nil;
+    for (id m in arr) {
+        RYCacheMsg(m);
+        NSString *mid = [m isKindOfClass:NSDictionary.class] ? RYStr(m[@"id"]) : nil; if (!mid) continue;
+        [have addObject:mid];
+        if (!minId || RYSnowCmp(mid, minId) == NSOrderedAscending) minId = mid;
+        if (!maxId || RYSnowCmp(mid, maxId) == NSOrderedDescending) maxId = mid;
+    }
+    BOOL full = (NSInteger)[arr count] >= limit;
+    NSString *before = q[@"before"], *after = q[@"after"], *around = q[@"around"];
+    NSMutableArray *add = [NSMutableArray new];
+    @synchronized (gLogLock) {
+        NSDictionary *saved = gDelStore[cid];
+        for (NSString *sid in saved) {
+            if ([have containsObject:sid]) continue;
+            BOOL ok;
+            if (before) ok = RYSnowCmp(sid, before) == NSOrderedAscending && (!full || !minId || RYSnowCmp(sid, minId) != NSOrderedAscending);
+            else if (after) ok = RYSnowCmp(sid, after) == NSOrderedDescending && (!full || !maxId || RYSnowCmp(sid, maxId) != NSOrderedDescending);
+            else if (around) ok = !full || (minId && RYSnowCmp(sid, minId) != NSOrderedAscending && RYSnowCmp(sid, maxId) != NSOrderedDescending);
+            else ok = !full || !minId || RYSnowCmp(sid, minId) != NSOrderedAscending;
+            if (!ok) continue;
+            id o = [NSJSONSerialization JSONObjectWithData:saved[sid] options:0 error:nil]; if (o) [add addObject:o];
+        }
+    }
+    if (!add.count) return data;
+    NSMutableArray *all = [arr mutableCopy]; [all addObjectsFromArray:add];
+    [all sortUsingComparator:^NSComparisonResult(id a, id b) { return RYSnowCmp(RYStr(b[@"id"]) ?: @"", RYStr(a[@"id"]) ?: @""); }];   // newest first
+    NSData *out = [NSJSONSerialization dataWithJSONObject:all options:0 error:nil]; if (!out) return data;
+    gNetInj += (int)add.count;
+    snprintf(gNetLast, sizeof gNetLast, "put back %d into %s", (int)add.count, cid.UTF8String);
+    RYLog(@"logger: put back %d kept message(s) into channel %@ (%@)", (int)add.count, cid, resp.URL.query ?: @"");
+    return out;
+}
+static void RYNetSendData(id self, SEL _cmd, NSData *data, NSString *type, id resp, id task) {
+    NSData *use = data;
+    @try { RYLogInit(); if ([data isKindOfClass:NSData.class]) use = RYMergeKept(data, resp); } @catch (__unused id e) { use = data; }
+    if (orig_netData) orig_netData(self, _cmd, use, type, resp, task);
+}
 static void RYInstallLogger(void) {
-    static BOOL cellDone, wsDone, httpDone; RYLogInit();
+    static BOOL cellDone, wsDone, httpDone, netDone; RYLogInit();
     if (!cellDone) {
         Class cc = NSClassFromString(@"DCDMessageTableViewCell");
         Method cm = cc ? class_getInstanceMethod(cc, NSSelectorFromString(@"configureWithViewModel:viewReusePoolManager:actionManager:")) : NULL;
@@ -1554,6 +1706,11 @@ static void RYInstallLogger(void) {
         Class wc = NSClassFromString(@"RCTWebSocketModule"); SEL s = NSSelectorFromString(@"sendEventWithName:body:");
         Method m = wc ? class_getInstanceMethod(wc, s) : NULL;
         if (m && method_getNumberOfArguments(m) == 4) { orig_wsSend = (void *)method_getImplementation(m); class_replaceMethod(wc, s, (IMP)RYWsSend, method_getTypeEncoding(m)); wsDone = YES; RYLog(@"logger: websocket hook installed"); }
+    }
+    if (!netDone) {
+        Class nc = NSClassFromString(@"RCTNetworking"); SEL ns = NSSelectorFromString(@"sendData:responseType:response:forTask:");
+        Method nm = nc ? class_getInstanceMethod(nc, ns) : NULL;
+        if (nm && method_getNumberOfArguments(nm) == 6) { orig_netData = (void *)method_getImplementation(nm); method_setImplementation(nm, (IMP)RYNetSendData); netDone = YES; RYLog(@"logger: network hook installed"); }
     }
     if (!httpDone) {
         Class hc = NSClassFromString(@"RCTHTTPRequestHandler"); SEL s = NSSelectorFromString(@"sendRequest:withDelegate:");
@@ -1866,7 +2023,7 @@ static NSString *RYDiagReport(void) {
     [o appendString:@"\n== voice engine\n"]; [o appendString:RYDiagVoice()];
     [o appendString:@"\n== mic\n"]; [o appendString:RYMicReport()];
     [o appendString:@"\n== screen share\n"]; [o appendString:RYDiagBroadcast()];
-    [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gTOLast, gTOCalls];
+    [o appendFormat:@"\n== message logger\nwebsocket messages seen %d  delete events %d (kept %d, own %d, server %d)\nlast: %s\nkept ids: %lu\nstored on disk: %d  remembered messages: %d  channel fetches seen: %d  put back: %d\nlast put back: %s\nvoice options last: %s (calls %d)\n", gWsMsgs, gLogSeen, gLogKept, gLogOwn, gLogPass, gLogLast, (unsigned long)gLogIds.count, gStored, gNetCached, gNetSeen, gNetInj, gNetLast, gTOLast, gTOCalls];
     { NSString *ev = [NSString stringWithContentsOfFile:[RYDir(@"logs") stringByAppendingPathComponent:@"events.txt"] encoding:NSUTF8StringEncoding error:nil] ?: @""; [o appendFormat:@"\n== events (tail)\n%@\n", ev.length > 3500 ? [ev substringFromIndex:ev.length - 3500] : ev]; }
     return o;
 }
@@ -2361,7 +2518,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         RYBtn([NSString stringWithFormat:@"%@: %@", T(@"الخلفية", @"Background"), [CF(@"bgFull", @NO) boolValue] ? T(@"كل الشاشة", @"Full screen") : T(@"الدردشة فقط", @"Chat only")], NO, ^{
             CS(@"bgFull", @(![CF(@"bgFull", @NO) boolValue])); [[RYCore shared] bump]; RYRestoreAll(); [ws rebuild];
         }),
-        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @NO) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @NO) boolValue])); [ws rebuild]; }),
+        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @YES) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @YES) boolValue])); [ws rebuild]; }),
         RYBtn(RYAr() ? @"English" : @"العربية", NO, ^{ CS(@"lang", RYAr() ? @"en" : @"ar"); [ws rebuild]; })])];
     NSMutableArray *ac = [NSMutableArray new]; NSArray *cols = RYAccents();
     for (NSUInteger i = 0; i < cols.count; i++) {
