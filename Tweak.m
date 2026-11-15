@@ -112,6 +112,10 @@
 //   Studio chain (RYStudioIn before the pitch stage, RYComp after the EQ): Clearcast-style expander, background / impact reduction, noise gate (fixed or auto), compressor. A time-domain approximation, not a neural net. Settings: eqOn, eqF/eqG/eqQ/eqT, eqPre, ncOn... compLvl.
 //   The graph is RYEQView (UIControl): dots move ONLY in edit mode (button "Edit"); edit mode freezes the panel scroll view and the sheet (RYPanel applyEditLock) because they stole the touch. UNTESTED on device.
 //
+// 6f. RECORDER (tab "Record" / "تسجيل"): normal iOS screen recording leaves the voice-call audio out, so the tweak records itself: video = in-app RPScreenRecorder (looked up at run time, video frames only),
+//   audio = own mic (tap at the end of RYMicFx) + everybody else (RYAUSetProp wraps the audio unit's playout render callback, input bus 0) -> 48 kHz mono, mixed on a 20 ms timer, AVAssetWriter mp4 in Documents/8ubah/rec,
+//   shared with the share sheet when stopped. Switch "my mic in recording" = gRecMicOn. UNTESTED on device: the status line shows video frames / mic / voices counters; if "voices" stays x the playout path is not that callback.
+//
 // 7. CODE MAP (search the #pragma mark lines)
 //   Config/storage (CF/CS, RYDir = Documents/8ubah), language T(ar,en), UI helpers (RYCard/RYBtn/...), view discovery (RYFindVC, RYAppWindows),
 //   background view + clearing (RYBGView, RYClear*), mic/stereo, voice hooks, message logger, Discord helpers (RYChatHost, RYLowestInput,
@@ -1104,6 +1108,141 @@ static void RYStMonSet(BOOL on) {
     if (on && gStOn) { gMonR = gMonW; RYMonEngineStart(); }
     else if (!on && !gMonOn) RYMonEngineStop();
 }
+// ---- Recorder (tab "Record"): iOS leaves the voice-call audio out of the normal screen recording, so the app records itself. Video = in-app ReplayKit capture (video frames only, looked up at
+// run time), audio = what this tweak already sees: YOUR microphone after the effects (RYMicFx) + everybody else's voices = the playout render callback of the audio unit (RYAUSetProp wraps
+// kAudioUnitProperty_SetRenderCallback, input bus 0). Both are resampled to 48 kHz mono, mixed on a 20 ms timer and written with the frames into an mp4 (AVAssetWriter). ASSUMED until the
+// status line shows both counters moving (mic / voices).
+static volatile int gRecOn = 0, gRecMicOn = 1;
+#define RYREC_N (1 << 18)
+static float gRecRingM[RYREC_N], gRecRingP[RYREC_N]; static volatile unsigned gRecWM = 0, gRecRM = 0, gRecWP = 0, gRecRP = 0;
+static volatile long long gRecMicN = 0, gRecPlayN = 0, gRecVidN = 0, gRecAudN = 0, gRecHook = 0; static volatile double gRecStart = 0;
+typedef struct { double pos; float last; } RYRsS; static RYRsS gRsM, gRsP;
+static void RYRecPush(float *ring, volatile unsigned *w, RYRsS *st, const float *x, int n, double sr) {
+    if (n <= 0) return; if (sr < 4000) sr = 48000;
+    double step = sr / 48000.0, pos = st->pos; float last = st->last; unsigned wi = *w;
+    while (pos < (double)(n - 1)) { int i = (int)floor(pos); float a = i < 0 ? last : x[i], b = x[i + 1], fr = (float)(pos - (double)i); ring[wi & (RYREC_N - 1)] = a + (b - a) * fr; wi++; pos += step; }
+    st->pos = pos - (double)n; st->last = x[n - 1]; __sync_synchronize(); *w = wi;
+}
+static void RYRecMic(const float *x, int n, double sr) { if (!gRecOn || !gRecMicOn) return; gRecMicN += n; RYRecPush(gRecRingM, &gRecWM, &gRsM, x, n, sr); }
+// mono float copy of channel 0 of a raw buffer list, then into the "voices" ring
+static void RYRecPlayTap(const AudioStreamBasicDescription *f, UInt32 n, AudioBufferList *io) {
+    if (!f || !io || !io->mNumberBuffers || f->mFormatID != kAudioFormatLinearPCM) return;
+    BOOL isFloat = (f->mFormatFlags & kAudioFormatFlagIsFloat) != 0, planar = (f->mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0; UInt32 bits = f->mBitsPerChannel, ch = f->mChannelsPerFrame ? f->mChannelsPerFrame : 1;
+    if (!((isFloat && bits == 32) || (!isFloat && bits == 16))) return;
+    static __thread float tmp[4096]; UInt32 frames = planar ? io->mBuffers[0].mDataByteSize / (bits / 8) : io->mBuffers[0].mDataByteSize / (ch * (bits / 8)); if (frames > n) frames = n; if (frames > 4096) frames = 4096;
+    void *d = io->mBuffers[0].mData; if (!d) return; UInt32 st = planar ? 1 : ch;
+    for (UInt32 i = 0; i < frames; i++) tmp[i] = isFloat ? ((float *)d)[i * st] : (float)((int16_t *)d)[i * st] / 32768.f;
+    gRecPlayN += frames; RYRecPush(gRecRingP, &gRecWP, &gRsP, tmp, (int)frames, f->mSampleRate > 0 ? f->mSampleRate : 48000);
+}
+// playout: wrap the render callback the audio unit pulls its speaker data from
+typedef struct { AURenderCallback proc; void *ref; AudioUnit au; AudioStreamBasicDescription f; int have; } RYPbCtx;
+static OSStatus RYPlayCB(void *ref, AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, UInt32 bus, UInt32 n, AudioBufferList *io) {
+    RYPbCtx *c = (RYPbCtx *)ref; OSStatus r = c->proc(c->ref, fl, ts, bus, n, io);
+    if (r != noErr || !gRecOn || !io) return r;
+    if (!c->have) { UInt32 sz = sizeof c->f; memset(&c->f, 0, sizeof c->f); if (AudioUnitGetProperty(c->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &c->f, &sz) == noErr && c->f.mSampleRate > 0) c->have = 1; else return r; }
+    if (fl && (*fl & kAudioUnitRenderAction_OutputIsSilence)) return r;
+    RYRecPlayTap(&c->f, n, io); return r;
+}
+static OSStatus (*orig_ausetprop)(AudioUnit, AudioUnitPropertyID, AudioUnitScope, AudioUnitElement, const void *, UInt32);
+static OSStatus RYAUSetProp(AudioUnit u, AudioUnitPropertyID pid, AudioUnitScope sc, AudioUnitElement el, const void *d, UInt32 sz) {
+    if (pid == kAudioUnitProperty_SetRenderCallback && sc == kAudioUnitScope_Input && el == 0 && d && sz >= sizeof(AURenderCallbackStruct) && orig_ausetprop) {
+        const AURenderCallbackStruct *cb = (const AURenderCallbackStruct *)d;
+        if (cb->inputProc && cb->inputProc != RYPlayCB) {
+            RYPbCtx *c = (RYPbCtx *)calloc(1, sizeof(RYPbCtx)); c->proc = cb->inputProc; c->ref = cb->inputProcRefCon; c->au = u;
+            AURenderCallbackStruct n; n.inputProc = RYPlayCB; n.inputProcRefCon = c; gRecHook++;
+            return orig_ausetprop(u, pid, sc, el, &n, sizeof n);
+        }
+    }
+    return orig_ausetprop ? orig_ausetprop(u, pid, sc, el, d, sz) : -50;
+}
+// writer + mixer
+static NSObject *gRecLock; static AVAssetWriter *gRecWriter; static AVAssetWriterInput *gRecVIn, *gRecAIn; static NSURL *gRecURL; static dispatch_source_t gRecTimer;
+static double gRecBase, gRecT0; static long long gRecDone;
+static void RYRecAppendPCM(const int16_t *pcm, int frames, CMTime pts) {
+    AudioStreamBasicDescription a; memset(&a, 0, sizeof a); a.mSampleRate = 48000; a.mFormatID = kAudioFormatLinearPCM; a.mFormatFlags = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    a.mChannelsPerFrame = 1; a.mBitsPerChannel = 16; a.mBytesPerFrame = 2; a.mFramesPerPacket = 1; a.mBytesPerPacket = 2;
+    CMAudioFormatDescriptionRef fd = NULL; if (CMAudioFormatDescriptionCreate(kCFAllocatorDefault, &a, 0, NULL, 0, NULL, NULL, &fd) != noErr) return;
+    size_t len = (size_t)frames * 2; CMBlockBufferRef bb = NULL;
+    if (CMBlockBufferCreateWithMemoryBlock(kCFAllocatorDefault, NULL, len, kCFAllocatorDefault, NULL, 0, len, kCMBlockBufferAssureMemoryNowFlag, &bb) == noErr && bb) {
+        CMBlockBufferReplaceDataBytes(pcm, bb, 0, len);
+        CMSampleBufferRef sb = NULL;
+        if (CMAudioSampleBufferCreateWithPacketDescriptions(kCFAllocatorDefault, bb, true, NULL, NULL, fd, frames, pts, NULL, &sb) == noErr && sb) {
+            if (gRecAIn.isReadyForMoreMediaData) { [gRecAIn appendSampleBuffer:sb]; gRecAudN += frames; }
+            CFRelease(sb);
+        }
+        CFRelease(bb);
+    }
+    CFRelease(fd);
+}
+static void RYRecTick(void) {
+    @synchronized (gRecLock) {
+        if (!gRecOn || !gRecWriter || gRecWriter.status != AVAssetWriterStatusWriting || !gRecAIn) return;
+        long long target = (long long)((CACurrentMediaTime() - gRecT0 - 0.1) * 48000.0), want = target - gRecDone;
+        if (want < 480) return; if (want > 4800) want = 4800;
+        static int16_t out[4800]; unsigned rm = gRecRM, rp = gRecRP, wm = gRecWM, wp = gRecWP;
+        if (wm - rm > 19200) rm = wm - 4800; if (wp - rp > 19200) rp = wp - 4800;                    // fell behind: jump to ~100 ms
+        for (int i = 0; i < (int)want; i++) {
+            float v = 0; if (rm != wm) { v += gRecRingM[rm & (RYREC_N - 1)]; rm++; } if (rp != wp) { v += gRecRingP[rp & (RYREC_N - 1)]; rp++; }
+            v = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); out[i] = (int16_t)(v * 32767.f);
+        }
+        gRecRM = rm; gRecRP = rp;
+        RYRecAppendPCM(out, (int)want, CMTimeMakeWithSeconds(gRecBase + (double)gRecDone / 48000.0, 48000)); gRecDone += want;
+    }
+}
+static void RYRecSetup(CMSampleBufferRef sb) {   // called with gRecLock held, on the first video frame
+    CMVideoFormatDescriptionRef vf = (CMVideoFormatDescriptionRef)CMSampleBufferGetFormatDescription(sb); if (!vf) return;
+    CMVideoDimensions dm = CMVideoFormatDescriptionGetDimensions(vf); if (dm.width < 16 || dm.height < 16) return;
+    NSError *e = nil; AVAssetWriter *w = [[AVAssetWriter alloc] initWithURL:gRecURL fileType:AVFileTypeMPEG4 error:&e]; if (!w) return;
+    double px = (double)dm.width * dm.height, br = px * 3.0 > 8e6 ? 8e6 : px * 3.0;
+    AVAssetWriterInput *vi = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeVideo outputSettings:@{AVVideoCodecKey: AVVideoCodecTypeH264, AVVideoWidthKey: @(dm.width), AVVideoHeightKey: @(dm.height), AVVideoCompressionPropertiesKey: @{AVVideoAverageBitRateKey: @(br), AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel}}];
+    vi.expectsMediaDataInRealTime = YES;
+    AVAssetWriterInput *ai = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio outputSettings:@{AVFormatIDKey: @(kAudioFormatMPEG4AAC), AVSampleRateKey: @48000, AVNumberOfChannelsKey: @1, AVEncoderBitRateKey: @96000}];
+    ai.expectsMediaDataInRealTime = YES;
+    if (![w canAddInput:vi] || ![w canAddInput:ai]) return; [w addInput:vi]; [w addInput:ai];
+    if (![w startWriting]) return;
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sb); [w startSessionAtSourceTime:pts];
+    gRecWriter = w; gRecVIn = vi; gRecAIn = ai; gRecBase = CMTimeGetSeconds(pts); gRecT0 = CACurrentMediaTime(); gRecDone = 0; gRecRM = gRecWM; gRecRP = gRecWP; gRsM.pos = gRsP.pos = 0;
+    gRecTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_queue_create("8ubah.rec", DISPATCH_QUEUE_SERIAL));
+    dispatch_source_set_timer(gRecTimer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), 20 * NSEC_PER_MSEC, 2 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(gRecTimer, ^{ RYRecTick(); }); dispatch_resume(gRecTimer);
+}
+static id RYRecorder(void) {
+    dlopen("/System/Library/Frameworks/ReplayKit.framework/ReplayKit", RTLD_LAZY);
+    Class c = NSClassFromString(@"RPScreenRecorder"); return c ? ((id (*)(id, SEL))objc_msgSend)(c, NSSelectorFromString(@"sharedRecorder")) : nil;
+}
+static void RYRecStart(void (^done)(NSString *err)) {
+    if (gRecOn) { done(nil); return; }
+    id rec = RYRecorder(); if (!rec) { done(T(@"التسجيل غير متاح", @"Recording unavailable")); return; }
+    static dispatch_once_t once; dispatch_once(&once, ^{ gRecLock = [NSObject new]; });
+    NSDateFormatter *df = [NSDateFormatter new]; df.dateFormat = @"yyyyMMdd-HHmmss";
+    @synchronized (gRecLock) { gRecURL = [NSURL fileURLWithPath:[RYDir(@"rec") stringByAppendingPathComponent:[NSString stringWithFormat:@"rec-%@.mp4", [df stringFromDate:NSDate.date]]]]; gRecWriter = nil; gRecVIn = nil; gRecAIn = nil; }
+    gRecMicN = gRecPlayN = gRecVidN = gRecAudN = 0; gRecStart = CACurrentMediaTime(); gRecOn = 1;
+    void (^handler)(CMSampleBufferRef, NSInteger, NSError *) = ^(CMSampleBufferRef sb, NSInteger type, NSError *err) {
+        if (type != 1 || !gRecOn || !sb || !CMSampleBufferDataIsReady(sb)) return;   // 1 = video; ReplayKit's own audio is ignored (it has none of the call)
+        @synchronized (gRecLock) {
+            if (!gRecWriter) RYRecSetup(sb);
+            if (gRecWriter && gRecWriter.status == AVAssetWriterStatusWriting && gRecVIn.isReadyForMoreMediaData) { [gRecVIn appendSampleBuffer:sb]; gRecVidN++; }
+        }
+    };
+    void (^comp)(NSError *) = ^(NSError *e) { if (e) { gRecOn = 0; dispatch_async(dispatch_get_main_queue(), ^{ done(T(@"ما قدرت أبدأ التسجيل", @"Could not start recording")); }); } else dispatch_async(dispatch_get_main_queue(), ^{ done(nil); }); };
+    ((void (*)(id, SEL, id, id))objc_msgSend)(rec, NSSelectorFromString(@"startCaptureWithHandler:completionHandler:"), handler, comp);
+}
+static void RYRecStop(void (^done)(NSURL *url, NSString *err)) {
+    if (!gRecOn) { done(nil, nil); return; }
+    gRecOn = 0; id rec = RYRecorder();
+    void (^fin)(void) = ^{
+        AVAssetWriter *w; NSURL *u;
+        @synchronized (gRecLock) {
+            if (gRecTimer) { dispatch_source_cancel(gRecTimer); gRecTimer = nil; }
+            w = gRecWriter; u = gRecURL; gRecWriter = nil;
+            if (w && w.status == AVAssetWriterStatusWriting) { [gRecVIn markAsFinished]; [gRecAIn markAsFinished]; }
+            gRecVIn = nil; gRecAIn = nil;
+        }
+        if (!w || w.status != AVAssetWriterStatusWriting) { dispatch_async(dispatch_get_main_queue(), ^{ done(nil, T(@"ما فيه فيديو", @"No video was captured")); }); return; }
+        [w finishWritingWithCompletionHandler:^{ dispatch_async(dispatch_get_main_queue(), ^{ if (w.status == AVAssetWriterStatusCompleted) done(u, nil); else done(nil, T(@"فشل الحفظ", @"Save failed")); }); }];
+    };
+    if (rec) ((void (*)(id, SEL, id))objc_msgSend)(rec, NSSelectorFromString(@"stopCaptureWithHandler:"), ^(NSError *e) { fin(); }); else fin();
+}
 static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
     gMonSR = sr; // remembered even while the monitor is off, so the engine starts at the real capture rate
     if (gStOn) {
@@ -1122,6 +1261,7 @@ static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
     } else if (gMicMute) { memset(t, 0, (size_t)c * sizeof(float)); } // no Stereo playing: muting the mic just means silence
     else if (RY_FX_ON) RYVoiceBlock(t, c, sr, s);
     if (gMonOn) RYMonFeed(t, c, sr);
+    if (gRecOn) RYRecMic(t, c, sr);
 }
 // interleaved: channel 0 is processed and copied to the other channels
 static void RYProcInter(void *data, BOOL isFloat, UInt32 frames, UInt32 ch, double sr, RYVS *s) {
@@ -1181,7 +1321,7 @@ static OSStatus RYAURender(AudioUnit u, AudioUnitRenderActionFlags *fl, const Au
     OSStatus r = orig_aurender ? orig_aurender(u, fl, ts, bus, n, io) : -50;
     if (r != noErr || bus != 1 || !io) return r;
     gMicCallsA++;
-    if (!RY_FX_ON && !gMonOn) return r;
+    if (!RY_FX_ON && !gMonOn && !gRecOn) return r;
     static AudioUnit lastU; static AudioStreamBasicDescription f; static BOOL ok;
     if (u != lastU) {
         lastU = u; UInt32 sz = sizeof f; memset(&f, 0, sizeof f);
@@ -1244,7 +1384,7 @@ static AURenderBlock RYRBGetter(id self, SEL _cmd) {
         if (r != noErr || bus != 1 || !io) return r;
         long long calls = ++gMicCallsU;
         if (calls <= 3 || calls % 2000 == 0) snprintf(gMicLast, sizeof gMicLast, "frames=%u buffers=%u b0: ch=%u bytes=%u data=%d have=%d inferred=%d", (unsigned)n, (unsigned)io->mNumberBuffers, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mNumberChannels : 0, io->mNumberBuffers ? (unsigned)io->mBuffers[0].mDataByteSize : 0, io->mNumberBuffers ? io->mBuffers[0].mData != NULL : 0, cx->have, cx->inferred);
-        if (!RY_FX_ON && !gMonOn) return r;
+        if (!RY_FX_ON && !gMonOn && !gRecOn) return r;
         AudioStreamBasicDescription f;
         if (cx->have) f = cx->f;
         else {
@@ -1300,7 +1440,7 @@ static void RYTapInstall(id self, SEL _cmd, AVAudioNodeBus bus, AVAudioFrameCoun
     RYTapBlock w = blk;
     if (blk && [self isKindOfClass:[AVAudioInputNode class]]) {
         gMicTapInst++;
-        w = [^(AVAudioPCMBuffer *b, AVAudioTime *t) { gMicCallsT++; if (RY_FX_ON || gMonOn) RYTapProcess(b); blk(b, t); } copy];
+        w = [^(AVAudioPCMBuffer *b, AVAudioTime *t) { gMicCallsT++; if (RY_FX_ON || gMonOn || gRecOn) RYTapProcess(b); blk(b, t); } copy];
     }
     orig_tap(self, _cmd, bus, size, fmt, w);
 }
@@ -1487,7 +1627,7 @@ static NSDictionary *RYSonarParse(id root, NSString *fallbackName) {
     NSString *nm = [root isKindOfClass:NSDictionary.class] && [root[@"name"] isKindOfClass:NSString.class] && [root[@"name"] length] ? root[@"name"] : fallbackName;
     return @{@"n": nm, @"f": F2, @"g": G2, @"q": Q2, @"t": T2};
 }
-static void RYEqImportLink(NSString *link, void (^done)(NSString *err, NSString *name)) {
+static void RYEqImportLink(NSString *link, NSString *forcedName, void (^done)(NSString *err, NSString *name)) {
     NSString *t = [link stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet], *target = nil;
     NSURLComponents *uc = [NSURLComponents componentsWithString:t];
     for (NSURLQueryItem *qi in uc.queryItems) if ([qi.name isEqualToString:@"url"] && qi.value.length) { target = qi.value; if (![target hasPrefix:@"http"]) target = RYB64Dec(target); }
@@ -1502,7 +1642,7 @@ static void RYEqImportLink(NSString *link, void (^done)(NSString *err, NSString 
             id j = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             NSDictionary *p = j ? RYSonarParse(j, T(@"استيراد", @"Imported")) : nil;
             if (!p) msg = T(@"ما لقيت إيكولايزر بالإعداد", @"No equalizer found in the config");
-            else { NSString *base = p[@"n"], *use = base; int k = 2; while (RYEqIsBuiltin(use)) use = [NSString stringWithFormat:@"%@ %d", base, k++];
+            else { NSString *base = forcedName.length ? forcedName : p[@"n"], *use = base; int k = 2; while (RYEqIsBuiltin(use)) use = [NSString stringWithFormat:@"%@ %d", base, k++];
                    NSMutableDictionary *m = [p mutableCopy]; m[@"n"] = use; RYEqApplyDict(m); RYEqSaveUser(use); nm = use; }
         }
         dispatch_async(dispatch_get_main_queue(), ^{ done(msg, nm); });
@@ -1581,6 +1721,7 @@ static void RYRebindImage(const struct mach_header *mh, intptr_t slide) {
                 void *rep = NULL, **save = NULL;
                 if (strcmp(nm, "_AudioUnitInitialize") == 0) { rep = (void *)RYAUInit; save = (void **)&orig_auinit; }
                 else if (strcmp(nm, "_AudioOutputUnitStart") == 0) { rep = (void *)RYAUStart; save = (void **)&orig_austart; }
+                else if (strcmp(nm, "_AudioUnitSetProperty") == 0) { rep = (void *)RYAUSetProp; save = (void **)&orig_ausetprop; }
                 else if (strcmp(nm, "_AudioUnitRender") == 0) { rep = (void *)RYAURender; save = (void **)&orig_aurender; if (slots[k] != rep) gMicRebound++; }
                 else continue;
                 if (slots[k] == rep) continue;
@@ -3306,10 +3447,10 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation")];
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation"), T(@"تسجيل", @"Record")];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @5, @1, @2, @3, @4];
-    if (self.tab < 0 || self.tab > 5) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @5, @6, @1, @2, @3, @4];
+    if (self.tab < 0 || self.tab > 6) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -3341,7 +3482,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     if (self.tab != 5) self.eqEdit = NO;
     [self applyEditLock];
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; default: [self renderBG]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; case 6: [self renderRec]; break; default: [self renderBG]; }
 }
 #pragma mark Locked
 - (void)renderLocked {
@@ -3738,19 +3879,56 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
     // ---- Compressor
     [self.stack addArrangedSubview:RYCard(@[RYSw(T(@"الكومبريسر", @"Compressor"), gCompOn != 0, nil, ^(BOOL on) { gCompOn = on; CS(@"compOn", @(on)); }),
         RYSl(T(@"المستوى", @"Level"), nil, nil, 0, 1, gCompLvl, 2, YES, ^(float v) { gCompLvl = v; CS(@"compLvl", @(v)); })])];
-    // ---- Sonar import
-    UITextField *tf = [UITextField new]; tf.placeholder = @"Sonar link"; tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.layer.cornerRadius = 10; tf.clipsToBounds = YES;
-    tf.autocorrectionType = UITextAutocorrectionTypeNo; tf.autocapitalizationType = UITextAutocapitalizationTypeNone; tf.clearButtonMode = UITextFieldViewModeWhileEditing; tf.font = [UIFont systemFontOfSize:14];
-    tf.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 10, 10)]; tf.leftViewMode = UITextFieldViewModeAlways; [tf.heightAnchor constraintEqualToConstant:42].active = YES;
-    __weak UITextField *wtf = tf;
-    UIButton *imp = RYBtn(T(@"استيراد", @"Import"), YES, ^{
-        NSString *t = wtf.text; if (!t.length) t = UIPasteboard.generalPasteboard.string;
-        if (!t.length) return;
-        [ws toast:T(@"جاري الاستيراد", @"Importing")];
-        RYEqImportLink(t, ^(NSString *err, NSString *name) { if (err) [ws toast:err]; else { [ws toast:name]; [ws rebuild]; } });
-    });
-    [self.stack addArrangedSubview:RYCard(@[tf, imp])];
+    // ---- Sonar import: the link is taken from the clipboard, then the preset name is asked
+    [self.stack addArrangedSubview:RYBtn(T(@"استيراد", @"Import"), NO, ^{
+        UIPasteboard *pb = UIPasteboard.generalPasteboard; NSString *t = pb.string; if (!t.length && pb.URL) t = pb.URL.absoluteString;
+        if (!t.length) { [ws toast:T(@"الحافظة فاضية", @"Clipboard is empty")]; return; }
+        [ws ask:T(@"اسم الوزنية", @"Preset name") ph:T(@"اسم", @"Name") secure:NO ok:^(NSString *n) {
+            n = [n stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+            [ws toast:T(@"جاري الاستيراد", @"Importing")];
+            RYEqImportLink(t, n, ^(NSString *err, NSString *name) { if (err) [ws toast:err]; else { [ws toast:name]; [ws rebuild]; } });
+        }];
+    })];
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
+}
+- (void)renderRec {
+    __weak typeof(self) ws = self;
+    UIButton *go = RYBtn(gRecOn ? T(@"إيقاف", @"Stop") : T(@"تسجيل", @"Record"), gRecOn != 0, ^{
+        if (!gRecOn) {
+            RYRecStart(^(NSString *err) { if (err) { [ws toast:err]; return; } [ws dismissViewControllerAnimated:YES completion:nil]; });
+        } else {
+            [ws toast:T(@"جاري الحفظ", @"Saving")];
+            RYRecStop(^(NSURL *u, NSString *err) {
+                if (err || !u) { if (err) [ws toast:err]; [ws rebuild]; return; }
+                [ws rebuild];
+                UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[u] applicationActivities:nil];
+                av.popoverPresentationController.sourceView = ws.view; [ws presentViewController:av animated:YES completion:nil];
+            });
+        }
+    });
+    [self.stack addArrangedSubview:RYCard(@[go, RYSw(T(@"مايكي بالتسجيل", @"My mic in recording"), gRecMicOn != 0, nil, ^(BOOL on) { gRecMicOn = on; })])];
+    UILabel *st = RYLabel(@" ", 13, UIFontWeightMedium, RY_MUTED);
+    void (^upd)(void) = ^{
+        if (!gRecOn) { st.text = gRecHook ? T(@"جاهز", @"Ready") : T(@"جاهز (صوت الروم يُلتقط بعد دخول الروم)", @"Ready (room audio is picked up after joining a room)"); return; }
+        int sec = (int)(CACurrentMediaTime() - gRecStart);
+        st.text = [NSString stringWithFormat:@"%02d:%02d   %@ %lld   %@ %@   %@ %@", sec / 60, sec % 60, T(@"فيديو", @"Video"), gRecVidN, T(@"مايك", @"Mic"), gRecMicOn ? (gRecMicN > 0 ? @"✓" : @"✗") : @"-", T(@"أصواتهم", @"Voices"), gRecPlayN > 0 ? @"✓" : @"✗"];
+    };
+    upd(); [self.stack addArrangedSubview:RYCard(@[st])];
+    [self.invUI invalidate]; self.invLabel = nil; self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { upd(); }];
+    // saved recordings: tap = share / save, x = delete
+    NSString *dir = RYDir(@"rec"); NSArray *fs = [[[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil] sortedArrayUsingSelector:@selector(compare:)];
+    int shown = 0;
+    for (NSString *f in [fs reverseObjectEnumerator]) {
+        if (![f.pathExtension isEqualToString:@"mp4"] || shown++ >= 12) continue;
+        NSString *path = [dir stringByAppendingPathComponent:f]; unsigned long long sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil] fileSize];
+        UIButton *b = RYBtn([NSString stringWithFormat:@"%@   %.1f MB", [f substringWithRange:NSMakeRange(4, MIN((NSUInteger)15, f.length - 4))], sz / 1048576.0], NO, ^{
+            UIActivityViewController *av = [[UIActivityViewController alloc] initWithActivityItems:@[[NSURL fileURLWithPath:path]] applicationActivities:nil];
+            av.popoverPresentationController.sourceView = ws.view; [ws presentViewController:av animated:YES completion:nil];
+        });
+        [b setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+        UIButton *x = RYBtn(@"✕", NO, ^{ [[NSFileManager defaultManager] removeItemAtPath:path error:nil]; [ws rebuild]; });
+        [self.stack addArrangedSubview:RYCard(@[RYHStack(@[b, x], 8)])];
+    }
 }
 - (void)renderCat {
     __weak typeof(self) ws = self; BOOL on = [CF(@"cat", @YES) boolValue];
@@ -3851,7 +4029,7 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
 - (void)openPanel {
     UIViewController *root = self.win.rootViewController; if (root.presentedViewController) return;
     self.prevKey = nil; for (UIWindow *w in RYAppWindows()) if (w.isKeyWindow) { self.prevKey = w; break; }
-    RYPanel *p = [RYPanel new]; p.modalPresentationStyle = UIModalPresentationPageSheet;
+    RYPanel *p = [RYPanel new]; p.modalPresentationStyle = UIModalPresentationPageSheet; if (gRecOn) p.tab = 6;
     UISheetPresentationController *sp = p.sheetPresentationController;
     if (sp) { sp.detents = @[UISheetPresentationControllerDetent.mediumDetent, UISheetPresentationControllerDetent.largeDetent]; sp.prefersGrabberVisible = YES; }
     [root presentViewController:p animated:YES completion:^{ [self.win makeKeyWindow]; }];
@@ -3892,7 +4070,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
     [self fpRefresh]; self.fpBar.hidden = NO; [rv bringSubviewToFront:self.fpBar];
 }
 - (void)tick {
-    self.fab.hidden = NO; self.fab.backgroundColor = RYAccent(); RYHookInputs();
+    self.fab.hidden = NO; self.fab.backgroundColor = gRecOn ? RY_RED : RYAccent(); RYHookInputs();
     RYCatTick();
     [self syncBG:RYChatHost()];
     [self fpTick];
