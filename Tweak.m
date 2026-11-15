@@ -1650,7 +1650,7 @@ static NSString *RYGatewayFilter(NSString *s) {
     NSDictionary *d = j[@"d"]; if (![d isKindOfClass:NSDictionary.class]) return s;
     RYLogInit(); gLogSeen++;
     id gid = d[@"guild_id"];
-    if (gid && gid != NSNull.null && ![CF(@"delAll", @YES) boolValue]) { gLogPass++; return s; }      // servers are kept too unless "DMs only" is chosen
+    if (gid && gid != NSNull.null && ![CF(@"delAll", @NO) boolValue]) { gLogPass++; return s; }      // DMs/groups always kept; servers only if explicitly switched to "all chats"
     NSArray *ids = bulk ? d[@"ids"] : (d[@"id"] ? @[d[@"id"]] : @[]);
     if (![ids isKindOfClass:NSArray.class] || !ids.count) return s;
     NSString *cid0 = RYStr(d[@"channel_id"]), *mid0 = RYStr(ids.firstObject);
@@ -1665,11 +1665,7 @@ static NSString *RYGatewayFilter(NSString *s) {
     // nothing is removed, guild_id stays, no unknown event type reaches JS). Full copy if we remember the message, else just ids.
     id full = nil;
     @synchronized (gLogLock) { NSData *x = gMsgCache[cid0][mid0] ?: gDelStore[cid0][mid0]; if (x) full = [NSJSONSerialization JSONObjectWithData:x options:NSJSONReadingMutableContainers error:nil]; }
-    if (![full isKindOfClass:NSDictionary.class]) {
-        NSMutableDictionary *pm = [@{@"id": mid0, @"channel_id": cid0} mutableCopy];
-        if (gid && gid != NSNull.null) pm[@"guild_id"] = gid;
-        full = pm;
-    }
+    if (![full isKindOfClass:NSDictionary.class]) { gLogPass++; return s; }   // never saw the full message: let the real delete through rather than fake an incomplete one
     j[@"t"] = @"MESSAGE_UPDATE"; j[@"d"] = full;
     NSData *out = [NSJSONSerialization dataWithJSONObject:j options:0 error:nil];
     NSString *ns = out ? [[NSString alloc] initWithData:out encoding:NSUTF8StringEncoding] : nil;
@@ -2684,7 +2680,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
         RYBtn([NSString stringWithFormat:@"%@: %@", T(@"الخلفية", @"Background"), [CF(@"bgFull", @NO) boolValue] ? T(@"كل الشاشة", @"Full screen") : T(@"الدردشة فقط", @"Chat only")], NO, ^{
             CS(@"bgFull", @(![CF(@"bgFull", @NO) boolValue])); [[RYCore shared] bump]; RYRestoreAll(); [ws rebuild];
         }),
-        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @YES) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @YES) boolValue])); [ws rebuild]; }),
+        RYBtn([NSString stringWithFormat:@"%@: %@", T(@"المحذوفات", @"Deleted"), [CF(@"delAll", @NO) boolValue] ? T(@"كل الشاتات", @"All chats") : T(@"الخاص فقط", @"DMs only")], NO, ^{ CS(@"delAll", @(![CF(@"delAll", @NO) boolValue])); [ws rebuild]; }),
         RYBtn(RYAr() ? @"English" : @"العربية", NO, ^{ CS(@"lang", RYAr() ? @"en" : @"ar"); [ws rebuild]; })])];
     NSMutableArray *ac = [NSMutableArray new]; NSArray *cols = RYAccents();
     for (NSUInteger i = 0; i < cols.count; i++) {
