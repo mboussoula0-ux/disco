@@ -107,6 +107,10 @@
 // 6d. CHAT TEXT COLOUR: only the colour the owner picks (txtMode == "custom", txtColor). There is NO automatic contrast / wallpaper luminance / username-colour copy
 //   any more (it made white-on-white text). RYTextTarget() returns nil unless custom; do not add an automatic mode back unless the owner asks.
 //
+// 6e. EQUALIZER (tab "Isolation" / "عوازل"): 10 peaking bands (RBJ biquads, Q 1.1) on the real mic voice, inside RYVoiceBlock after the other effects
+//   (RYEqPrep / RYEqRun, soft limiter at 0.8). Part of RY_FX_ON (gEqOn). Defaults = kEqF / kEqG = the owner's screenshot of the PC equalizer. Settings: eqOn, eqF[10],
+//   eqG[10], eqPre. The graph is RYEQView (UIControl: drag a dot = frequency + gain, between its neighbours). Off until the owner switches it on.
+//
 // 7. CODE MAP (search the #pragma mark lines)
 //   Config/storage (CF/CS, RYDir = Documents/8ubah), language T(ar,en), UI helpers (RYCard/RYBtn/...), view discovery (RYFindVC, RYAppWindows),
 //   background view + clearing (RYBGView, RYClear*), mic/stereo, voice hooks, message logger, Discord helpers (RYChatHost, RYLowestInput,
@@ -759,6 +763,15 @@ static const RYPreset kPresets[] = {
 #define RY_NPRESETS ((int)(sizeof(kPresets) / sizeof(kPresets[0])))
 static volatile int gMicOn = 0, gMicMode = 0, gMicPreset = 0;
 static volatile float gMicSemi = 0, gMicEcho = 0, gMicGain = 1;
+// ---- Equalizer (tab "Isolation"): 10 peaking bands on YOUR real mic voice. Defaults = the owner's screenshot of the PC equalizer
+// (frequency in Hz / gain in dB read off the picture). Off until the owner switches it on; then it is part of the mic chain (RY_FX_ON).
+#define RYEQ_N 10
+static const float kEqF[RYEQ_N] = {30.f, 90.f, 300.f, 500.f, 1000.f, 2000.f, 4000.f, 12000.f, 13600.f, 17400.f};
+static const float kEqG[RYEQ_N] = {-1.5f, 9.1f, -1.3f, 0.f, -2.8f, 3.0f, 4.0f, 12.0f, 3.3f, 4.0f};
+static volatile int gEqOn = 0, gEqVer = 1;
+static volatile float gEqF[RYEQ_N] = {30.f, 90.f, 300.f, 500.f, 1000.f, 2000.f, 4000.f, 12000.f, 13600.f, 17400.f};
+static volatile float gEqG[RYEQ_N] = {-1.5f, 9.1f, -1.3f, 0.f, -2.8f, 3.0f, 4.0f, 12.0f, 3.3f, 4.0f};
+static volatile float gEqPre = 0;
 static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
 static volatile int gMicDist = 0, gMicRev = 0, gMonOn = 0;
@@ -835,7 +848,7 @@ static void RYStDecode(NSURL *u, void (^done)(BOOL ok, NSString *msg)) {
     });
 }
 
-#define RY_FX_ON (RYFeatureOK("fx") && (gMicOn || gMicDist || gMicRev || gMicMute || gStOn))   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
+#define RY_FX_ON (RYFeatureOK("fx") && (gMicOn || gMicDist || gMicRev || gMicMute || gStOn || gEqOn))   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
 enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
 static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
 static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
@@ -850,6 +863,7 @@ typedef struct {
     float cb[8][4096]; unsigned ci[8]; float cf[8]; float ab[4][1024]; unsigned ai[4]; // room reverb: 8 combs + 4 all-passes
     float pre[16384]; unsigned pw; float er[8192]; unsigned erw;      // pre-delay + early reflections
     float rlc, elp, olp, blp, lfo;                                    // reverb filters + modulation
+    int eqVer; double eqSr; float eqc[RYEQ_N][5]; float eqz[RYEQ_N][2]; unsigned char eqAct[RYEQ_N];   // equalizer: coefficients (b0 b1 b2 a1 a2) + state per band
 } RYVS;
 static RYVS gVS[3]; // 0 = AudioUnitRender, 1 = AUAudioUnit block, 2 = AVAudioEngine tap (separate state: they may run at the same time)
 
@@ -908,6 +922,28 @@ static inline float RYRev(float x, RYVS *s, const RYRevC *c) {
     s->olp = wet * (1.f - c->hc) + s->olp * c->hc;                                       // high cut
     return x * c->dry + s->olp;
 }
+// Equalizer. Coefficients are rebuilt only when the owner changes something (gEqVer) or the capture sample rate changes. A band above 45% of the sample
+// rate (e.g. 17 kHz when the phone captures at 16 kHz) is skipped. After the bands a soft limiter (knee at 0.8) keeps +12 dB boosts from clipping.
+static void RYEqPrep(RYVS *s, double sr) {
+    if (s->eqVer == gEqVer && s->eqSr == sr) return;
+    for (int b = 0; b < RYEQ_N; b++) {
+        float f = gEqF[b], g = gEqG[b]; s->eqAct[b] = 0;
+        if (fabsf(g) < 0.05f || f < 15.f || f > 0.45f * (float)sr) continue;
+        double A = pow(10.0, g / 40.0), w0 = 2.0 * M_PI * f / sr, al = sin(w0) / (2.0 * 1.1), cw = cos(w0);
+        double b0 = 1 + al * A, b1 = -2 * cw, b2 = 1 - al * A, a0 = 1 + al / A, a1 = -2 * cw, a2 = 1 - al / A;
+        s->eqc[b][0] = (float)(b0 / a0); s->eqc[b][1] = (float)(b1 / a0); s->eqc[b][2] = (float)(b2 / a0); s->eqc[b][3] = (float)(a1 / a0); s->eqc[b][4] = (float)(a2 / a0); s->eqAct[b] = 1;
+    }
+    s->eqVer = gEqVer; s->eqSr = sr;
+}
+static inline float RYEqRun(float x, RYVS *s, float pre) {
+    float y = x * pre;
+    for (int b = 0; b < RYEQ_N; b++) if (s->eqAct[b]) {
+        const float *c = s->eqc[b]; float o = c[0] * y + s->eqz[b][0];
+        s->eqz[b][0] = c[1] * y - c[3] * o + s->eqz[b][1]; s->eqz[b][1] = c[2] * y - c[4] * o; y = o;
+    }
+    float a = fabsf(y); if (a > 0.8f) y = copysignf(0.8f + 0.2f * tanhf((a - 0.8f) / 0.2f), y);
+    return y;
+}
 // pitch shift = two read taps on a delay line that slides at (1 - ratio) samples per sample, cross-faded with a Hann window
 static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; s->d1 = (float)(0.016 * sr); }
@@ -917,6 +953,7 @@ static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     const float semi = mst ? gMicSemi : 0.f, echo = mst ? gMicEcho : 0.f, gain = mst ? gMicGain : 1.f; const int mode = mst ? gMicMode : 0;
     const float dd = 1.f - powf(2.f, semi / 12.f);
     const BOOL pitch = fabsf(semi) > 0.05f;
+    const int eqOn = gEqOn; const float eqPre = powf(10.f, gEqPre / 20.f); if (eqOn) RYEqPrep(s, sr);
     int ed = (int)(0.27 * sr); if (ed >= RYM_ECHO) ed = RYM_ECHO - 1;
     const float rph = (float)(2.0 * M_PI * 70.0 / sr);
     for (int i = 0; i < n; i++) {
@@ -937,6 +974,7 @@ static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
         if (gMicDist) y = RYDist(y, s);
         if (revOn) y = RYRev(y, s, &rc);
         if (echo > 0.01f) { float e = s->eb[(s->ew - (unsigned)ed) & (RYM_ECHO - 1)]; s->eb[s->ew & (RYM_ECHO - 1)] = y + e * 0.4f; s->ew++; y += e * echo; }
+        if (eqOn) y = RYEqRun(y, s, eqPre);
         if (y > 1.f) y = 1.f; else if (y < -1.f) y = -1.f;
         x[i] = y;
     }
@@ -1267,7 +1305,19 @@ static void RYMicLoad(void) {
       else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
     gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
     gIsoOn = [CF(@"isoOn", @YES) boolValue]; gIsoVP = gIsoOn ? 1 : 0; gIsoSess = gIsoRTC = 0; // switch in the Mic tab. Session-mode override + RTC constraints are never used (they can stop a voice join)
+    gEqOn = [CF(@"eqOn", @NO) boolValue]; gEqPre = [CF(@"eqPre", @0) floatValue];
+    { NSArray *ef = CF(@"eqF", nil), *eg = CF(@"eqG", nil);
+      BOOL ok = [ef isKindOfClass:NSArray.class] && [eg isKindOfClass:NSArray.class] && ef.count == RYEQ_N && eg.count == RYEQ_N;
+      for (int i = 0; i < RYEQ_N; i++) { gEqF[i] = ok ? [ef[i] floatValue] : kEqF[i]; gEqG[i] = ok ? [eg[i] floatValue] : kEqG[i]; }
+      gEqVer++; }
 }
+static void RYEqSave(void) {
+    NSMutableArray *f = [NSMutableArray new], *g = [NSMutableArray new];
+    for (int i = 0; i < RYEQ_N; i++) { [f addObject:@(gEqF[i])]; [g addObject:@(gEqG[i])]; }
+    CS(@"eqF", f); CS(@"eqG", g); CS(@"eqPre", @(gEqPre));
+}
+static void RYEqSetOn(BOOL on) { gEqOn = on ? 1 : 0; gEqVer++; CS(@"eqOn", @(on)); }
+static void RYEqReset(void) { for (int i = 0; i < RYEQ_N; i++) { gEqF[i] = kEqF[i]; gEqG[i] = kEqG[i]; } gEqPre = 0; gEqVer++; RYEqSave(); }
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
 static void RYMicSetRev(BOOL on) { gMicRev = on; CS(@"micRev", @(on)); }
@@ -2927,6 +2977,86 @@ static void RYMsgLoopSet(BOOL on) {
     if (on) { gMsgIdx = 0; RYMsgLoopStep(gMsgGen); }
 }
 
+// magnitude (dB) of one peaking band at frequency f, for drawing the response curve (sample rate 48 kHz)
+static double RYEqBandDb(float fc, float g, double f) {
+    if (fabsf(g) < 0.05f || fc > 0.45f * 48000.f) return 0;
+    double A = pow(10.0, g / 40.0), w0 = 2.0 * M_PI * fc / 48000.0, al = sin(w0) / (2.0 * 1.1), cw = cos(w0);
+    double b0 = (1 + al * A), b1 = -2 * cw, b2 = (1 - al * A), a0 = 1 + al / A, a1 = -2 * cw / a0, a2 = (1 - al / A) / a0; b0 /= a0; b1 /= a0; b2 /= a0;
+    double w = 2.0 * M_PI * f / 48000.0, c1 = cos(w), c2 = cos(2 * w);
+    double num = b0 * b0 + b1 * b1 + b2 * b2 + 2 * (b0 * b1 + b1 * b2) * c1 + 2 * b0 * b2 * c2;
+    double den = 1 + a1 * a1 + a2 * a2 + 2 * (a1 + a1 * a2) * c1 + 2 * a2 * c2;
+    return den > 0 && num > 0 ? 10.0 * log10(num / den) : 0;
+}
+@interface RYEQView : UIControl
+@property (nonatomic, copy) void (^onLive)(int band);
+@property (nonatomic, copy) void (^onEnd)(void);
+@end
+@implementation RYEQView { int _sel; }
+- (instancetype)initWithFrame:(CGRect)f {
+    self = [super initWithFrame:f];
+    if (self) { self.backgroundColor = [UIColor colorWithRed:0.12 green:0.14 blue:0.17 alpha:1]; self.layer.cornerRadius = 10; self.clipsToBounds = YES; _sel = -1; }
+    return self;
+}
+- (CGRect)plot { return CGRectMake(36, 8, self.bounds.size.width - 44, self.bounds.size.height - 26); }
+- (CGFloat)xFor:(double)f { CGRect p = [self plot]; return p.origin.x + p.size.width * (log10(f / 20.0) / 3.0); }
+- (double)fFor:(CGFloat)x { CGRect p = [self plot]; return 20.0 * pow(10.0, 3.0 * (x - p.origin.x) / p.size.width); }
+- (CGFloat)yFor:(double)g { CGRect p = [self plot]; return p.origin.y + p.size.height * (0.5 - g / 24.0); }
+- (double)gFor:(CGFloat)y { CGRect p = [self plot]; return (0.5 - (y - p.origin.y) / p.size.height) * 24.0; }
+- (int)nearest:(CGPoint)pt {
+    int best = -1; CGFloat bd = 34;
+    for (int i = 0; i < RYEQ_N; i++) { CGFloat dx = [self xFor:gEqF[i]] - pt.x, dy = [self yFor:gEqG[i]] - pt.y, d = sqrt(dx * dx + dy * dy); if (d < bd) { bd = d; best = i; } }
+    return best;
+}
+- (UIColor *)dotColor:(int)i {
+    static NSArray *c; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = @[[UIColor colorWithRed:.62 green:.33 blue:.95 alpha:1], [UIColor colorWithRed:.31 green:.40 blue:.98 alpha:1], [UIColor colorWithRed:1 green:.31 blue:.35 alpha:1], [UIColor colorWithRed:1 green:.45 blue:.30 alpha:1], [UIColor colorWithRed:1 green:.64 blue:.18 alpha:1], [UIColor colorWithRed:.70 green:.95 blue:.15 alpha:1], [UIColor colorWithRed:.05 green:.85 blue:.70 alpha:1], [UIColor colorWithRed:1 green:.25 blue:.60 alpha:1], [UIColor colorWithRed:.10 green:.90 blue:.95 alpha:1], [UIColor colorWithRed:.15 green:.65 blue:1 alpha:1]]; });
+    return c[i % 10];
+}
+- (void)drawRect:(CGRect)r {
+    CGContextRef g = UIGraphicsGetCurrentContext(); CGRect p = [self plot];
+    NSDictionary *at = @{NSFontAttributeName: [UIFont systemFontOfSize:9], NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.5]};
+    CGContextSetLineWidth(g, 1);
+    for (NSNumber *f in @[@20, @50, @100, @200, @500, @1000, @2000, @5000, @10000, @20000]) {
+        CGFloat x = [self xFor:f.doubleValue]; CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:0.07].CGColor);
+        CGContextMoveToPoint(g, x, p.origin.y); CGContextAddLineToPoint(g, x, CGRectGetMaxY(p)); CGContextStrokePath(g);
+        double v = f.doubleValue; NSString *t = v >= 1000 ? [NSString stringWithFormat:@"%gk", v / 1000] : [NSString stringWithFormat:@"%g", v];
+        [t drawAtPoint:CGPointMake(x - 6, CGRectGetMaxY(p) + 4) withAttributes:at];
+    }
+    for (NSNumber *d in @[@12, @6, @0, @-6, @-12]) {
+        CGFloat y = [self yFor:d.doubleValue]; CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:d.intValue == 0 ? 0.18 : 0.07].CGColor);
+        CGContextMoveToPoint(g, p.origin.x, y); CGContextAddLineToPoint(g, CGRectGetMaxX(p), y); CGContextStrokePath(g);
+        [[NSString stringWithFormat:@"%+d", d.intValue] drawAtPoint:CGPointMake(6, y - 5) withAttributes:at];
+    }
+    CGContextSaveGState(g); CGContextClipToRect(g, p);
+    CGContextSetStrokeColorWithColor(g, [UIColor colorWithWhite:1 alpha:gEqOn ? 0.95 : 0.4].CGColor); CGContextSetLineWidth(g, 1.6);
+    for (CGFloat x = p.origin.x; x <= CGRectGetMaxX(p); x += 2) {
+        double f = [self fFor:x], db = 0; for (int i = 0; i < RYEQ_N; i++) db += RYEqBandDb(gEqF[i], gEqG[i], f);
+        db += gEqPre; CGFloat y = [self yFor:MAX(-18, MIN(18, db))];
+        if (x == p.origin.x) CGContextMoveToPoint(g, x, y); else CGContextAddLineToPoint(g, x, y);
+    }
+    CGContextStrokePath(g); CGContextRestoreGState(g);
+    for (int i = 0; i < RYEQ_N; i++) {
+        CGPoint c = CGPointMake([self xFor:gEqF[i]], [self yFor:gEqG[i]]); CGFloat rad = (i == _sel) ? 8 : 5.5;
+        CGContextSetFillColorWithColor(g, [self dotColor:i].CGColor); CGContextFillEllipseInRect(g, CGRectMake(c.x - rad, c.y - rad, rad * 2, rad * 2));
+        if (i == _sel) { CGContextSetStrokeColorWithColor(g, UIColor.whiteColor.CGColor); CGContextSetLineWidth(g, 2); CGContextStrokeEllipseInRect(g, CGRectMake(c.x - rad, c.y - rad, rad * 2, rad * 2)); }
+    }
+}
+- (BOOL)beginTrackingWithTouch:(UITouch *)t withEvent:(UIEvent *)e {
+    _sel = [self nearest:[t locationInView:self]]; if (_sel < 0) return NO;
+    [self setNeedsDisplay]; if (self.onLive) self.onLive(_sel); return YES;
+}
+- (BOOL)continueTrackingWithTouch:(UITouch *)t withEvent:(UIEvent *)e {
+    if (_sel < 0) return NO;
+    CGPoint pt = [t locationInView:self];
+    double lo = _sel > 0 ? gEqF[_sel - 1] * 1.06 : 20.0, hi = _sel < RYEQ_N - 1 ? gEqF[_sel + 1] / 1.06 : 20000.0;
+    double f = MAX(lo, MIN(hi, [self fFor:pt.x])), g = MAX(-12.0, MIN(12.0, [self gFor:pt.y]));
+    gEqF[_sel] = (float)f; gEqG[_sel] = (float)g; gEqVer++;
+    [self setNeedsDisplay]; if (self.onLive) self.onLive(_sel); return YES;
+}
+- (void)endTrackingWithTouch:(UITouch *)t withEvent:(UIEvent *)e { _sel = -1; [self setNeedsDisplay]; if (self.onEnd) self.onEnd(); }
+- (void)cancelTrackingWithEvent:(UIEvent *)e { _sel = -1; [self setNeedsDisplay]; if (self.onEnd) self.onEnd(); }
+@end
+
 @interface RYPanel : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate, UIColorPickerViewControllerDelegate>
 @property (nonatomic) NSInteger tab;
 @property (nonatomic, strong) UIStackView *stack;
@@ -2971,10 +3101,10 @@ static void RYMsgLoopSet(BOOL on) {
     UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
     UIStackView *head = RYHStack(@[title, spacer, close], 8);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat")];
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation")];
     // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @4];
-    if (self.tab < 0 || self.tab > 4) self.tab = 0;
+    NSArray<NSNumber *> *order = @[@0, @5, @1, @2, @3, @4];
+    if (self.tab < 0 || self.tab > 5) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -3004,7 +3134,7 @@ static void RYMsgLoopSet(BOOL on) {
         [self.stack.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor constant:-32]]];
 
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; default: [self renderBG]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; default: [self renderBG]; }
 }
 #pragma mark Locked
 - (void)renderLocked {
@@ -3325,6 +3455,18 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 }
 
 #pragma mark Diag
+- (void)renderEQ {
+    __weak typeof(self) ws = self;
+    UIButton *on = RYBtn(T(@"الإيكولايزر", @"Equalizer"), gEqOn != 0, ^{ RYEqSetOn(!gEqOn); [ws rebuild]; });
+    RYEQView *gv = [[RYEQView alloc] initWithFrame:CGRectMake(0, 0, 300, 260)]; [gv.heightAnchor constraintEqualToConstant:260].active = YES;
+    UILabel *st = RYLabel(@" ", 13, UIFontWeightMedium, RY_MUTED);
+    gv.onLive = ^(int b) { st.text = [NSString stringWithFormat:@"%.0f Hz    %+.1f dB", gEqF[b], gEqG[b]]; };
+    gv.onEnd = ^{ RYEqSave(); };
+    [self.stack addArrangedSubview:RYCard(@[on, gv, st])];
+    [self.stack addArrangedSubview:RYSlider(T(@"المستوى (Preamp)", @"Preamp"), -12, 12, gEqPre, ^(float v) { gEqPre = v; gEqVer++; CS(@"eqPre", @(v)); })];
+    [self.stack addArrangedSubview:RYBtn(T(@"رجوع للافتراضي", @"Reset"), NO, ^{ RYEqReset(); [ws rebuild]; })];
+    [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
+}
 - (void)renderCat {
     __weak typeof(self) ws = self; BOOL on = [CF(@"cat", @YES) boolValue];
     UIButton *b = RYBtn(T(@"القطوة", @"Cat"), on, ^{ RYCatSet(![CF(@"cat", @YES) boolValue]); [ws rebuild]; });   // purple = on, grey = off
