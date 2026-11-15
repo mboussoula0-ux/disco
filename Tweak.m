@@ -104,6 +104,9 @@
 //   the real state JS sent last) so the toggle takes effect without rejoining. Gateway socket id = any outgoing op 4 frame or the incoming VOICE_STATE_UPDATE. send:forSocketID: takes the socket id as a DOUBLE (not an object): hooking it with an `id` parameter
 //   corrupted every outgoing gateway frame incl. heartbeats (voice dropped after ~40 s) -> fixed, RYWsSendOutD/RYWsSendOutO. Not persisted.
 //
+// 6d. CHAT TEXT COLOUR: only the colour the owner picks (txtMode == "custom", txtColor). There is NO automatic contrast / wallpaper luminance / username-colour copy
+//   any more (it made white-on-white text). RYTextTarget() returns nil unless custom; do not add an automatic mode back unless the owner asks.
+//
 // 7. CODE MAP (search the #pragma mark lines)
 //   Config/storage (CF/CS, RYDir = Documents/8ubah), language T(ar,en), UI helpers (RYCard/RYBtn/...), view discovery (RYFindVC, RYAppWindows),
 //   background view + clearing (RYBGView, RYClear*), mic/stereo, voice hooks, message logger, Discord helpers (RYChatHost, RYLowestInput,
@@ -1487,11 +1490,11 @@ static CGFloat RYBGLum(void) {
     CGFloat dim = [CF(@"dim", @30) floatValue] / 100.0 * 0.9;
     return l * (1 - dim);
 }
+// Message text colour: ONLY the colour the owner picked ("custom"). No automatic contrast, nothing is read from the wallpaper or from other labels:
+// every other state (default, off, or an old saved "auto") returns nil = the app's own colours stay untouched.
 static UIColor *RYTextTarget(void) {
-    NSString *mode = CF(@"txtMode", @"auto");
-    if ([mode isEqual:@"off"]) return nil;
-    if ([mode isEqual:@"custom"]) return RYHex(CF(@"txtColor", @"#FFFFFF"));
-    return RYBGLum() > 0.5 ? UIColor.blackColor : UIColor.whiteColor;
+    if (![CF(@"txtMode", @"off") isEqual:@"custom"]) return nil;
+    return RYHex(CF(@"txtColor", @"#FFFFFF"));
 }
 // only plain/greyish text is recoloured: mentions, links, role colours, red/green etc. keep their own colour
 static BOOL RYIsGreyish(UIColor *c) {
@@ -2264,8 +2267,7 @@ static void RYDecorateCell(UITableViewCell *cell, id vm) {
     id lab = RYKV(cell, @"contentLabel");
     if ([lab isKindOfClass:UIView.class]) {
         if (del) RYTintYY(lab, RY_RED, YES);
-        else if (gBgActive) { UIColor *tc = RYTextTarget(); if (tc) RYTintYY(lab, tc, NO); }
-        else { UILabel *uname = RYFindUsernameLabel(cell.contentView, (UIView *)lab, 0); if (uname.textColor) RYTintYY(lab, uname.textColor, NO); }
+        else { UIColor *tc = RYTextTarget(); if (tc) RYTintYY(lab, tc, NO); }      // the picked colour only, never automatic
     }
 }
 static void RYCellCfg(id self, SEL _cmd, id vm, id pool, id am) {
@@ -3054,13 +3056,15 @@ static void RYMsgLoopSet(BOOL on) {
 
     [self.stack addArrangedSubview:RYSlider(T(@"التمويه (Blur)", @"Blur"), 0, 100, [CF(@"blur", @0) floatValue], ^(float v) { CS(@"blur", @(v)); [[RYCore shared] bump]; })];
     [self.stack addArrangedSubview:RYSlider(T(@"التعتيم (Dim)", @"Dim"), 0, 100, [CF(@"dim", @30) floatValue], ^(float v) { CS(@"dim", @(v)); [[RYCore shared] bump]; })];
-    { NSString *tm = CF(@"txtMode", @"auto");
-      UIButton *tA = RYBtn(T(@"تلقائي", @"Auto"), [tm isEqual:@"auto"], ^{ CS(@"txtMode", @"auto"); [[RYCore shared] bump]; [ws rebuild]; });
+    { NSString *tm = CF(@"txtMode", @"off"); if (![tm isEqual:@"custom"]) tm = @"off";
       UIButton *tC = RYBtn(T(@"لون مخصص", @"Custom"), [tm isEqual:@"custom"], ^{
           ws.pickPurpose = @"txt"; UIColorPickerViewController *cp = [UIColorPickerViewController new]; cp.delegate = ws; cp.supportsAlpha = NO;
           cp.selectedColor = RYHex(CF(@"txtColor", @"#FFFFFF")); [ws presentViewController:cp animated:YES completion:nil]; });
-      UIButton *tO = RYBtn(T(@"بدون", @"Off"), [tm isEqual:@"off"], ^{ CS(@"txtMode", @"off"); [[RYCore shared] bump]; [ws rebuild]; });
-      [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"لون كلام الناس", @"Message text colour"), 15, UIFontWeightBold, nil), RYHStack(@[tA, tC, tO], 8)])]; }
+      UIButton *tO = RYBtn(T(@"افتراضي", @"Default"), [tm isEqual:@"off"], ^{
+          CS(@"txtMode", @"off"); [[RYCore shared] bump]; [ws rebuild];
+          dispatch_async(dispatch_get_main_queue(), ^{ UIView *h = RYChatHost(); if (!h) return; NSMutableArray *tabs = [NSMutableArray new]; RYCollectTables(h, tabs, 0); for (UITableView *tv in tabs) [tv reloadData]; });   // cells already tinted get the app's own colours back
+      });
+      [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"لون كلام الناس", @"Message text colour"), 15, UIFontWeightBold, nil), RYHStack(@[tC, tO], 8)])]; }
     [self.stack addArrangedSubview:RYBtn(T(@"رجوع للافتراضي", @"Reset to default"), NO, ^{
         [ws setBG:@"none" value:@""]; CS(@"blur", @0); CS(@"dim", @30); CS(@"txtMode", nil); CS(@"txtColor", nil); [ws rebuild]; [ws toast:T(@"تم الرجوع للافتراضي", @"Reset")];
     })];
