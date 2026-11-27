@@ -4366,7 +4366,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // step. We only rewrite (and drop the stale cache) when the stored URL differs, so later launches reuse
 // the cached bundle and stay fast/offline. Do NOT add a second JS loader here: BTLoader already hooks the
 // RN bridge, and injecting the bundle twice would crash Discord.
-#define RY_PLUGIN_BUNDLE_URL @"https://raw.githubusercontent.com/mboussoula0-ux/displug/dist/8ubah.min.js"
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@dist/8ubah.min.js"
 
 static void RYConfigurePluginLoader(void) {
     @try {
