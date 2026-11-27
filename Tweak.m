@@ -507,7 +507,7 @@ static void RYShowIntro(UIWindowScene *scene) {
     [box.widthAnchor constraintEqualToConstant:96].active = YES; [box.heightAnchor constraintEqualToConstant:96].active = YES;
     UILabel *word = RYLabel(@"8ubah", 34, UIFontWeightHeavy, UIColor.whiteColor); word.textAlignment = NSTextAlignmentCenter;
     UILabel *sub = [UILabel new]; sub.textAlignment = NSTextAlignmentCenter;
-    sub.attributedText = [[NSAttributedString alloc] initWithString:@"DISCORD MOD" attributes:@{NSKernAttributeName: @5, NSForegroundColorAttributeName: RY_MUTED, NSFontAttributeName: [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold]}];
+    sub.attributedText = [[NSAttributedString alloc] initWithString:@"discord.gg/ulp" attributes:@{NSKernAttributeName: @1, NSForegroundColorAttributeName: RYAccent(), NSFontAttributeName: [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold]}];
     UIStackView *col = RYVStack(@[box, word, sub], 14); col.alignment = UIStackViewAlignmentCenter;
     [root addSubview:col]; col.translatesAutoresizingMaskIntoConstraints = NO;
     [NSLayoutConstraint activateConstraints:@[[col.centerXAnchor constraintEqualToAnchor:root.centerXAnchor], [col.centerYAnchor constraintEqualToAnchor:root.centerYAnchor]]];
@@ -966,11 +966,15 @@ static const RYEqPreset kEqPresets[] = {
     {"Broadcast",     {70, 120, 220, 400, 800, 1600, 3000, 5000, 9000, 14000}, {-5.f, 2.5f, 1.5f, -2.0f, 0, 1.0f, 2.5f, 1.0f, -1.0f, 1.5f}, {0.7f, 1.0f, 1.0f, 1.2f, 1.0f, 1.0f, 1.1f, 1.0f, 1.0f, 0.7f}, {1, 0, 0, 0, 0, 0, 0, 0, 0, 2}},
     {"Crystal Clear", {60, 120, 250, 500, 1000, 2000, 3500, 6000, 10000, 15000}, {-6.f, -2.0f, -1.5f, -2.0f, 0, 2.0f, 3.5f, 2.5f, 2.0f, 3.0f}, {0.7f, 1.0f, 1.2f, 1.0f, 1.0f, 1.0f, 1.2f, 1.0f, 1.0f, 0.7f}, {1, 0, 0, 0, 0, 0, 0, 0, 0, 2}},
     {"Deep Voice",    {60, 100, 160, 300, 600, 1200, 2400, 4800, 9000, 14000}, {2.0f, 4.5f, 3.0f, 0.5f, -1.0f, -1.0f, 0.5f, 1.0f, 0, 0}, {0.7f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 0.7f}, {1, 0, 0, 0, 0, 0, 0, 0, 0, 2}},
+    {"فضي 1",         {31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000}, {1, 2, 2, 1, -2, 4, 5, 6, 5, 5}, {1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f}, {0,0,0,0,0,0,0,0,0,0}},
+    {"فضي 2",         {31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000}, {6, 10, 12, 12, 0, -3, 1, 4, 5, 5}, {1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f}, {0,0,0,0,0,0,0,0,0,0}},
+    {"فضي 3",         {31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000}, {-1, -2, -2, -3, -12, 12, 12, 12, 12, 12}, {1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f,1.1f}, {0,0,0,0,0,0,0,0,0,0}},
 };
 #define RY_NEQP ((int)(sizeof(kEqPresets) / sizeof(kEqPresets[0])))
 static volatile long long gMicCallsA = 0, gMicCallsU = 0, gMicCallsT = 0, gMicProc = 0;
 static volatile int gMicRebound = 0, gMicWrapped = 0, gMicTapInst = 0;
-static volatile int gMicDist = 0, gMicRev = 0, gMonOn = 0;
+static volatile int gMicDist = 0, gMonOn = 0;
+static volatile int gRevMic = 0, gRevSong = 0; // Haunted Cavern echo amount 0-100: separate for mic voice and for the stereo/song file
 static volatile int gMicMute = 0; // "سكر صوتي": hard-silences the mic no matter what else is on
 
 // ---- Stereo: play an imported audio/video file through the mic instead of the real voice (kill-mic still overrides it, see RYMicFx)
@@ -1044,10 +1048,11 @@ static void RYStDecode(NSURL *u, void (^done)(BOOL ok, NSString *msg)) {
     });
 }
 
-#define RY_FX_ON (RYFeatureOK("fx") && (gMicOn || gMicDist || gMicRev || gMicMute || gStOn || gEqOn || RY_STUDIO))   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
+#define RY_FX_ON (RYFeatureOK("fx") && (gMicOn || gMicDist || gRevMic || gMicMute || gStOn || gEqOn || RY_STUDIO))   // the "Silver" effects (amplifier, silver echo) work on their own, without the voice-changer switch; Stereo file playback also needs the pipeline live
 enum { RV_DRY, RV_ELVL, RV_ESEND, RV_LLVL, RV_SIZE, RV_PRE, RV_DECAY, RV_DIFF, RV_SPIN, RV_WANDER, RV_HC, RV_EDAMP, RV_LDAMP, RV_LC, RV_LB, RV_BF, RV_N };
-static const float kRvDef[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600}; // the Dragonfly Room Reverb values from the screenshot
-static volatile float gRv[RV_N] = {46, 69, 69, 69, 32, 100, 10, 0, 0, 40, 16000, 16000, 9400, 137, 100, 600};
+// Haunted Cavern voicing (SB0490 "silver card" EAX preset): big dark cave, long tail, slow modulation for the eerie shimmer. Fixed; only the amount is exposed.
+static const float kRvDef[RV_N] = {100, 42, 85, 92, 60, 70, 7.0f, 78, 0.6f, 50, 6000, 6500, 6500, 150, 40, 110}; // Haunted Cavern: long lingering tail (RT60~5.4s)
+static volatile float gRv[RV_N]  = {100, 42, 85, 92, 60, 70, 7.0f, 78, 0.6f, 50, 6000, 6500, 6500, 150, 40, 110};
 static volatile float gDistGain = 1000.f, gDistOut = 0.7f, gDistGate = 0.0018f; // amplifier: +60 dB, -3 dB out, gate at -55 dB
 static char gMicFmt[96] = "-"; static char gMicLast[200] = "-"; static volatile long long gMicSkip = 0; static volatile double gMicHWRate = 48000;
 
@@ -1192,10 +1197,20 @@ static inline float RYComp(float x, RYVS *s, const RYStC *c) {
     return x * exp2f(gdb * 0.16609640f);
 }
 // pitch shift = two read taps on a delay line that slides at (1 - ratio) samples per sample, cross-faded with a Hann window
+static inline float RYRevAmt(int amt) { if (amt <= 0) return 0.f; if (amt > 100) amt = 100; return powf((float)amt / 100.f, 0.45f); }
+static RYVS gSongVS;
+static void RYCavern(float *x, int n, double sr, RYVS *s, int amount) {
+    if (amount <= 0) return;
+    if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; }
+    RYRevC rc; RYRevPrep(&rc, sr);
+    float a = RYRevAmt(amount); rc.dry = 1.f; rc.elv *= a; rc.llv *= a;
+    for (int i = 0; i < n; i++) { float y = RYRev(x[i], s, &rc); if (y > 1.f) y = 1.f; else if (y < -1.f) y = -1.f; x[i] = y; }
+}
 static void RYVoiceBlock(float *x, int n, double sr, RYVS *s) {
     if (s->sr != sr) { memset(s, 0, sizeof(RYVS)); s->sr = sr; s->d1 = (float)(0.016 * sr); }
     if (gMicMute) { memset(x, 0, (size_t)n * sizeof(float)); return; } // overrides everything else, on purpose
-    const int W = (int)(0.032 * sr); const int revOn = gMicRev; RYRevC rc; if (revOn) RYRevPrep(&rc, sr);
+    const int W = (int)(0.032 * sr); const int revAmt = gRevMic, revOn = revAmt > 0; RYRevC rc;
+    if (revOn) { RYRevPrep(&rc, sr); float a = RYRevAmt(revAmt); rc.dry = 1.f; rc.elv *= a; rc.llv *= a; }
     const int mst = gMicOn; // pitch / voice / echo / mic level belong to the main switch; amplifier and silver echo have their own
     const float semi = mst ? gMicSemi : 0.f, echo = mst ? gMicEcho : 0.f, gain = mst ? gMicGain : 1.f; const int mode = mst ? gMicMode : 0;
     const float dd = 1.f - powf(2.f, semi / 12.f);
@@ -1312,7 +1327,22 @@ typedef struct { AURenderCallback proc; void *ref; AudioUnit au; AudioStreamBasi
 static OSStatus RYPlayCB(void *ref, AudioUnitRenderActionFlags *fl, const AudioTimeStamp *ts, UInt32 bus, UInt32 n, AudioBufferList *io) {
     RYPbCtx *c = (RYPbCtx *)ref; OSStatus r = c->proc(c->ref, fl, ts, bus, n, io);
     if (r != noErr || !gRecOn || !io) return r;
-    if (!c->have) { UInt32 sz = sizeof c->f; memset(&c->f, 0, sizeof c->f); if (AudioUnitGetProperty(c->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &c->f, &sz) == noErr && c->f.mSampleRate > 0) c->have = 1; else return r; }
+    if (!c->have) {
+        UInt32 sz = sizeof c->f; memset(&c->f, 0, sizeof c->f);
+        BOOL got = AudioUnitGetProperty(c->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &c->f, &sz) == noErr && c->f.mSampleRate > 0;
+        if (!got) { sz = sizeof c->f; memset(&c->f, 0, sizeof c->f); got = AudioUnitGetProperty(c->au, kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 0, &c->f, &sz) == noErr && c->f.mSampleRate > 0; }
+        if (!got) { // the property wasn't available: infer the format from the buffer the callback just filled, so room audio is still captured
+            memset(&c->f, 0, sizeof c->f);
+            BOOL planar = io->mNumberBuffers > 1; UInt32 bch = planar ? io->mNumberBuffers : (io->mBuffers[0].mNumberChannels ? io->mBuffers[0].mNumberChannels : 1);
+            UInt32 bpf = n ? io->mBuffers[0].mDataByteSize / n : 0; BOOL isF = planar ? (bpf >= 4) : (bpf >= 4u * bch); // 4 bytes/frame/chan => float32, else int16
+            double ssr = AVAudioSession.sharedInstance.sampleRate; if (ssr < 4000) ssr = 48000;
+            c->f.mSampleRate = ssr; c->f.mFormatID = kAudioFormatLinearPCM; c->f.mChannelsPerFrame = bch ? bch : 1; c->f.mFramesPerPacket = 1;
+            c->f.mBitsPerChannel = isF ? 32 : 16; c->f.mFormatFlags = isF ? (kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked) : (kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked);
+            if (planar) c->f.mFormatFlags |= kAudioFormatFlagIsNonInterleaved;
+            UInt32 bytes = isF ? 4 : 2; c->f.mBytesPerFrame = planar ? bytes : bytes * c->f.mChannelsPerFrame; c->f.mBytesPerPacket = c->f.mBytesPerFrame;
+        }
+        c->have = 1;
+    }
     if (fl && (*fl & kAudioUnitRenderAction_OutputIsSilence)) return r;
     RYRecPlayTap(&c->f, n, io); return r;
 }
@@ -1427,6 +1457,7 @@ static inline void RYMicFx(float *t, int c, double sr, RYVS *s) {
             memcpy(tmp, t + done, (size_t)n * sizeof(float));
             RYVoiceBlock(tmp, n, sr, s);                 // tmp = your real voice, exactly as it would normally sound (silence if muted)
             RYStFeed(t + done, n, sr);                    // t[] = the Stereo file, always at full clarity
+            if (gRevSong > 0) RYCavern(t + done, n, sr, &gSongVS, gRevSong); // songs get the Haunted Cavern echo at their own amount
             if (gStMon && !gMonOn) RYMonPush(t + done, n, sr); // I hear the file itself, at the same moment the room does (when "Hear my voice" is on, the mixed signal below is monitored instead)
             for (int i = 0; i < n; i++) { float v = t[done + i] + tmp[i] * 0.55f; t[done + i] = v > 1.f ? 1.f : (v < -1.f ? -1.f : v); }
             done += n;
@@ -1683,11 +1714,10 @@ static void RYMicLoad(void) {
     dispatch_async(dispatch_get_main_queue(), ^{ double r = AVAudioSession.sharedInstance.sampleRate; if (r > 0) gMicHWRate = r; });
     gMicOn = [CF(@"micOn", @NO) boolValue]; gMicPreset = [CF(@"micPreset", @0) intValue]; gMicSemi = [CF(@"micSemi", @0) floatValue];
     gMicMode = [CF(@"micMode", @0) intValue]; gMicEcho = [CF(@"micEcho", @0) floatValue]; gMicGain = [CF(@"micGain", @1) floatValue];
-    gMicDist = [CF(@"micDist", @NO) boolValue]; gMicRev = [CF(@"micRev", @NO) boolValue]; gMicMute = 0; // never restore "on": always starts unmuted so it's never silently stuck
+    gMicDist = [CF(@"micDist", @NO) boolValue]; gMicMute = 0; // never restore "on": always starts unmuted so it's never silently stuck
+    gRevMic = [CF(@"revMic", @0) intValue]; gRevSong = [CF(@"revSong", @0) intValue];
     gStLoop = [CF(@"stLoop", @NO) boolValue]; gStVol = [CF(@"stVol", @1.0) floatValue]; gStMon = [CF(@"stMon", @YES) boolValue];
-    { NSArray *rc = CF(@"revCfg", nil); // the saved echo settings only count if they were saved with the current defaults (version 2); otherwise start from the Dragonfly values
-      if ([CF(@"revCfgVer", @0) intValue] == 2 && [rc isKindOfClass:NSArray.class] && rc.count == RV_N) for (int i = 0; i < RV_N; i++) gRv[i] = [rc[i] floatValue];
-      else { NSMutableArray *d = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) { gRv[i] = kRvDef[i]; [d addObject:@(kRvDef[i])]; } CS(@"revCfg", d); CS(@"revCfgVer", @2); } }
+    for (int i = 0; i < RV_N; i++) gRv[i] = kRvDef[i]; // echo voicing is fixed (Haunted Cavern); only the amount is user-set
     gDistGain = powf(10.f, [CF(@"distDb", @60) floatValue] / 20.f); gDistOut = powf(10.f, [CF(@"distOutDb", @-3) floatValue] / 20.f); gDistGate = powf(10.f, [CF(@"distGateDb", @-55) floatValue] / 20.f);
     gIsoOn = [CF(@"isoOn", @YES) boolValue]; gIsoVP = gIsoOn ? 1 : 0; gIsoSess = gIsoRTC = 0; // switch in the Mic tab. Session-mode override + RTC constraints are never used (they can stop a voice join)
     gEqOn = [CF(@"eqOn", @NO) boolValue]; gEqPre = [CF(@"eqPre", @0) floatValue];
@@ -1824,11 +1854,9 @@ static void RYEqImportLink(NSString *link, NSString *forcedName, void (^done)(NS
 }
 static void RYMicSetOn(BOOL on) { gMicOn = on; CS(@"micOn", @(on)); }
 static void RYMicSetDist(BOOL on) { gMicDist = on; CS(@"micDist", @(on)); }
-static void RYMicSetRev(BOOL on) { gMicRev = on; CS(@"micRev", @(on)); }
+static void RYSetRevMic(int v) { if (v < 0) v = 0; if (v > 100) v = 100; gRevMic = v; CS(@"revMic", @(v)); }
+static void RYSetRevSong(int v) { if (v < 0) v = 0; if (v > 100) v = 100; gRevSong = v; CS(@"revSong", @(v)); }
 static void RYMicSetMute(BOOL on) { gMicMute = on; } // not persisted on purpose (see RYInit note)
-static void RYRevSave(void) { NSMutableArray *a = [NSMutableArray new]; for (int i = 0; i < RV_N; i++) [a addObject:@(gRv[i])]; CS(@"revCfg", a); CS(@"revCfgVer", @2); }
-static BOOL RYRevIsDefault(void) { for (int i = 0; i < RV_N; i++) if (fabsf(gRv[i] - kRvDef[i]) > 0.0005f) return NO; return YES; }
-static NSString *RYRevStateText(void) { return RYRevIsDefault() ? T(@"الافتراضي ✓", @"Default ✓") : T(@"معدّل", @"Changed"); }
 static void RYIsoPushNow(void);
 static void RYMicSetIso(BOOL on) {
     gIsoOn = on ? 1 : 0; gIsoVP = gIsoOn; gIsoSess = gIsoRTC = 0; CS(@"isoOn", @(on));
@@ -1853,7 +1881,7 @@ static NSString *RYMicStatus2(void) {
 }
 static NSString *RYMicReport(void) {
     return [NSString stringWithFormat:@"mic voice changer\non=%d preset=%d semi=%.1f mode=%d echo=%.2f gain=%.2f dist=%d reverb=%d monitor=%d\nroute A (AudioUnitRender bus 1): calls=%lld, images rebound=%d\nroute U (AUAudioUnit renderBlock): calls=%lld, blocks wrapped=%d\nroute T (AVAudioEngine input tap): calls=%lld, taps installed=%d\nframes processed=%lld (skipped calls=%lld)\nformat=%s\nlast buffer: %s\nhw sample rate=%.0f\nisolation removal: session=%d (forced %lld) vpio=%d (bypassed %lld, failed %lld, engine %lld) webrtc=%d (rewritten %lld)\n",
-        gMicOn, gMicPreset, gMicSemi, gMicMode, gMicEcho, gMicGain, gMicDist, gMicRev, gMonOn, gMicCallsA, gMicRebound, gMicCallsU, gMicWrapped, gMicCallsT, gMicTapInst, (long long)gMicProc, (long long)gMicSkip, gMicFmt, gMicLast, gMicHWRate, gIsoSess, gIsoSessN, gIsoVP, gIsoVPN, gIsoVPFail, gIsoEngN, gIsoRTC, gIsoRTCN];
+        gMicOn, gMicPreset, gMicSemi, gMicMode, gMicEcho, gMicGain, gMicDist, gRevMic, gMonOn, gMicCallsA, gMicRebound, gMicCallsU, gMicWrapped, gMicCallsT, gMicTapInst, (long long)gMicProc, (long long)gMicSkip, gMicFmt, gMicLast, gMicHWRate, gIsoSess, gIsoSessN, gIsoVP, gIsoVPN, gIsoVPFail, gIsoEngN, gIsoRTC, gIsoRTCN];
 }
 
 // minimal symbol-pointer rebinding (same idea as fishhook)
@@ -3847,6 +3875,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     [self.stack addArrangedSubview:RYCard(@[pos, tlab])];
     [self startStUI];
     [self.stack addArrangedSubview:RYSlider(T(@"مستوى الصوت", @"Volume"), 0, 2, gStVol, ^(float v) { gStVol = v; CS(@"stVol", @(v)); })];
+    [self.stack addArrangedSubview:RYSliderV(T(@"الصدى (كهف مسكون)", @"Echo (Haunted Cavern)"), @"", 0, 100, (float)gRevSong, NO, 0, ^(float v) { RYSetRevSong((int)lroundf(v)); })];
     NSArray *clips = CF(@"stClips", @[]);
     if (clips.count) {
         NSMutableArray *rows = [NSMutableArray arrayWithObject:RYLabel(T(@"الاختصارات المحفوظة", @"Saved shortcuts"), 16, UIFontWeightBold, nil)];
@@ -3955,11 +3984,9 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     [self.stack addArrangedSubview:RYSlider(T(@"مستوى المايك", @"Mic level"), 0.5, 2, gMicGain, ^(float v) { gMicGain = v; CS(@"micGain", @(v)); })];
     UISwitch *s1 = [UISwitch new]; s1.on = gMicDist != 0; s1.onTintColor = RYAccent(); __weak UISwitch *ws1 = s1;
     [s1 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetDist(ws1.on); }] forControlEvents:UIControlEventValueChanged];
-    UISwitch *s2 = [UISwitch new]; s2.on = gMicRev != 0; s2.onTintColor = RYAccent(); __weak UISwitch *ws2 = s2;
-    [s2 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetRev(ws2.on); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYSection(@"sparkles", T(@"فضي", @"Silver"), nil),
-        RYHStack(@[RYLabel(T(@"مضخم", @"Amplifier"), 14, UIFontWeightMedium, nil), s1], 12),
-        RYHStack(@[RYLabel(T(@"صدى فضي", @"Silver echo"), 14, UIFontWeightMedium, nil), s2], 12)])];
+        RYHStack(@[RYLabel(T(@"مضخم", @"Amplifier"), 14, UIFontWeightMedium, nil), s1], 12)])];
+    [self.stack addArrangedSubview:RYSliderV(T(@"الصدى (كهف مسكون)", @"Echo (Haunted Cavern)"), @"", 0, 100, (float)gRevMic, NO, 0, ^(float v) { RYSetRevMic((int)lroundf(v)); })];
     UISwitch *s3 = [UISwitch new]; s3.on = gMonOn != 0; s3.onTintColor = RYAccent(); __weak UISwitch *ws3 = s3;
     [s3 addAction:[UIAction actionWithHandler:^(UIAction *a) { if (ws3.on) RYMonStart(); else RYMonStop(); }] forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:RYCard(@[RYSection(@"ear.fill", T(@"اسمع صوتي", @"Hear my voice"), s3)])];
@@ -3968,25 +3995,6 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     [self.stack addArrangedSubview:RYSliderV(T(@"التضخيم", @"Gain"), @"dB", 0, 120, [CF(@"distDb", @60) floatValue], NO, 0, ^(float v) { gDistGain = powf(10.f, v / 20.f); CS(@"distDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"مستوى الخروج", @"Output"), @"dB", -30, 0, [CF(@"distOutDb", @-3) floatValue], NO, 0, ^(float v) { gDistOut = powf(10.f, v / 20.f); CS(@"distOutDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"عتبة الكتم", @"Gate"), @"dB", -80, -30, [CF(@"distGateDb", @-55) floatValue], NO, 0, ^(float v) { gDistGate = powf(10.f, v / 20.f); CS(@"distGateDb", @(v)); })];
-    // ---- room reverb settings (every control of Dragonfly Room Reverb that matters for a mono voice)
-    UILabel *rvState = RYLabel(RYRevStateText(), 12, UIFontWeightMedium, RY_MUTED); __weak UILabel *wst = rvState;
-    void (^rvReset)(void) = ^{ for (int i = 0; i < RV_N; i++) gRv[i] = kRvDef[i]; RYRevSave(); [ws rebuild]; [ws toast:T(@"رجعت القيم الافتراضية", @"Defaults restored")]; };
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات الصدى (Dragonfly)", @"Echo settings (Dragonfly)"), 15, UIFontWeightBold, nil),
-        rvState, RYBtn(T(@"رجّع الافتراضي", @"Reset to default"), YES, rvReset)])];
-    struct { int i; const char *ar, *en, *u; float mn, mx; BOOL lg; int d; } rv[] = {
-        {RV_DRY, "الصوت الأصلي", "Dry Level", "%", 0, 100, NO, 0}, {RV_ELVL, "الانعكاسات المبكرة", "Early Level", "%", 0, 100, NO, 0},
-        {RV_ESEND, "إرسال المبكر للذيل", "Early Send", "%", 0, 100, NO, 0}, {RV_LLVL, "الذيل", "Late Level", "%", 0, 100, NO, 0},
-        {RV_SIZE, "حجم الغرفة", "Size", "m", 8, 60, NO, 0}, {RV_PRE, "التأخير الأولي", "Predelay", "ms", 0, 300, NO, 0},
-        {RV_DECAY, "مدة الصدى", "Decay", "s", 0.1f, 20, NO, 1}, {RV_DIFF, "الانتشار", "Diffuse", "%", 0, 100, NO, 0},
-        {RV_SPIN, "سرعة التذبذب", "Spin", "Hz", 0, 5, NO, 2}, {RV_WANDER, "التجوال", "Wander", "%", 0, 100, NO, 0},
-        {RV_HC, "قطع الأعلى", "High Cut", "Hz", 2000, 20000, YES, 0}, {RV_EDAMP, "كتم المبكر", "Early Damp", "Hz", 2000, 20000, YES, 0},
-        {RV_LDAMP, "كتم الذيل", "Late Damp", "Hz", 2000, 20000, YES, 0}, {RV_LC, "قطع الأدنى", "Low Cut", "Hz", 20, 1000, YES, 0},
-        {RV_LB, "تعزيز الباص", "Low Boost", "%", 0, 200, NO, 0}, {RV_BF, "تردد التعزيز", "Boost Freq", "Hz", 100, 2000, YES, 0}};
-    for (size_t q = 0; q < sizeof rv / sizeof rv[0]; q++) {
-        int ix = rv[q].i;
-        [self.stack addArrangedSubview:RYSliderV(T([NSString stringWithUTF8String:rv[q].ar], [NSString stringWithUTF8String:rv[q].en]), [NSString stringWithUTF8String:rv[q].u], rv[q].mn, rv[q].mx, gRv[ix], rv[q].lg, rv[q].d, ^(float v) { gRv[ix] = v; RYRevSave(); wst.text = RYRevStateText(); })];
-    }
-    [self.stack addArrangedSubview:RYCard(@[RYBtn(T(@"رجّع الافتراضي (الصدى)", @"Reset echo to default"), NO, rvReset)])];
     self.invLabel = RYLabel(RYMicStatus2(), 13, UIFontWeightMedium, RY_MUTED);
     [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYBtn(T(@"نسخ تشخيص المايك", @"Copy mic diagnostics"), NO, ^{ UIPasteboard.generalPasteboard.string = RYMicReport(); [ws toast:T(@"اننسخ", @"Copied")]; })])];
     [self.invUI invalidate];
@@ -4205,7 +4213,14 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
     UIViewController *root = [UIViewController new]; root.view.backgroundColor = UIColor.clearColor; self.win.rootViewController = root; self.win.hidden = NO;
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom]; b.frame = CGRectMake(0, 0, 52, 52); b.layer.cornerRadius = 26;
     b.backgroundColor = RYAccent(); b.tintColor = UIColor.whiteColor; b.layer.shadowOpacity = 0.4; b.layer.shadowRadius = 6; b.layer.shadowOffset = CGSizeMake(0, 3);
-    [b setImage:[UIImage systemImageNamed:@"slider.horizontal.3"] forState:UIControlStateNormal];
+    // floating button mark: a soft rounded "R" with a small gold crown on top
+    UIFontDescriptor *rdsc = [[UIFont systemFontOfSize:23 weight:UIFontWeightHeavy].fontDescriptor fontDescriptorWithDesign:UIFontDescriptorSystemDesignRounded];
+    UILabel *rl = [UILabel new]; rl.text = @"R"; rl.textColor = UIColor.whiteColor; rl.textAlignment = NSTextAlignmentCenter;
+    rl.font = rdsc ? [UIFont fontWithDescriptor:rdsc size:23] : [UIFont systemFontOfSize:23 weight:UIFontWeightHeavy];
+    rl.frame = CGRectMake(0, 5, 52, 52); rl.userInteractionEnabled = NO; [b addSubview:rl];
+    UIImageView *crown = [[UIImageView alloc] initWithImage:[[UIImage systemImageNamed:@"crown.fill"] imageWithConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightBold]]];
+    crown.tintColor = [UIColor colorWithRed:1.0 green:0.82 blue:0.28 alpha:1.0]; crown.contentMode = UIViewContentModeScaleAspectFit;
+    crown.frame = CGRectMake(16, 6, 20, 14); crown.userInteractionEnabled = NO; [b addSubview:crown];
     __weak typeof(self) ws = self; [b addAction:[UIAction actionWithHandler:^(UIAction *a) { [ws openPanel]; }] forControlEvents:UIControlEventTouchUpInside];
     [b addGestureRecognizer:[[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(pan:)]];
     CGSize sz = root.view.bounds.size;
