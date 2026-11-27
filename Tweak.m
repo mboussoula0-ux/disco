@@ -157,6 +157,22 @@
 #include <unistd.h>
 #include <signal.h>
 
+// =====================================================================================================================
+// 8ubah — OWNERSHIP WATERMARK  (do not remove; the owner asked for this)
+//   Proof of authorship, embedded in a dedicated Mach-O section so it survives in the built dylib and shows up in a
+//   plain `strings` scan even after renaming / re-signing. If a copy of this tweak is found in the wild, this marker
+//   identifies the original author. Keep the markers below in sync if the brand changes.
+// =====================================================================================================================
+__attribute__((used, section("__DATA,__8ubah")))
+static const char k8ubahOwner[] =
+    "8ubah :: original author & owner: rayan :: "
+    "this Discord audio tweak, its UI and its design system are the property of the 8ubah author. "
+    "unauthorized redistribution, resale, rebranding or key-cracking is prohibited. "
+    "tamper-marker:8UBAH-OWNER-RAYAN-v1";
+__attribute__((used, section("__DATA,__8ubah2")))
+static const char k8ubahOwner2[] = "8UBAH|OWNER|RAYAN|DISCORD-TWEAK|build-v1";
+#define RY_OWNER_TAG @"8ubah © rayan"
+
 #pragma mark - Config / storage
 
 #define RY_CFG @"ry.cfg.v1"
@@ -224,10 +240,15 @@ static UIColor *RYAccent(void) {
     NSArray *a = RYAccents(); if (i < 0 || i >= (NSInteger)a.count) i = 0;
     return RYHex(a[i]);
 }
-#define RY_BG RYHex(@"#0E1014")
-#define RY_CARD RYHex(@"#1A1D25")
-#define RY_CARD2 RYHex(@"#252A35")
-#define RY_MUTED RYHex(@"#8A90A0")
+// 8ubah design system — premium black & purple. Near-black canvas with a faint purple undertone, purple-tinted
+// surfaces, a hairline violet stroke on every card, and a bright accent reserved for interaction + glow.
+#define RY_BG     RYHex(@"#07060C")   // canvas: near-black, faint purple undertone
+#define RY_CARD   RYHex(@"#141220")   // card surface (purple-tinted charcoal)
+#define RY_CARD2  RYHex(@"#1E1A2E")   // raised surface / secondary buttons
+#define RY_MUTED  RYHex(@"#8E8CA8")   // secondary text
+#define RY_DIM    RYHex(@"#C3C1D4")   // tertiary / body text on dark
+#define RY_STROKE [UIColor colorWithRed:0.55 green:0.42 blue:1.0 alpha:0.14]   // hairline border on cards
+#define RY_GLOW   [UIColor colorWithRed:0.49 green:0.36 blue:1.0 alpha:1.0]    // purple used for soft glows
 
 static NSString *RYHash(NSString *s) {
     NSData *d = [[@"8ubah|" stringByAppendingString:s ?: @""] dataUsingEncoding:NSUTF8StringEncoding];
@@ -358,11 +379,155 @@ static UILabel *RYLabel(NSString *t, CGFloat sz, UIFontWeight w, UIColor *c) {
 }
 static UIButton *RYBtn(NSString *t, BOOL filled, void (^act)(void)) {
     UIButtonConfiguration *c = filled ? [UIButtonConfiguration filledButtonConfiguration] : [UIButtonConfiguration grayButtonConfiguration];
-    c.title = t; c.cornerStyle = UIButtonConfigurationCornerStyleMedium;
-    c.baseBackgroundColor = filled ? RYAccent() : RY_CARD2; c.baseForegroundColor = UIColor.whiteColor;
+    c.title = t; c.cornerStyle = UIButtonConfigurationCornerStyleLarge;
+    c.baseBackgroundColor = filled ? RYAccent() : RY_CARD2;
+    c.baseForegroundColor = filled ? UIColor.whiteColor : RY_DIM;
+    c.contentInsets = NSDirectionalEdgeInsetsMake(9, 16, 9, 16);
+    c.titleTextAttributesTransformer = [[UIConfigurationTextAttributesTransformer alloc] initWithTransformer:^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *a) {
+        NSMutableDictionary *m = [a mutableCopy]; m[NSFontAttributeName] = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold]; return m; }];
     UIButton *b = [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { if (act) act(); }]];
+    // touch feedback: a subtle press-in scale + dim, consistent on every button in the panel
+    b.configurationUpdateHandler = ^(UIButton *bb) {
+        bb.alpha = bb.isHighlighted ? 0.72 : 1.0;
+        bb.transform = bb.isHighlighted ? CGAffineTransformMakeScale(0.97, 0.97) : CGAffineTransformIdentity;
+    };
+    if (filled) { // soft purple glow under the primary action
+        b.layer.shadowColor = RYAccent().CGColor; b.layer.shadowOpacity = 0.45; b.layer.shadowRadius = 9;
+        b.layer.shadowOffset = CGSizeMake(0, 3); b.layer.masksToBounds = NO;
+    }
     b.semanticContentAttribute = RYSem();
     return b;
+}
+// icon-over-label tab button (top navigation). Selected = filled purple pill with glow; unselected = transparent + muted.
+static UIButton *RYIconTab(NSString *name, NSString *sym, BOOL sel, void (^act)(void)) {
+    UIButtonConfiguration *c = [UIButtonConfiguration filledButtonConfiguration];
+    c.title = name; c.image = [UIImage systemImageNamed:sym];
+    c.imagePlacement = NSDirectionalRectEdgeTop; c.imagePadding = 5;
+    c.preferredSymbolConfigurationForImage = [UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightSemibold];
+    c.cornerStyle = UIButtonConfigurationCornerStyleLarge;
+    c.baseBackgroundColor = sel ? RYAccent() : UIColor.clearColor;
+    c.baseForegroundColor = sel ? UIColor.whiteColor : RY_MUTED;
+    c.contentInsets = NSDirectionalEdgeInsetsMake(8, 14, 8, 14);
+    c.titleTextAttributesTransformer = [[UIConfigurationTextAttributesTransformer alloc] initWithTransformer:^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *a) {
+        NSMutableDictionary *m = [a mutableCopy]; m[NSFontAttributeName] = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold]; return m; }];
+    UIButton *b = [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { if (act) act(); }]];
+    if (sel) { b.layer.shadowColor = RYAccent().CGColor; b.layer.shadowOpacity = 0.5; b.layer.shadowRadius = 10; b.layer.shadowOffset = CGSizeMake(0, 3); b.layer.masksToBounds = NO; }
+    b.semanticContentAttribute = RYSem();
+    return b;
+}
+// card section header: small accent icon + bold title + optional trailing accessory (switch / menu button).
+static UIStackView *RYSection(NSString *sym, NSString *title, UIView *trailing) {
+    UIImageView *icon = [[UIImageView alloc] initWithImage:[UIImage systemImageNamed:sym]];
+    icon.tintColor = RYAccent(); icon.contentMode = UIViewContentModeScaleAspectFit;
+    [icon.widthAnchor constraintEqualToConstant:20].active = YES; [icon.heightAnchor constraintEqualToConstant:20].active = YES;
+    UILabel *l = RYLabel(title, 16, UIFontWeightBold, nil); l.numberOfLines = 1;
+    UIView *spacer = [UIView new]; [spacer setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
+    NSMutableArray *row = [@[icon, l, spacer] mutableCopy]; if (trailing) [row addObject:trailing];
+    return RYHStack(row, 10);
+}
+// a styled on/off switch wired to a handler, accent-tinted.
+static UISwitch *RYSwitch(BOOL on, UIColor *tint, void (^chg)(BOOL)) {
+    UISwitch *s = [UISwitch new]; s.on = on; s.onTintColor = tint ?: RYAccent();
+    __weak UISwitch *w = s;
+    [s addAction:[UIAction actionWithHandler:^(UIAction *a) { if (chg) chg(w.on); }] forControlEvents:UIControlEventValueChanged];
+    return s;
+}
+// small status pill ("Active", "Ready", "Saved") — a short live state chip, never explanatory text.
+static UIView *RYPill(NSString *text, UIColor *tint) {
+    UIColor *t = tint ?: RYAccent();
+    UILabel *l = RYLabel(text, 12, UIFontWeightSemibold, t); l.textAlignment = NSTextAlignmentCenter;
+    UIView *dot = [UIView new]; dot.backgroundColor = t; dot.layer.cornerRadius = 3;
+    [dot.widthAnchor constraintEqualToConstant:6].active = YES; [dot.heightAnchor constraintEqualToConstant:6].active = YES;
+    UIStackView *s = RYHStack(@[dot, l], 6); s.alignment = UIStackViewAlignmentCenter;
+    UIView *box = [UIView new]; box.backgroundColor = [t colorWithAlphaComponent:0.14]; box.layer.cornerRadius = 11;
+    box.layer.borderWidth = 1; box.layer.borderColor = [t colorWithAlphaComponent:0.35].CGColor;
+    [box addSubview:s]; s.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [s.topAnchor constraintEqualToAnchor:box.topAnchor constant:6], [s.bottomAnchor constraintEqualToAnchor:box.bottomAnchor constant:-6],
+        [s.leadingAnchor constraintEqualToAnchor:box.leadingAnchor constant:12], [s.trailingAnchor constraintEqualToAnchor:box.trailingAnchor constant:-12]]];
+    return box;
+}
+// circular avatar button for the voice-changer row: icon in a 56pt circle (purple + glow when selected), name below.
+static UIView *RYAvatar(NSString *title, NSString *sym, BOOL sel, void (^act)(void)) {
+    UIButtonConfiguration *c = [UIButtonConfiguration filledButtonConfiguration];
+    c.image = [UIImage systemImageNamed:sym]; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    c.preferredSymbolConfigurationForImage = [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightSemibold];
+    c.baseBackgroundColor = sel ? RYAccent() : RY_CARD2; c.baseForegroundColor = sel ? UIColor.whiteColor : RY_DIM;
+    UIButton *b = [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { if (act) act(); }]];
+    [b.widthAnchor constraintEqualToConstant:56].active = YES; [b.heightAnchor constraintEqualToConstant:56].active = YES;
+    if (sel) { b.layer.shadowColor = RYAccent().CGColor; b.layer.shadowOpacity = 0.6; b.layer.shadowRadius = 10; b.layer.shadowOffset = CGSizeMake(0, 2); b.layer.masksToBounds = NO; }
+    UILabel *l = RYLabel(title, 11, UIFontWeightMedium, sel ? nil : RY_MUTED); l.textAlignment = NSTextAlignmentCenter; l.numberOfLines = 1;
+    [l.widthAnchor constraintLessThanOrEqualToConstant:66].active = YES;
+    UIStackView *v = RYVStack(@[b, l], 5); v.alignment = UIStackViewAlignmentCenter;
+    return v;
+}
+// horizontal scrolling row of avatars (keeps the voice-changer presets on one swipeable line, like the mockup).
+static UIView *RYAvatarRow(NSArray<UIView *> *items) {
+    UIScrollView *sc = [UIScrollView new]; sc.showsHorizontalScrollIndicator = NO;
+    UIStackView *h = RYHStack(items, 12); h.alignment = UIStackViewAlignmentTop;
+    [sc addSubview:h]; h.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [h.topAnchor constraintEqualToAnchor:sc.contentLayoutGuide.topAnchor], [h.bottomAnchor constraintEqualToAnchor:sc.contentLayoutGuide.bottomAnchor],
+        [h.leadingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.leadingAnchor], [h.trailingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.trailingAnchor],
+        [h.heightAnchor constraintEqualToAnchor:sc.frameLayoutGuide.heightAnchor]]];
+    [sc.heightAnchor constraintEqualToConstant:86].active = YES;
+    return sc;
+}
+// =========================================================================================================
+// Cinematic intro — one 8ubah splash per app launch. Black canvas + purple haze -> logo springs in and glows
+// -> short pulse hold -> the mark bursts into purple particles and the logo dissolves -> everything fades out
+// and the overlay window removes itself (~3.3 s total). Shown over Discord, never blocks it (touches fall
+// through), auto-cleans, and is skipped in crash-safe mode. Original 8ubah mark, drawn in code (no artwork).
+// =========================================================================================================
+static void RYShowIntro(UIWindowScene *scene) {
+    if (!scene) return;
+    CGRect sb = scene.coordinateSpace.bounds; if (sb.size.width < 50) sb = UIScreen.mainScreen.bounds;
+    UIWindow *win = [[UIWindow alloc] initWithWindowScene:scene];
+    win.windowLevel = UIWindowLevelAlert + 100; win.userInteractionEnabled = NO; win.backgroundColor = UIColor.blackColor;
+    UIViewController *vc = [UIViewController new]; vc.view.backgroundColor = UIColor.blackColor; vc.view.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    win.rootViewController = vc; win.frame = sb; win.hidden = NO;
+    UIView *root = vc.view;
+    // radial purple haze behind the mark
+    CAGradientLayer *haze = [CAGradientLayer layer]; haze.type = kCAGradientLayerRadial; haze.frame = sb;
+    haze.colors = @[(id)[UIColor colorWithRed:0.42 green:0.25 blue:0.98 alpha:0.55].CGColor, (id)UIColor.clearColor.CGColor];
+    haze.startPoint = CGPointMake(0.5, 0.5); haze.endPoint = CGPointMake(1.0, 1.0); haze.opacity = 0;
+    [root.layer addSublayer:haze];
+    // logo column: glowing "8" tile, "8ubah" wordmark, spaced "DISCORD MOD"
+    UILabel *mark = RYLabel(@"8", 44, UIFontWeightHeavy, UIColor.whiteColor); mark.textAlignment = NSTextAlignmentCenter;
+    UIView *box = [UIView new]; box.backgroundColor = RYAccent(); box.layer.cornerRadius = 22; box.layer.cornerCurve = kCACornerCurveContinuous;
+    box.layer.shadowColor = RYAccent().CGColor; box.layer.shadowOpacity = 0.95; box.layer.shadowRadius = 30; box.layer.shadowOffset = CGSizeZero; box.layer.masksToBounds = NO;
+    [box addSubview:mark]; RYPin(mark, box, 0);
+    [box.widthAnchor constraintEqualToConstant:96].active = YES; [box.heightAnchor constraintEqualToConstant:96].active = YES;
+    UILabel *word = RYLabel(@"8ubah", 34, UIFontWeightHeavy, UIColor.whiteColor); word.textAlignment = NSTextAlignmentCenter;
+    UILabel *sub = [UILabel new]; sub.textAlignment = NSTextAlignmentCenter;
+    sub.attributedText = [[NSAttributedString alloc] initWithString:@"DISCORD MOD" attributes:@{NSKernAttributeName: @5, NSForegroundColorAttributeName: RY_MUTED, NSFontAttributeName: [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold]}];
+    UIStackView *col = RYVStack(@[box, word, sub], 14); col.alignment = UIStackViewAlignmentCenter;
+    [root addSubview:col]; col.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[[col.centerXAnchor constraintEqualToAnchor:root.centerXAnchor], [col.centerYAnchor constraintEqualToAnchor:root.centerYAnchor]]];
+    col.alpha = 0; col.transform = CGAffineTransformMakeScale(0.7, 0.7);
+    // 1) logo springs in with the haze
+    [UIView animateWithDuration:0.7 delay:0.1 usingSpringWithDamping:0.68 initialSpringVelocity:0.6 options:UIViewAnimationOptionCurveEaseOut animations:^{ col.alpha = 1; col.transform = CGAffineTransformIdentity; } completion:nil];
+    CABasicAnimation *hz = [CABasicAnimation animationWithKeyPath:@"opacity"]; hz.fromValue = @0; hz.toValue = @1; hz.beginTime = CACurrentMediaTime() + 0.1; hz.duration = 0.7; hz.fillMode = kCAFillModeForwards; hz.removedOnCompletion = NO; [haze addAnimation:hz forKey:@"in"];
+    // 2) short glow pulse while it holds
+    CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"transform.scale"]; pulse.fromValue = @1.0; pulse.toValue = @1.06; pulse.duration = 0.6; pulse.autoreverses = YES; pulse.beginTime = CACurrentMediaTime() + 0.85; pulse.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut]; [box.layer addAnimation:pulse forKey:@"pulse"];
+    // 3) particle burst + dissolve at ~2.0 s
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        CAEmitterLayer *em = [CAEmitterLayer layer];
+        em.emitterPosition = CGPointMake(CGRectGetMidX(sb), CGRectGetMidY(sb) - 40);
+        em.emitterShape = kCAEmitterLayerCircle; em.emitterMode = kCAEmitterLayerOutline; em.emitterSize = CGSizeMake(96, 96);
+        CAEmitterCell *cell = [CAEmitterCell emitterCell];
+        cell.birthRate = 1100; cell.lifetime = 1.1f; cell.velocity = 190; cell.velocityRange = 90; cell.emissionRange = (float)(2 * M_PI);
+        cell.scale = 0.06f; cell.scaleRange = 0.04f; cell.alphaSpeed = -0.95f; cell.color = RY_GLOW.CGColor;
+        UIGraphicsImageRenderer *rnd = [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(10, 10)];
+        UIImage *dot = [rnd imageWithActions:^(UIGraphicsImageRendererContext *ctx) { [UIColor.whiteColor setFill]; [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(0, 0, 10, 10)] fill]; }];
+        cell.contents = (id)dot.CGImage; em.emitterCells = @[cell]; [root.layer addSublayer:em];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ em.birthRate = 0; });
+        [UIView animateWithDuration:0.8 animations:^{ col.alpha = 0; col.transform = CGAffineTransformMakeScale(1.25, 1.25); haze.opacity = 0; }];
+    });
+    // 4) remove the overlay window
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.4 animations:^{ win.alpha = 0; } completion:^(BOOL f) { win.hidden = YES; }];
+    });
 }
 static UIStackView *RYVStack(NSArray *v, CGFloat sp) {
     UIStackView *s = [[UIStackView alloc] initWithArrangedSubviews:v]; s.axis = UILayoutConstraintAxisVertical; s.spacing = sp;
@@ -379,12 +544,13 @@ static void RYPin(UIView *v, UIView *to, CGFloat pad) {
         [v.leadingAnchor constraintEqualToAnchor:to.leadingAnchor constant:pad], [v.trailingAnchor constraintEqualToAnchor:to.trailingAnchor constant:-pad]]];
 }
 static UIView *RYCard(NSArray *views) {
-    UIView *c = [UIView new]; c.backgroundColor = RY_CARD; c.layer.cornerRadius = 14;
-    UIStackView *s = RYVStack(views, 10); [c addSubview:s]; RYPin(s, c, 12); return c;
+    UIView *c = [UIView new]; c.backgroundColor = RY_CARD; c.layer.cornerRadius = 16;
+    c.layer.borderWidth = 1; c.layer.borderColor = RY_STROKE.CGColor; c.layer.cornerCurve = kCACornerCurveContinuous;
+    UIStackView *s = RYVStack(views, 10); [c addSubview:s]; RYPin(s, c, 14); return c;
 }
 static UIView *RYSlider(NSString *title, float mn, float mx, float val, void (^chg)(float)) {
     UILabel *l = RYLabel(title, 14, UIFontWeightMedium, nil);
-    UISlider *s = [UISlider new]; s.minimumValue = mn; s.maximumValue = mx; s.value = val; s.minimumTrackTintColor = RYAccent();
+    UISlider *s = [UISlider new]; s.minimumValue = mn; s.maximumValue = mx; s.value = val; s.minimumTrackTintColor = RYAccent(); s.maximumTrackTintColor = RY_CARD2;
     __weak UISlider *ws = s;
     [s addAction:[UIAction actionWithHandler:^(UIAction *a) { if (ws && chg) chg(ws.value); }] forControlEvents:UIControlEventValueChanged];
     return RYCard(@[l, s]);
@@ -3442,17 +3608,27 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     __weak typeof(self) ws = self;
     self.view.backgroundColor = RY_BG; self.view.overrideUserInterfaceStyle = UIUserInterfaceStyleDark; self.view.semanticContentAttribute = RYSem();
 
-    UILabel *title = RYLabel(@"8ubah", 22, UIFontWeightHeavy, nil); title.numberOfLines = 1;
+    // brand mark: a glowing purple tile with "8", next to the 8ubah wordmark
+    UILabel *mark = RYLabel(@"8", 17, UIFontWeightHeavy, UIColor.whiteColor); mark.textAlignment = NSTextAlignmentCenter;
+    UIView *markBox = [UIView new]; markBox.backgroundColor = RYAccent(); markBox.layer.cornerRadius = 9; markBox.layer.cornerCurve = kCACornerCurveContinuous;
+    markBox.layer.shadowColor = RYAccent().CGColor; markBox.layer.shadowOpacity = 0.6; markBox.layer.shadowRadius = 8; markBox.layer.shadowOffset = CGSizeMake(0, 2); markBox.layer.masksToBounds = NO;
+    [markBox addSubview:mark]; RYPin(mark, markBox, 0);
+    [markBox.widthAnchor constraintEqualToConstant:30].active = YES; [markBox.heightAnchor constraintEqualToConstant:30].active = YES;
+    UILabel *title = RYLabel(@"8ubah", 23, UIFontWeightHeavy, nil); title.numberOfLines = 1;
     UIView *spacer = [UIView new]; [spacer setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
-    UIButton *close = RYBtn(T(@"إغلاق", @"Close"), NO, ^{ [ws dismissViewControllerAnimated:YES completion:nil]; });
-    UIStackView *head = RYHStack(@[title, spacer, close], 8);
+    UIButtonConfiguration *cc = [UIButtonConfiguration grayButtonConfiguration];
+    cc.image = [UIImage systemImageNamed:@"xmark"]; cc.baseBackgroundColor = RY_CARD2; cc.baseForegroundColor = RY_DIM; cc.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
+    cc.contentInsets = NSDirectionalEdgeInsetsMake(8, 8, 8, 8);
+    UIButton *close = [UIButton buttonWithConfiguration:cc primaryAction:[UIAction actionWithHandler:^(UIAction *a) { [ws dismissViewControllerAnimated:YES completion:nil]; }]];
+    UIStackView *head = RYHStack(@[markBox, title, spacer, close], 10);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation"), T(@"تسجيل", @"Record")];
-    // all tabs always shown, in or out of a room (tabs whose feature needs a room just say so when you tap into them there)
-    NSArray<NSNumber *> *order = @[@0, @5, @6, @1, @2, @3, @4];
-    if (self.tab < 0 || self.tab > 6) self.tab = 0;
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation"), T(@"تسجيل", @"Record"), @"Diag"];
+    NSArray *icons = @[@"mic.fill", @"waveform", @"photo.fill", @"shield.lefthalf.filled", @"pawprint.fill", @"slider.vertical.3", @"record.circle.fill", @"waveform.path.ecg"];
+    // mockup tab order: Mic, Stereo, Backgrounds, Fake Defen, Isolation, Record, Diag — Cat kept at the end (scrolls into view)
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @5, @6, @7, @4];
+    if (self.tab < 0 || self.tab > 7) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
-    for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYBtn(names[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
+    for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYIconTab(names[i], icons[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
     UIStackView *tabStack = RYHStack(tb, 8); tabStack.alignment = UIStackViewAlignmentFill;
@@ -3468,7 +3644,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
         [head.leadingAnchor constraintEqualToAnchor:sg.leadingAnchor constant:16], [head.trailingAnchor constraintEqualToAnchor:sg.trailingAnchor constant:-16],
         [tabsScroll.topAnchor constraintEqualToAnchor:head.bottomAnchor constant:12],
         [tabsScroll.leadingAnchor constraintEqualToAnchor:sg.leadingAnchor], [tabsScroll.trailingAnchor constraintEqualToAnchor:sg.trailingAnchor],
-        [tabsScroll.heightAnchor constraintEqualToConstant:40],
+        [tabsScroll.heightAnchor constraintEqualToConstant:58],
         [tabStack.topAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.topAnchor], [tabStack.bottomAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.bottomAnchor],
         [tabStack.leadingAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.leadingAnchor constant:16], [tabStack.trailingAnchor constraintEqualToAnchor:tabsScroll.contentLayoutGuide.trailingAnchor constant:-16],
         [tabStack.heightAnchor constraintEqualToAnchor:tabsScroll.frameLayoutGuide.heightAnchor],
@@ -3482,18 +3658,28 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     if (self.tab != 5) self.eqEdit = NO;
     [self applyEditLock];
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; case 6: [self renderRec]; break; default: [self renderBG]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; case 6: [self renderRec]; break; case 7: [self renderDiag]; break; default: [self renderBG]; }
 }
 #pragma mark Locked
 - (void)renderLocked {
     __weak typeof(self) ws = self;
+    // glowing 8ubah mark
+    UILabel *mk = RYLabel(@"8", 34, UIFontWeightHeavy, UIColor.whiteColor); mk.textAlignment = NSTextAlignmentCenter;
+    UIView *box = [UIView new]; box.backgroundColor = RYAccent(); box.layer.cornerRadius = 18; box.layer.cornerCurve = kCACornerCurveContinuous;
+    box.layer.shadowColor = RYAccent().CGColor; box.layer.shadowOpacity = 0.8; box.layer.shadowRadius = 22; box.layer.shadowOffset = CGSizeZero; box.layer.masksToBounds = NO;
+    [box addSubview:mk]; RYPin(mk, box, 0);
+    [box.widthAnchor constraintEqualToConstant:76].active = YES; [box.heightAnchor constraintEqualToConstant:76].active = YES;
+    UILabel *word = RYLabel(@"8ubah", 26, UIFontWeightHeavy, nil); word.textAlignment = NSTextAlignmentCenter;
+    UIView *status = RYPill(T(@"مقفل", @"Locked"), RY_MUTED);
     UIButton *unlock = RYBtn(T(@"فتح", @"Unlock"), YES, ^{
         [ws ask:T(@"المفتاح", @"Key") ph:@"XXXX-XXXX-XXXX-XXXX" secure:NO ok:^(NSString *k) {
             if (!k.length) return;
             RYLicActivate(k, ^(BOOL ok, NSString *reason) { if (ok) [ws rebuild]; else [ws toast:reason.length ? [NSString stringWithFormat:@"%@ (%@)", T(@"المفتاح غلط", @"Wrong key"), reason] : T(@"المفتاح غلط", @"Wrong key")]; });
         }];
     });
-    [self.stack addArrangedSubview:RYCard(@[unlock])];
+    UIStackView *col = RYVStack(@[box, word, status, unlock], 16); col.alignment = UIStackViewAlignmentCenter;
+    UIView *card = RYCard(@[col]);
+    [self.stack addArrangedSubview:card];
 }
 
 #pragma mark Backgrounds
@@ -3511,7 +3697,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
             [[[NSURLSession sharedSession] dataTaskWithURL:u completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) { [ws saveBGData:d]; }] resume];
         }];
     });
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"خلفية الغرفة (تشوفها أنت بس)", @"Room background (only you see it)"), 15, UIFontWeightBold, nil), RYHStack(@[photo, url], 8)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"photo.fill", T(@"خلفية الغرفة", @"Room background"), nil), RYHStack(@[photo, url], 8)])];
 
     NSMutableArray *sw = [NSMutableArray new];
     for (NSString *h in @[@"#000000", @"#111827", @"#1E1B4B", @"#052E16", @"#450A0A", @"#3B0764", @"#0C4A6E", @"#78350F"]) {
@@ -3522,7 +3708,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     UIButton *custom = RYBtn(T(@"لون مخصص", @"Custom colour"), NO, ^{
         ws.pickPurpose = nil; UIColorPickerViewController *cp = [UIColorPickerViewController new]; cp.delegate = ws; [ws presentViewController:cp animated:YES completion:nil];
     });
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"لون ثابت", @"Solid colour"), 15, UIFontWeightBold, nil), RYGrid(sw, 4), custom])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"paintpalette.fill", T(@"لون ثابت", @"Solid colour"), nil), RYGrid(sw, 4), custom])];
 
     NSMutableArray *gs = [NSMutableArray new];
     for (NSString *g in @[@"#0F2027,#2C5364", @"#41295A,#2F0743", @"#FF512F,#DD2476", @"#00C6FF,#0072FF", @"#11998E,#38EF7D", @"#232526,#414345"]) {
@@ -3530,7 +3716,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
         [b addAction:[UIAction actionWithHandler:^(UIAction *a) { [ws setBG:@"gradient" value:g]; [ws toast:T(@"تم", @"Done")]; }] forControlEvents:UIControlEventTouchUpInside];
         [b.heightAnchor constraintEqualToConstant:44].active = YES; [gs addObject:b];
     }
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"تدرجات", @"Gradients"), 15, UIFontWeightBold, nil), RYGrid(gs, 3)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"circle.hexagongrid.fill", T(@"تدرجات", @"Gradients"), nil), RYGrid(gs, 3)])];
 
     [self.stack addArrangedSubview:RYSlider(T(@"التمويه (Blur)", @"Blur"), 0, 100, [CF(@"blur", @0) floatValue], ^(float v) { CS(@"blur", @(v)); [[RYCore shared] bump]; })];
     [self.stack addArrangedSubview:RYSlider(T(@"التعتيم (Dim)", @"Dim"), 0, 100, [CF(@"dim", @30) floatValue], ^(float v) { CS(@"dim", @(v)); [[RYCore shared] bump]; })];
@@ -3542,7 +3728,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
           CS(@"txtMode", @"off"); [[RYCore shared] bump]; [ws rebuild];
           dispatch_async(dispatch_get_main_queue(), ^{ UIView *h = RYChatHost(); if (!h) return; NSMutableArray *tabs = [NSMutableArray new]; RYCollectTables(h, tabs, 0); for (UITableView *tv in tabs) [tv reloadData]; });   // cells already tinted get the app's own colours back
       });
-      [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"لون كلام الناس", @"Message text colour"), 15, UIFontWeightBold, nil), RYHStack(@[tC, tO], 8)])]; }
+      [self.stack addArrangedSubview:RYCard(@[RYSection(@"textformat", T(@"لون كلام الناس", @"Message text colour"), nil), RYHStack(@[tC, tO], 8)])]; }
     [self.stack addArrangedSubview:RYBtn(T(@"رجوع للافتراضي", @"Reset to default"), NO, ^{
         [ws setBG:@"none" value:@""]; CS(@"blur", @0); CS(@"dim", @30); CS(@"txtMode", nil); CS(@"txtColor", nil); [ws rebuild]; [ws toast:T(@"تم الرجوع للافتراضي", @"Reset")];
     })];
@@ -3629,7 +3815,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
             CS(@"stClips", clips); [ws toast:T(@"تم الحفظ كاختصار", @"Saved as a shortcut")]; [ws rebuild];
         }];
     });
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"ملف الصوت أو الفيديو", @"Audio/video file"), 16, UIFontWeightBold, nil),
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"waveform", T(@"ملف الصوت أو الفيديو", @"Audio/video file"), nil),
         RYLabel(gStLoading ? T(@"جاري التحميل…", @"Loading…") : (nm ?: T(@"ما فيه ملف", @"No file")), 13, UIFontWeightMedium, RY_MUTED),
         RYHStack(@[choose, gallery, remove], 8), saveShortcut])];
     UISwitch *lp = [UISwitch new]; lp.on = gStLoop != 0; lp.onTintColor = RYAccent(); __weak UISwitch *wlp = lp;
@@ -3642,8 +3828,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تكرار", @"Loop"), 14, UIFontWeightMedium, nil), lp], 12), play])];
     UISwitch *hm = [UISwitch new]; hm.on = gStMon != 0; hm.onTintColor = RYAccent(); __weak UISwitch *whm = hm;
     [hm addAction:[UIAction actionWithHandler:^(UIAction *a) { RYStMonSet(whm.on); }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"أسمع الملف أنا كمان", @"Hear it myself"), 14, UIFontWeightMedium, nil), hm], 12),
-        RYLabel(T(@"تسمع الملف نفسه بنفس لحظة ما الروم يسمعونه (بدون صوتك). استخدم سماعة عشان المايك ما يلتقطه مرة ثانية.", @"You hear the file itself at the same moment the room does (not your voice). Use headphones so the mic does not pick it up again."), 12, UIFontWeightRegular, RY_MUTED)])];
+    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"أسمع الملف أنا كمان", @"Hear it myself"), 14, UIFontWeightMedium, nil), hm], 12)])];
     // scrub bar: shows where the clip is and lets you drag forward/back, same clip the mic is playing
     UISlider *pos = [UISlider new]; pos.minimumValue = 0; pos.maximumValue = (float)MAX(RYStDuration(), 0.01); pos.value = (float)RYStPosSec();
     pos.minimumTrackTintColor = RYAccent(); self.stSlider = pos;
@@ -3744,21 +3929,20 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     __weak typeof(self) ws = self;
     UISwitch *siso = [UISwitch new]; siso.on = gIsoOn != 0; siso.onTintColor = RYAccent(); __weak UISwitch *wsiso = siso;
     [siso addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetIso(wsiso.on); [ws toast:wsiso.on ? T(@"انطفت العوازل — اقفل الغرفة وارجع لها", @"Isolation off — rejoin the voice room") : T(@"رجعت العوازل", @"Isolation back on")]; }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"إطفاء كل العوازل", @"Disable all isolation"), 16, UIFontWeightBold, nil), siso], 12)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"shield.slash.fill", T(@"إطفاء كل العوازل", @"Disable all isolation"), siso)])];
     UISwitch *smute = [UISwitch new]; smute.on = gMicMute != 0; smute.onTintColor = UIColor.systemRedColor; __weak UISwitch *wsmute = smute;
     [smute addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetMute(wsmute.on); [ws rebuild]; }] forControlEvents:UIControlEventValueChanged];
-    UIView *muteCard = RYCard(@[RYHStack(@[RYLabel(T(@"سكر صوتي", @"Kill mic"), 16, UIFontWeightBold, gMicMute ? UIColor.systemRedColor : nil), smute], 12),
-        RYLabel(T(@"مايطلع أي صوت من مايكك للباقين مهما سويت، لين تطفيه من هنا.", @"Nothing from your mic reaches anyone else, no matter what, until you turn this off here."), 12, UIFontWeightRegular, RY_MUTED)]);
+    UIView *muteCard = RYCard(@[RYSection(@"mic.slash.fill", T(@"سكر صوتي", @"Kill mic"), smute)]);
     [self.stack addArrangedSubview:muteCard];
-    UISwitch *sw = [UISwitch new]; sw.on = gMicOn != 0; sw.onTintColor = RYAccent(); __weak UISwitch *wsw = sw;
-    [sw addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetOn(wsw.on); }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"تشغيل مغيّر الصوت", @"Voice changer"), 15, UIFontWeightBold, nil), sw], 12)])];
+    UISwitch *sw = RYSwitch(gMicOn != 0, nil, ^(BOOL on) { RYMicSetOn(on); });
+    NSArray *vIcons = @[@"waveform", @"person.fill", @"flame.fill", @"person.fill", @"figure.child", @"hare.fill", @"cpu", @"megaphone.fill", @"dot.radiowaves.left.and.right", @"waveform.path.ecg"];
     NSMutableArray *bs = [NSMutableArray new];
     for (int i = 0; i < RY_NPRESETS; i++) {
         NSString *nm = [NSString stringWithUTF8String:RYAr() ? kPresets[i].ar : kPresets[i].en];
-        [bs addObject:RYBtn(nm, i == gMicPreset, ^{ RYMicApplyPreset(i); RYMicSetOn(YES); [ws rebuild]; })];
+        NSString *sym = i < (int)vIcons.count ? vIcons[i] : @"waveform";
+        [bs addObject:RYAvatar(nm, sym, i == gMicPreset, ^{ RYMicApplyPreset(i); RYMicSetOn(YES); [ws rebuild]; })];
     }
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"الأصوات", @"Voices"), 15, UIFontWeightBold, nil), RYGrid(bs, 3)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"mic.fill", T(@"مغيّر الصوت", @"Voice Changer"), sw), RYAvatarRow(bs)])];
     [self.stack addArrangedSubview:RYSlider(T(@"درجة الصوت (نغمات)", @"Pitch (semitones)"), -12, 12, gMicSemi, ^(float v) { gMicSemi = v; gMicPreset = -1; CS(@"micSemi", @(v)); CS(@"micPreset", @(-1)); })];
     [self.stack addArrangedSubview:RYSlider(T(@"الصدى", @"Echo"), 0, 1, gMicEcho, ^(float v) { gMicEcho = v; CS(@"micEcho", @(v)); })];
     [self.stack addArrangedSubview:RYSlider(T(@"مستوى المايك", @"Mic level"), 0.5, 2, gMicGain, ^(float v) { gMicGain = v; CS(@"micGain", @(v)); })];
@@ -3766,14 +3950,14 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     [s1 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetDist(ws1.on); }] forControlEvents:UIControlEventValueChanged];
     UISwitch *s2 = [UISwitch new]; s2.on = gMicRev != 0; s2.onTintColor = RYAccent(); __weak UISwitch *ws2 = s2;
     [s2 addAction:[UIAction actionWithHandler:^(UIAction *a) { RYMicSetRev(ws2.on); }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"فضي", @"Silver"), 15, UIFontWeightBold, nil),
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"sparkles", T(@"فضي", @"Silver"), nil),
         RYHStack(@[RYLabel(T(@"مضخم", @"Amplifier"), 14, UIFontWeightMedium, nil), s1], 12),
         RYHStack(@[RYLabel(T(@"صدى فضي", @"Silver echo"), 14, UIFontWeightMedium, nil), s2], 12)])];
     UISwitch *s3 = [UISwitch new]; s3.on = gMonOn != 0; s3.onTintColor = RYAccent(); __weak UISwitch *ws3 = s3;
     [s3 addAction:[UIAction actionWithHandler:^(UIAction *a) { if (ws3.on) RYMonStart(); else RYMonStop(); }] forControlEvents:UIControlEventValueChanged];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYLabel(T(@"اسمع صوتي", @"Hear my voice"), 15, UIFontWeightBold, nil), s3], 12)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"ear.fill", T(@"اسمع صوتي", @"Hear my voice"), s3)])];
         // ---- amplifier settings
-    [self.stack addArrangedSubview:RYCard(@[RYLabel(T(@"إعدادات المضخم", @"Amplifier settings"), 15, UIFontWeightBold, nil)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"dial.high.fill", T(@"إعدادات المضخم", @"Amplifier settings"), nil)])];
     [self.stack addArrangedSubview:RYSliderV(T(@"التضخيم", @"Gain"), @"dB", 0, 120, [CF(@"distDb", @60) floatValue], NO, 0, ^(float v) { gDistGain = powf(10.f, v / 20.f); CS(@"distDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"مستوى الخروج", @"Output"), @"dB", -30, 0, [CF(@"distOutDb", @-3) floatValue], NO, 0, ^(float v) { gDistOut = powf(10.f, v / 20.f); CS(@"distOutDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"عتبة الكتم", @"Gate"), @"dB", -80, -30, [CF(@"distGateDb", @-55) floatValue], NO, 0, ^(float v) { gDistGate = powf(10.f, v / 20.f); CS(@"distGateDb", @(v)); })];
@@ -3810,7 +3994,7 @@ static UIView *RYSw(NSString *title, BOOL on, UIColor *tint, void (^chg)(BOOL)) 
     return RYHStack(@[l, sw], 12);
 }
 static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float mx, float val, int dec, BOOL enabled, void (^chg)(float)) {
-    UISlider *s = [UISlider new]; s.minimumValue = mn; s.maximumValue = mx; s.value = val; s.minimumTrackTintColor = RYAccent(); s.enabled = enabled;
+    UISlider *s = [UISlider new]; s.minimumValue = mn; s.maximumValue = mx; s.value = val; s.minimumTrackTintColor = RYAccent(); s.maximumTrackTintColor = RY_CARD2; s.enabled = enabled;
     UILabel *l = RYLabel(unit.length ? [NSString stringWithFormat:@"%.*f %@", dec, val, unit] : [NSString stringWithFormat:@"%.*f", dec, val], 13, UIFontWeightMedium, RY_MUTED); l.numberOfLines = 1;
     [l.widthAnchor constraintEqualToConstant:74].active = YES; l.textAlignment = NSTextAlignmentCenter;
     __weak UISlider *ws = s; __weak UILabel *wl = l;
@@ -3842,7 +4026,7 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
     [more addObject:[UIAction actionWithTitle:T(@"رجوع للافتراضي", @"Reset") image:nil identifier:nil handler:^(UIAction *a) { RYEqReset(); [ws rebuild]; }]];
     UIButton *moreBtn = RYBtn(@"•••", NO, nil); moreBtn.menu = [UIMenu menuWithTitle:@"" children:more]; moreBtn.showsMenuAsPrimaryAction = YES;
     [nameBtn setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[nameBtn, star, moreBtn], 8)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"star.fill", T(@"الوزنية", @"Preset"), nil), RYHStack(@[nameBtn, star, moreBtn], 8)])];
     // ---- favourites (9 slots)
     NSMutableArray *slots = [NSMutableArray new];
     for (int i = 0; i < 9; i++) {
@@ -3860,7 +4044,8 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
     gv.onLive = ^(int b) { st.text = [NSString stringWithFormat:@"%.0f Hz    %+.1f dB    Q %.1f", gEqF[b], gEqG[b], gEqQ[b]]; };
     gv.onEnd = ^{ RYEqSave(); };
     UIButton *edit = RYBtn(self.eqEdit ? T(@"تم", @"Done") : T(@"تعديل", @"Edit"), self.eqEdit, ^{ ws.eqEdit = !ws.eqEdit; [ws rebuild]; });
-    [self.stack addArrangedSubview:RYCard(@[RYHStack(@[RYSw(T(@"الإيكولايزر", @"Equalizer"), gEqOn != 0, nil, ^(BOOL on) { RYEqSetOn(on); [gv setNeedsDisplay]; }), edit], 12), gv, st])];
+    UISwitch *eqSw = RYSwitch(gEqOn != 0, nil, ^(BOOL on) { RYEqSetOn(on); [gv setNeedsDisplay]; });
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"slider.vertical.3", @"EQ / Studio", RYHStack(@[edit, eqSw], 10)), gv, st])];
     [self.stack addArrangedSubview:RYCard(@[RYSl(T(@"المستوى", @"Preamp"), nil, @"dB", -12, 12, gEqPre, 1, YES, ^(float v) { gEqPre = v; gEqVer++; CS(@"eqPre", @(v)); [gv setNeedsDisplay]; })])];
     // ---- Clearcast
     [self.stack addArrangedSubview:RYCard(@[RYSw(@"Clearcast AI", gNcOn != 0, nil, ^(BOOL on) { gNcOn = on; CS(@"ncOn", @(on)); [ws rebuild]; }),
@@ -3906,7 +4091,7 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
             });
         }
     });
-    [self.stack addArrangedSubview:RYCard(@[go, RYSw(T(@"مايكي بالتسجيل", @"My mic in recording"), gRecMicOn != 0, nil, ^(BOOL on) { gRecMicOn = on; })])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"record.circle.fill", T(@"تسجيل", @"Record"), nil), go, RYSw(T(@"مايكي بالتسجيل", @"My mic in recording"), gRecMicOn != 0, nil, ^(BOOL on) { gRecMicOn = on; })])];
     UILabel *st = RYLabel(@" ", 13, UIFontWeightMedium, RY_MUTED);
     void (^upd)(void) = ^{
         if (!gRecOn) { st.text = gRecHook ? T(@"جاهز", @"Ready") : T(@"جاهز (صوت الروم يُلتقط بعد دخول الروم)", @"Ready (room audio is picked up after joining a room)"); return; }
@@ -3931,9 +4116,11 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
     }
 }
 - (void)renderCat {
-    __weak typeof(self) ws = self; BOOL on = [CF(@"cat", @YES) boolValue];
-    UIButton *b = RYBtn(T(@"القطوة", @"Cat"), on, ^{ RYCatSet(![CF(@"cat", @YES) boolValue]); [ws rebuild]; });   // purple = on, grey = off
-    [self.stack addArrangedSubview:RYCard(@[b])];
+    BOOL on = [CF(@"cat", @YES) boolValue];
+    UISwitch *cs = RYSwitch(on, nil, ^(BOOL v) { RYCatSet(v); });
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"pawprint.fill", T(@"القطوة", @"Cat"), cs)])];
+    UISwitch *is = RYSwitch(![CF(@"introOff", @NO) boolValue], nil, ^(BOOL v) { CS(@"introOff", @(!v)); });
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"sparkles", T(@"مقدمة 8ubah", @"8ubah intro"), is)])];
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
 }
 - (void)renderFake {
@@ -3945,12 +4132,13 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
                        : (r ? T(@"رجعت حالتك الحقيقية", @"Your real state is back") : T(@"انطفى", @"Off"))];
         [ws rebuild];
     });
-    [self.stack addArrangedSubview:RYCard(@[b])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"shield.lefthalf.filled", @"Fake Defean", nil), b])];
     [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil;
 }
 - (void)renderDiag {
     __weak typeof(self) ws = self;
     [self.stack addArrangedSubview:RYCard(@[
+        RYSection(@"waveform.path.ecg", @"Diag", nil),
         RYBtn(T(@"تقرير كامل", @"Full report"), YES, ^{ RYShareText(ws, @"diag-full.txt", RYDiagReport()); }),
         RYBtn(T(@"شاشة الدردشة", @"Chat screen"), NO, ^{ RYShareText(ws, @"diag-chat.txt", RYDiagChat()); }),
         RYBtn(T(@"محرك الصوت", @"Voice engine"), NO, ^{ RYShareText(ws, @"diag-voice.txt", RYDiagVoice()); }),
@@ -4004,6 +4192,8 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
     UIWindowScene *sc = nil;
     for (UIScene *s in UIApplication.sharedApplication.connectedScenes) if ([s isKindOfClass:UIWindowScene.class] && s.activationState == UISceneActivationStateForegroundActive) { sc = (UIWindowScene *)s; break; }
     if (!sc) { [self performSelector:@selector(start) withObject:nil afterDelay:1.0]; return; }
+    // one cinematic 8ubah splash per launch (not per panel open); skipped after a crash and when the owner turns it off
+    static dispatch_once_t introOnce; dispatch_once(&introOnce, ^{ if (!gSafeLaunch && ![CF(@"introOff", @NO) boolValue]) RYShowIntro(sc); });
     self.win = [[RYWindow alloc] initWithWindowScene:sc]; self.win.windowLevel = UIWindowLevelAlert + 50; self.win.backgroundColor = UIColor.clearColor;
     UIViewController *root = [UIViewController new]; root.view.backgroundColor = UIColor.clearColor; self.win.rootViewController = root; self.win.hidden = NO;
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom]; b.frame = CGRectMake(0, 0, 52, 52); b.layer.cornerRadius = 26;
