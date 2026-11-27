@@ -4411,7 +4411,10 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // step. We only (re)write the URL when it differs and NEVER delete the cached bundle, so once it is fetched
 // the first time it loads instantly and offline on every later launch. Do NOT add a second JS loader here:
 // BTLoader already hooks the RN bridge, and injecting the bundle twice would crash Discord.
-#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@dist/8ubah.min.js"
+// Pinned to the dist commit's jsDelivr SHA URL (not @dist): jsDelivr caches a BRANCH ref for ~12h and
+// won't refresh, but a commit-SHA URL is immutable, fast, and served fresh at once. Bump this SHA when
+// publishing a new bundle. (Resolve the latest with: git -C displug rev-parse origin/dist)
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@a435cc7ac4c096e714d90da1073aaf9c201efa87/8ubah.min.js"
 
 static void RYConfigurePluginLoader(void) {
     @try {
