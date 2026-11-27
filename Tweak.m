@@ -377,14 +377,21 @@ static UILabel *RYLabel(NSString *t, CGFloat sz, UIFontWeight w, UIColor *c) {
     l.semanticContentAttribute = RYSem();
     return l;
 }
+// forward declarations: the new 8ubah components below (RYIconTab/RYSection/RYPill/RYAvatar/RYShowIntro)
+// are placed here for readability but use these layout helpers, which are defined a little further down.
+static UIStackView *RYVStack(NSArray *v, CGFloat sp);
+static UIStackView *RYHStack(NSArray *v, CGFloat sp);
+static void RYPin(UIView *v, UIView *to, CGFloat pad);
+static UIView *RYCard(NSArray *views);
+
 static UIButton *RYBtn(NSString *t, BOOL filled, void (^act)(void)) {
     UIButtonConfiguration *c = filled ? [UIButtonConfiguration filledButtonConfiguration] : [UIButtonConfiguration grayButtonConfiguration];
     c.title = t; c.cornerStyle = UIButtonConfigurationCornerStyleLarge;
     c.baseBackgroundColor = filled ? RYAccent() : RY_CARD2;
     c.baseForegroundColor = filled ? UIColor.whiteColor : RY_DIM;
     c.contentInsets = NSDirectionalEdgeInsetsMake(9, 16, 9, 16);
-    c.titleTextAttributesTransformer = [[UIConfigurationTextAttributesTransformer alloc] initWithTransformer:^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *a) {
-        NSMutableDictionary *m = [a mutableCopy]; m[NSFontAttributeName] = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold]; return m; }];
+    c.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *a) {
+        NSMutableDictionary *m = [a mutableCopy]; m[NSFontAttributeName] = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold]; return m; };
     UIButton *b = [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { if (act) act(); }]];
     // touch feedback: a subtle press-in scale + dim, consistent on every button in the panel
     b.configurationUpdateHandler = ^(UIButton *bb) {
@@ -408,8 +415,8 @@ static UIButton *RYIconTab(NSString *name, NSString *sym, BOOL sel, void (^act)(
     c.baseBackgroundColor = sel ? RYAccent() : UIColor.clearColor;
     c.baseForegroundColor = sel ? UIColor.whiteColor : RY_MUTED;
     c.contentInsets = NSDirectionalEdgeInsetsMake(8, 14, 8, 14);
-    c.titleTextAttributesTransformer = [[UIConfigurationTextAttributesTransformer alloc] initWithTransformer:^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *a) {
-        NSMutableDictionary *m = [a mutableCopy]; m[NSFontAttributeName] = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold]; return m; }];
+    c.titleTextAttributesTransformer = ^NSDictionary<NSAttributedStringKey, id> *(NSDictionary<NSAttributedStringKey, id> *a) {
+        NSMutableDictionary *m = [a mutableCopy]; m[NSFontAttributeName] = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold]; return m; };
     UIButton *b = [UIButton buttonWithConfiguration:c primaryAction:[UIAction actionWithHandler:^(UIAction *a) { if (act) act(); }]];
     if (sel) { b.layer.shadowColor = RYAccent().CGColor; b.layer.shadowOpacity = 0.5; b.layer.shadowRadius = 10; b.layer.shadowOffset = CGSizeMake(0, 3); b.layer.masksToBounds = NO; }
     b.semanticContentAttribute = RYSem();
