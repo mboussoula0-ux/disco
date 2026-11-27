@@ -4363,9 +4363,9 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // The IPA already ships BTLoader.dylib (the Pyoncord/Bunny JS loader). On launch it reads
 // Documents/pyoncord/loader.json; if customLoadUrl.enabled is true it loads that bundle instead of
 // the stock one. We pre-write that file to the 8ubah bundle so every plugin is present with no manual
-// step. We only rewrite (and drop the stale cache) when the stored URL differs, so later launches reuse
-// the cached bundle and stay fast/offline. Do NOT add a second JS loader here: BTLoader already hooks the
-// RN bridge, and injecting the bundle twice would crash Discord.
+// step. We only (re)write the URL when it differs and NEVER delete the cached bundle, so once it is fetched
+// the first time it loads instantly and offline on every later launch. Do NOT add a second JS loader here:
+// BTLoader already hooks the RN bridge, and injecting the bundle twice would crash Discord.
 #define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@dist/8ubah.min.js"
 
 static void RYConfigurePluginLoader(void) {
@@ -4387,15 +4387,16 @@ static void RYConfigurePluginLoader(void) {
                 && [c[@"url"] isKindOfClass:NSString.class] && [c[@"url"] isEqualToString:RY_PLUGIN_BUNDLE_URL])
                 match = YES;
         }
-        if (match) return; // already pointed at the 8ubah bundle -> leave the cache alone
+        if (match) return; // already pointed at the 8ubah bundle -> nothing to do
 
+        // Point BTLoader at the 8ubah bundle. We NEVER delete the cached bundle here: clearing it every
+        // launch forced a fresh (slow) network fetch each time, so the bundle showed only if you waited and
+        // vanished when you reopened before the fetch finished. By leaving bundle.js/etag.txt/backup alone,
+        // the first successful fetch is cached and every later launch loads it instantly (and offline).
+        // BTLoader still checks ETag when online, so plugin updates still arrive on their own.
         NSDictionary *json = @{ @"customLoadUrl" : @{ @"enabled" : @YES, @"url" : RY_PLUGIN_BUNDLE_URL } };
         NSData *out = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
         if (out) [out writeToURL:cfg atomically:YES];
-        // URL just changed -> drop the stale cached bundle so BTLoader fetches the 8ubah one fresh.
-        [fm removeItemAtURL:[dir URLByAppendingPathComponent:@"bundle.js"] error:nil];
-        [fm removeItemAtURL:[dir URLByAppendingPathComponent:@"etag.txt"] error:nil];
-        [fm removeItemAtURL:[dir URLByAppendingPathComponent:@"bundle.js.backup"] error:nil];
     } @catch (__unused id e) {}
 }
 
