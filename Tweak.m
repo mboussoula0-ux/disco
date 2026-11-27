@@ -4358,11 +4358,53 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 }
 @end
 
+#pragma mark - Plugins loader auto-config
+
+// The IPA already ships BTLoader.dylib (the Pyoncord/Bunny JS loader). On launch it reads
+// Documents/pyoncord/loader.json; if customLoadUrl.enabled is true it loads that bundle instead of
+// the stock one. We pre-write that file to the 8ubah bundle so every plugin is present with no manual
+// step. We only rewrite (and drop the stale cache) when the stored URL differs, so later launches reuse
+// the cached bundle and stay fast/offline. Do NOT add a second JS loader here: BTLoader already hooks the
+// RN bridge, and injecting the bundle twice would crash Discord.
+#define RY_PLUGIN_BUNDLE_URL @"https://raw.githubusercontent.com/mboussoula0-ux/displug/dist/8ubah.min.js"
+
+static void RYConfigurePluginLoader(void) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSURL *docs = [[fm URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] lastObject];
+        if (!docs) return;
+        NSURL *dir = [docs URLByAppendingPathComponent:@"pyoncord"];
+        if (![fm fileExistsAtPath:dir.path])
+            [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+        NSURL *cfg = [dir URLByAppendingPathComponent:@"loader.json"];
+
+        BOOL match = NO;
+        NSData *cur = [NSData dataWithContentsOfURL:cfg];
+        if (cur) {
+            id j = [NSJSONSerialization JSONObjectWithData:cur options:0 error:nil];
+            NSDictionary *c = [j isKindOfClass:NSDictionary.class] ? ((NSDictionary *)j)[@"customLoadUrl"] : nil;
+            if ([c isKindOfClass:NSDictionary.class] && [c[@"enabled"] boolValue]
+                && [c[@"url"] isKindOfClass:NSString.class] && [c[@"url"] isEqualToString:RY_PLUGIN_BUNDLE_URL])
+                match = YES;
+        }
+        if (match) return; // already pointed at the 8ubah bundle -> leave the cache alone
+
+        NSDictionary *json = @{ @"customLoadUrl" : @{ @"enabled" : @YES, @"url" : RY_PLUGIN_BUNDLE_URL } };
+        NSData *out = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+        if (out) [out writeToURL:cfg atomically:YES];
+        // URL just changed -> drop the stale cached bundle so BTLoader fetches the 8ubah one fresh.
+        [fm removeItemAtURL:[dir URLByAppendingPathComponent:@"bundle.js"] error:nil];
+        [fm removeItemAtURL:[dir URLByAppendingPathComponent:@"etag.txt"] error:nil];
+        [fm removeItemAtURL:[dir URLByAppendingPathComponent:@"bundle.js.backup"] error:nil];
+    } @catch (__unused id e) {}
+}
+
 #pragma mark - Entry
 
 __attribute__((constructor)) static void RYInit(void) {
     if (![[NSBundle mainBundle].bundlePath.pathExtension isEqual:@"app"]) return; // skip app extensions
     RYLoad(); RYInstallCrashLog();
+    RYConfigurePluginLoader(); // point the bundled BTLoader at the 8ubah plugin bundle (no manual step)
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ RYInstallCrashLog(); });
     // crash-loop guard: if the previous launch died within 10 seconds, this launch skips the audio hooks
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
