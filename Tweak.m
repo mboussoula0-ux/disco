@@ -3638,6 +3638,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     [self presentViewController:a animated:YES completion:nil];
 }
 
+- (void)secretDiag:(UILongPressGestureRecognizer *)g { if (g.state == UIGestureRecognizerStateBegan) { self.tab = 7; [self rebuild]; } } // long-press the 8ubah logo
 - (void)rebuild {
     for (UIView *v in self.view.subviews) [v removeFromSuperview];
     __weak typeof(self) ws = self;
@@ -3649,6 +3650,8 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     markBox.layer.shadowColor = RYAccent().CGColor; markBox.layer.shadowOpacity = 0.6; markBox.layer.shadowRadius = 8; markBox.layer.shadowOffset = CGSizeMake(0, 2); markBox.layer.masksToBounds = NO;
     [markBox addSubview:mark]; RYPin(mark, markBox, 0);
     [markBox.widthAnchor constraintEqualToConstant:30].active = YES; [markBox.heightAnchor constraintEqualToConstant:30].active = YES;
+    UILongPressGestureRecognizer *diagLP = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(secretDiag:)];
+    diagLP.minimumPressDuration = 1.2; markBox.userInteractionEnabled = YES; [markBox addGestureRecognizer:diagLP]; // owner-only Diag access (hidden)
     UILabel *title = RYLabel(@"8ubah", 23, UIFontWeightHeavy, nil); title.numberOfLines = 1;
     UIView *spacer = [UIView new]; [spacer setContentHuggingPriority:1 forAxis:UILayoutConstraintAxisHorizontal];
     UIButtonConfiguration *cc = [UIButtonConfiguration grayButtonConfiguration];
@@ -3660,7 +3663,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation"), T(@"تسجيل", @"Record"), @"Diag"];
     NSArray *icons = @[@"mic.fill", @"waveform", @"photo.fill", @"shield.lefthalf.filled", @"pawprint.fill", @"slider.vertical.3", @"record.circle.fill", @"waveform.path.ecg"];
     // mockup tab order: Mic, Stereo, Backgrounds, Fake Defen, Isolation, Record, Diag — Cat kept at the end (scrolls into view)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @5, @6, @7, @4];
+    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @5, @6, @4]; // Diag (7) hidden from the tab bar; opened by long-pressing the 8ubah logo
     if (self.tab < 0 || self.tab > 7) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYIconTab(names[i], icons[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
@@ -3995,10 +3998,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     [self.stack addArrangedSubview:RYSliderV(T(@"التضخيم", @"Gain"), @"dB", 0, 120, [CF(@"distDb", @60) floatValue], NO, 0, ^(float v) { gDistGain = powf(10.f, v / 20.f); CS(@"distDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"مستوى الخروج", @"Output"), @"dB", -30, 0, [CF(@"distOutDb", @-3) floatValue], NO, 0, ^(float v) { gDistOut = powf(10.f, v / 20.f); CS(@"distOutDb", @(v)); })];
     [self.stack addArrangedSubview:RYSliderV(T(@"عتبة الكتم", @"Gate"), @"dB", -80, -30, [CF(@"distGateDb", @-55) floatValue], NO, 0, ^(float v) { gDistGate = powf(10.f, v / 20.f); CS(@"distGateDb", @(v)); })];
-    self.invLabel = RYLabel(RYMicStatus2(), 13, UIFontWeightMedium, RY_MUTED);
-    [self.stack addArrangedSubview:RYCard(@[self.invLabel, RYBtn(T(@"نسخ تشخيص المايك", @"Copy mic diagnostics"), NO, ^{ UIPasteboard.generalPasteboard.string = RYMicReport(); [ws toast:T(@"اننسخ", @"Copied")]; })])];
-    [self.invUI invalidate];
-    self.invUI = [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { ws.invLabel.text = RYMicStatus2(); }];
+    [self.invUI invalidate]; self.invUI = nil; self.invLabel = nil; // diagnostics hidden
 }
 
 #pragma mark Diag
