@@ -3591,6 +3591,35 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
 - (void)cancelTrackingWithEvent:(UIEvent *)e { _sel = -1; [self setNeedsDisplay]; if (self.onEnd) self.onEnd(); }
 @end
 
+// --- 8ubah plugin feature flags -------------------------------------------------------------------
+// The "الإضافات" (Plugins) tab writes Documents/pyoncord/8ubah-features.json as { "<id>": true/false }.
+// The JS side (8ubah Controller plugin) reads the same file and starts/stops the matching plugins, so
+// the switches here drive the real JS plugins. This file is plain JSON both sides agree on.
+static NSString *RYFeaturesPath(void) {
+    NSURL *docs = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] lastObject];
+    if (!docs) return nil;
+    return [[docs.path stringByAppendingPathComponent:@"pyoncord"] stringByAppendingPathComponent:@"8ubah-features.json"];
+}
+static NSMutableDictionary *RYFeaturesLoad(void) {
+    @try {
+        NSString *p = RYFeaturesPath();
+        NSData *d = p ? [NSData dataWithContentsOfFile:p] : nil;
+        id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        if ([j isKindOfClass:NSDictionary.class]) return [j mutableCopy];
+    } @catch (__unused id e) {}
+    return [NSMutableDictionary new];
+}
+static void RYFeatureSet(NSString *pid, BOOL on) {
+    @try {
+        NSMutableDictionary *m = RYFeaturesLoad();
+        m[pid] = @(on);
+        NSString *p = RYFeaturesPath(); if (!p) return;
+        [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+        NSData *out = [NSJSONSerialization dataWithJSONObject:m options:0 error:nil];
+        if (out) [out writeToFile:p atomically:YES];
+    } @catch (__unused id e) {}
+}
+
 @interface RYPanel : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate, UIColorPickerViewControllerDelegate>
 @property (nonatomic) NSInteger tab;
 @property (nonatomic, strong) UIStackView *stack;
@@ -3660,11 +3689,11 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     UIButton *close = [UIButton buttonWithConfiguration:cc primaryAction:[UIAction actionWithHandler:^(UIAction *a) { [ws dismissViewControllerAnimated:YES completion:nil]; }]];
     UIStackView *head = RYHStack(@[markBox, title, spacer, close], 10);
     UIScrollView *tabsScroll = [UIScrollView new]; tabsScroll.showsHorizontalScrollIndicator = NO;
-    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation"), T(@"تسجيل", @"Record"), @"Diag"];
-    NSArray *icons = @[@"mic.fill", @"waveform", @"photo.fill", @"shield.lefthalf.filled", @"pawprint.fill", @"slider.vertical.3", @"record.circle.fill", @"waveform.path.ecg"];
-    // mockup tab order: Mic, Stereo, Backgrounds, Fake Defen, Isolation, Record, Diag — Cat kept at the end (scrolls into view)
-    NSArray<NSNumber *> *order = @[@0, @1, @2, @3, @5, @6, @4]; // Diag (7) hidden from the tab bar; opened by long-pressing the 8ubah logo
-    if (self.tab < 0 || self.tab > 7) self.tab = 0;
+    NSArray *names = @[T(@"مايك", @"Mic"), T(@"ستيريو", @"Stereo"), T(@"الخلفيات", @"Backgrounds"), @"Fake Defen", T(@"القطوة", @"Cat"), T(@"عوازل", @"Isolation"), T(@"تسجيل", @"Record"), @"Diag", T(@"الإضافات", @"Plugins")];
+    NSArray *icons = @[@"mic.fill", @"waveform", @"photo.fill", @"shield.lefthalf.filled", @"pawprint.fill", @"slider.vertical.3", @"record.circle.fill", @"waveform.path.ecg", @"puzzlepiece.extension.fill"];
+    // tab order: Plugins first, then Mic, Stereo, Backgrounds, Fake Defen, Isolation, Record, Cat (scrolls into view)
+    NSArray<NSNumber *> *order = @[@8, @0, @1, @2, @3, @5, @6, @4]; // Diag (7) hidden from the tab bar; opened by long-pressing the 8ubah logo
+    if (self.tab < 0 || self.tab > 8) self.tab = 0;
     NSMutableArray *tb = [NSMutableArray new];
     for (NSNumber *nn in order) { NSInteger i = nn.integerValue; [tb addObject:RYIconTab(names[i], icons[i], i == self.tab, ^{ ws.tab = i; [ws rebuild]; })]; }
     tabsScroll.hidden = NO;
@@ -3696,7 +3725,7 @@ static double RYEqBandDb(int type, float fc, float g, float q, double f) {
     if (self.tab != 5) self.eqEdit = NO;
     [self applyEditLock];
     if (RYLocked()) { tabsScroll.hidden = YES; [self renderLocked]; return; }
-    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; case 6: [self renderRec]; break; case 7: [self renderDiag]; break; default: [self renderBG]; }
+    switch (self.tab) { case 0: [self renderMic]; break; case 1: [self renderStereo]; break; case 3: [self renderFake]; break; case 4: [self renderCat]; break; case 5: [self renderEQ]; break; case 6: [self renderRec]; break; case 7: [self renderDiag]; break; case 8: [self renderPlugins]; break; default: [self renderBG]; }
 }
 #pragma mark Locked
 - (void)renderLocked {
@@ -3961,6 +3990,22 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
             NSMutableArray *a = [msgs mutableCopy]; [a addObject:s]; CS(@"messages", a); [ws rebuild];
         }];
     })];
+}
+
+#pragma mark Plugins
+- (void)renderPlugins {
+    NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify"];
+    NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إخفاء المهام", @"Hide quests")];
+    NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"flag.slash.fill"];
+    NSDictionary *flags = RYFeaturesLoad();
+    for (NSUInteger i = 0; i < ids.count; i++) {
+        NSString *pid = ids[i];
+        UISwitch *sw = RYSwitch([flags[pid] boolValue], nil, ^(BOOL v) { RYFeatureSet(pid, v); });
+        [self.stack addArrangedSubview:RYCard(@[RYSection(syms[i], titles[i], sw)])];
+    }
+    UILabel *note = RYLabel(T(@"شغّل اللي تبي — الإعداد يثبت ويطبّق تلقائياً داخل ديسكورد.", @"Toggle what you want — it persists and applies in Discord."), 13, UIFontWeightMedium, RY_MUTED);
+    note.numberOfLines = 0;
+    [self.stack addArrangedSubview:RYCard(@[note])];
 }
 
 #pragma mark Mic
