@@ -3994,9 +3994,9 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 
 #pragma mark Plugins
 - (void)renderPlugins {
-    NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify"];
-    NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إخفاء المهام", @"Hide quests")];
-    NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"flag.slash.fill"];
+    NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify", @"8ubah.dontcontrol"];
+    NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إخفاء المهام", @"Hide quests"), T(@"لا تتحكم فيّ", @"Dont control me")];
+    NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"flag.slash.fill", @"hand.raised.fill"];
     NSDictionary *flags = RYFeaturesLoad();
     for (NSUInteger i = 0; i < ids.count; i++) {
         NSString *pid = ids[i];
@@ -4414,7 +4414,41 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // Pinned to the dist commit's jsDelivr SHA URL (not @dist): jsDelivr caches a BRANCH ref for ~12h and
 // won't refresh, but a commit-SHA URL is immutable, fast, and served fresh at once. Bump this SHA when
 // publishing a new bundle. (Resolve the latest with: git -C displug rev-parse origin/dist)
-#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@a435cc7ac4c096e714d90da1073aaf9c201efa87/8ubah.min.js"
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@8c9258c5e4a2b1304b6d3c774f5122f2c078d2f9/8ubah.min.js"
+
+// OTA: resolve the latest published bundle (the newest commit on displug's dist branch) and point the
+// NEXT launch at its immutable jsDelivr SHA URL. Runs in the background, best-effort: if GitHub's API is
+// unreachable, loader.json keeps its current URL and the cached bundle still loads. This is what lets new
+// plugins/fixes reach the device WITHOUT reinstalling the dylib. We never delete the cached bundle.
+static void RYResolveLatestBundle(NSURL *cfgURL) {
+    @try {
+        NSURL *api = [NSURL URLWithString:@"https://api.github.com/repos/mboussoula0-ux/displug/commits/dist"];
+        if (!api || !cfgURL) return;
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:api cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:8];
+        [req setValue:@"8ubah-loader" forHTTPHeaderField:@"User-Agent"];
+        [req setValue:@"application/vnd.github.sha" forHTTPHeaderField:@"Accept"]; // response body == the commit SHA
+        NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            @try {
+                if (err || !data) return;
+                NSInteger code = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+                if (code != 200) return;
+                NSString *sha = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+                if (sha.length < 7) return;
+                NSCharacterSet *hex = [NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"];
+                if ([sha rangeOfCharacterFromSet:hex.invertedSet].location != NSNotFound) return; // must be a hex sha
+                NSString *url = [NSString stringWithFormat:@"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@%@/8ubah.min.js", sha];
+                NSData *cur = [NSData dataWithContentsOfURL:cfgURL];
+                NSString *curUrl = nil;
+                if (cur) { id j = [NSJSONSerialization JSONObjectWithData:cur options:0 error:nil]; NSDictionary *c = [j isKindOfClass:NSDictionary.class] ? ((NSDictionary *)j)[@"customLoadUrl"] : nil; if ([c isKindOfClass:NSDictionary.class]) curUrl = c[@"url"]; }
+                if ([curUrl isEqualToString:url]) return; // already on the latest
+                NSDictionary *json = @{ @"customLoadUrl" : @{ @"enabled" : @YES, @"url" : url } };
+                NSData *outD = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                if (outD) [outD writeToURL:cfgURL atomically:YES];
+            } @catch (__unused id e) {}
+        }];
+        [task resume];
+    } @catch (__unused id e) {}
+}
 
 static void RYConfigurePluginLoader(void) {
     @try {
@@ -4426,25 +4460,26 @@ static void RYConfigurePluginLoader(void) {
             [fm createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
         NSURL *cfg = [dir URLByAppendingPathComponent:@"loader.json"];
 
-        BOOL match = NO;
+        BOOL isOurs = NO;
         NSData *cur = [NSData dataWithContentsOfURL:cfg];
         if (cur) {
             id j = [NSJSONSerialization JSONObjectWithData:cur options:0 error:nil];
             NSDictionary *c = [j isKindOfClass:NSDictionary.class] ? ((NSDictionary *)j)[@"customLoadUrl"] : nil;
-            if ([c isKindOfClass:NSDictionary.class] && [c[@"enabled"] boolValue]
-                && [c[@"url"] isKindOfClass:NSString.class] && [c[@"url"] isEqualToString:RY_PLUGIN_BUNDLE_URL])
-                match = YES;
+            NSString *u = ([c isKindOfClass:NSDictionary.class] && [c[@"enabled"] boolValue] && [c[@"url"] isKindOfClass:NSString.class]) ? c[@"url"] : nil;
+            // Accept ANY 8ubah jsDelivr bundle URL (any commit SHA). The OTA resolver keeps it on the latest,
+            // so we must NOT stomp a newer SHA that a previous launch already wrote with our fallback.
+            if (u && [u hasPrefix:@"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@"] && [u hasSuffix:@"8ubah.min.js"]) isOurs = YES;
         }
-        if (match) return; // already pointed at the 8ubah bundle -> nothing to do
-
-        // Point BTLoader at the 8ubah bundle. We NEVER delete the cached bundle here: clearing it every
-        // launch forced a fresh (slow) network fetch each time, so the bundle showed only if you waited and
-        // vanished when you reopened before the fetch finished. By leaving bundle.js/etag.txt/backup alone,
-        // the first successful fetch is cached and every later launch loads it instantly (and offline).
-        // BTLoader still checks ETag when online, so plugin updates still arrive on their own.
-        NSDictionary *json = @{ @"customLoadUrl" : @{ @"enabled" : @YES, @"url" : RY_PLUGIN_BUNDLE_URL } };
-        NSData *out = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-        if (out) [out writeToURL:cfg atomically:YES];
+        if (!isOurs) {
+            // First run, or pointed elsewhere: write the known-good fallback URL. We NEVER delete the cached
+            // bundle (clearing it every launch forced a slow refetch, so 8ubah showed only if you waited and
+            // vanished on reopen). Leaving the cache means the first fetch loads instantly on every launch.
+            NSDictionary *json = @{ @"customLoadUrl" : @{ @"enabled" : @YES, @"url" : RY_PLUGIN_BUNDLE_URL } };
+            NSData *out = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+            if (out) [out writeToURL:cfg atomically:YES];
+        }
+        // OTA: point the NEXT launch at the newest published bundle (background, best-effort).
+        RYResolveLatestBundle(cfg);
     } @catch (__unused id e) {}
 }
 
