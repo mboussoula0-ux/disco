@@ -4030,10 +4030,10 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 #pragma mark Plugins
 - (void)renderPlugins {
     __weak typeof(self) ws = self;
-    NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify", @"8ubah.dontcontrol"];
-    NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إخفاء المهام", @"Hide quests"), T(@"لا تتحكم فيّ", @"Dont control me")];
-    NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"flag.slash.fill", @"hand.raised.fill"];
-    NSArray *hasCfg = @[@YES, @YES, @NO, @NO, @NO, @NO, @NO, @YES]; // RPC, Status Rotator, Dont Control Me have a ⚙️
+    NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify", @"8ubah.dontcontrol", @"8ubah.reviewdb"];
+    NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إخفاء المهام", @"Hide quests"), T(@"لا تتحكم فيّ", @"Dont control me"), T(@"ريفيو (ReviewDB)", @"ReviewDB")];
+    NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"flag.slash.fill", @"hand.raised.fill", @"star.bubble.fill"];
+    NSArray *hasCfg = @[@YES, @YES, @NO, @NO, @NO, @NO, @NO, @YES, @NO]; // RPC, Status Rotator, Dont Control Me have a ⚙️
     NSDictionary *flags = RYFeaturesLoad();
     for (NSUInteger i = 0; i < ids.count; i++) {
         NSString *pid = ids[i];
@@ -4521,7 +4521,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // Pinned to the dist commit's jsDelivr SHA URL (not @dist): jsDelivr caches a BRANCH ref for ~12h and
 // won't refresh, but a commit-SHA URL is immutable, fast, and served fresh at once. Bump this SHA when
 // publishing a new bundle. (Resolve the latest with: git -C displug rev-parse origin/dist)
-#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@3e82eb22dedd96db6fd6eab64e3f94226067dd5a/8ubah.min.js"
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@7ef3ac92354b4ebb79aa7a0f90a0e351de7b0c63/8ubah.min.js"
 
 // OTA: resolve the latest published bundle (the newest commit on displug's dist branch) and point the
 // NEXT launch at its immutable jsDelivr SHA URL. Runs in the background, best-effort: if GitHub's API is
