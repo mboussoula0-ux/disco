@@ -3679,7 +3679,7 @@ static void RYRpcUploadCatbox(NSData *data, void (^done)(NSString *url, NSString
     [r setValue:@"Mozilla/5.0" forHTTPHeaderField:@"User-Agent"];
     NSMutableData *body = [NSMutableData data];
     [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
-    [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"rpc.png\"\r\nContent-Type: image/png\r\n\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"rpc.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
     [body appendData:data];
     [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
     r.HTTPBody = body;
@@ -3693,9 +3693,10 @@ static void RYRpcUploadImgur(NSData *data, void (^done)(NSString *url, NSString 
     NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://api.imgur.com/3/image"]]; r.HTTPMethod = @"POST"; r.timeoutInterval = 35;
     [r setValue:@"Client-ID 546c25a59c58ad7" forHTTPHeaderField:@"Authorization"];
     [r setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
-    NSString *b64 = [data base64EncodedStringWithOptions:0];
     NSMutableData *body = [NSMutableData data];
-    [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\n%@\r\n--%@--\r\n", boundary, b64, boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"image\"; filename=\"rpc.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:data];
+    [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
     r.HTTPBody = body;
     [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *resp, NSURLResponse *rp, NSError *e) {
         id j = resp ? [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil] : nil;
@@ -3914,10 +3915,13 @@ static void RYRdbSetToken(NSString *tok);
         return;
     }
     if ([self.pickPurpose isEqualToString:@"rpc"]) {
-        [r.itemProvider loadDataRepresentationForTypeIdentifier:@"public.image" completionHandler:^(NSData *d, NSError *e) {
-            if (!d) { dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"تعذر فتح الصورة", @"Couldn't open image")]; }); return; }
+        // load as a UIImage and re-encode to JPEG — the raw picker data can be HEIC/empty, which uploaded a 0-byte
+        // file that Discord could not render. A re-encoded JPEG is always a valid, Discord-friendly image.
+        [r.itemProvider loadObjectOfClass:[UIImage class] completionHandler:^(UIImage *img, NSError *e) {
+            NSData *jpg = (img ? UIImageJPEGRepresentation(img, 0.85) : nil);
+            if (!jpg.length) { dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"تعذر فتح الصورة", @"Couldn't open image")]; }); return; }
             dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"جاري رفع الصورة…", @"Uploading image…")]; });
-            RYRpcUpload(d, ^(NSString *url, NSString *err) {
+            RYRpcUpload(jpg, ^(NSString *url, NSString *err) {
                 if (url) { RYConfigSet(@"8ubah.rpc", @"image", url); dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"انحفظت صورة الـRPC", @"Done")]; [ws rebuild]; }); }
                 else dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:err ?: T(@"فشل الرفع", @"Upload failed")]; });
             });
