@@ -3669,12 +3669,13 @@ static void RYConfigSet(NSString *pid, NSString *key, id value) {
 @property (nonatomic, strong) NSString *pickPurpose; // routes the shared PHPicker callback: nil/"bg" = background image, "stereo" = Stereo video, "rpc" = RPC image upload
 @end
 
-// Upload image data to catbox.moe (anonymous, permanent) and return its public URL — Discord RPC needs a URL,
-// not a local file, so an album image has to be hosted first.
-static void RYRpcUpload(NSData *data, void (^done)(NSString *url, NSString *err)) {
+// Upload image data to a public host and return its permanent URL — Discord RPC needs a URL, not a local file.
+// catbox is tried first, then imgur (Cloudflare-fronted, rarely region-blocked) as a fallback.
+static void RYRpcUploadCatbox(NSData *data, void (^done)(NSString *url, NSString *err)) {
     NSString *boundary = [@"8ubah" stringByAppendingString:[[NSUUID UUID] UUIDString]];
-    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://catbox.moe/user/api.php"]]; r.HTTPMethod = @"POST"; r.timeoutInterval = 40;
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://catbox.moe/user/api.php"]]; r.HTTPMethod = @"POST"; r.timeoutInterval = 35;
     [r setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+    [r setValue:@"Mozilla/5.0" forHTTPHeaderField:@"User-Agent"];
     NSMutableData *body = [NSMutableData data];
     [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
     [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"rpc.png\"\r\nContent-Type: image/png\r\n\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
@@ -3685,6 +3686,27 @@ static void RYRpcUpload(NSData *data, void (^done)(NSString *url, NSString *err)
         NSString *s = resp ? [[[NSString alloc] initWithData:resp encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : nil;
         if (s.length && [s hasPrefix:@"https://"]) done(s, nil); else done(nil, s.length ? s : T(@"فشل الرفع", @"Upload failed"));
     }] resume];
+}
+static void RYRpcUploadImgur(NSData *data, void (^done)(NSString *url, NSString *err)) {
+    NSString *boundary = [@"8ubah" stringByAppendingString:[[NSUUID UUID] UUIDString]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://api.imgur.com/3/image"]]; r.HTTPMethod = @"POST"; r.timeoutInterval = 35;
+    [r setValue:@"Client-ID 546c25a59c58ad7" forHTTPHeaderField:@"Authorization"];
+    [r setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+    NSString *b64 = [data base64EncodedStringWithOptions:0];
+    NSMutableData *body = [NSMutableData data];
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\n%@\r\n--%@--\r\n", boundary, b64, boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    r.HTTPBody = body;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *resp, NSURLResponse *rp, NSError *e) {
+        id j = resp ? [NSJSONSerialization JSONObjectWithData:resp options:0 error:nil] : nil;
+        NSString *link = ([j isKindOfClass:NSDictionary.class] && [j[@"data"] isKindOfClass:NSDictionary.class] && [j[@"data"][@"link"] isKindOfClass:NSString.class]) ? j[@"data"][@"link"] : nil;
+        if (link.length) done(link, nil); else done(nil, T(@"فشل الرفع", @"Upload failed"));
+    }] resume];
+}
+static void RYRpcUpload(NSData *data, void (^done)(NSString *url, NSString *err)) {
+    RYRpcUploadCatbox(data, ^(NSString *url, NSString *err) {
+        if (url) { done(url, nil); return; }
+        RYRpcUploadImgur(data, ^(NSString *u2, NSString *e2) { if (u2) done(u2, nil); else done(nil, e2 ?: err); });
+    });
 }
 
 @implementation RYPanel
