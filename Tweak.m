@@ -4124,6 +4124,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     NSDictionary *c = RYConfigFor(@"8ubah.rpc");
     NSString *(^S)(NSString *) = ^NSString *(NSString *k){ id v = c[k]; return [v isKindOfClass:NSString.class] ? v : @""; };
     [self addCfgField:@"8ubah.rpc" key:@"name"    label:T(@"اسم اللعبة", @"Game name") value:S(@"name")];
+    [self addCfgField:@"8ubah.rpc" key:@"appID"   label:T(@"App ID (اختياري)", @"App ID (optional)") value:S(@"appID")];
     [self addCfgField:@"8ubah.rpc" key:@"details" label:T(@"السطر الأول", @"Details")    value:S(@"details")];
     [self addCfgField:@"8ubah.rpc" key:@"state"   label:T(@"السطر الثاني", @"State")     value:S(@"state")];
     [self addCfgField:@"8ubah.rpc" key:@"image"   label:T(@"صورة (رابط)", @"Image URL")  value:S(@"image")];
@@ -4730,7 +4731,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // Pinned to the dist commit's jsDelivr SHA URL (not @dist): jsDelivr caches a BRANCH ref for ~12h and
 // won't refresh, but a commit-SHA URL is immutable, fast, and served fresh at once. Bump this SHA when
 // publishing a new bundle. (Resolve the latest with: git -C displug rev-parse origin/dist)
-#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@629a40613bebcafbf2d0dbee61abbfd792801965/8ubah.min.js"
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@c68c1683aeb2a166e7e62d99105ee1d2d6ef1407/8ubah.min.js"
 
 // OTA: resolve the latest published bundle (the newest commit on displug's dist branch) and point the
 // NEXT launch at its immutable jsDelivr SHA URL. Runs in the background, best-effort: if GitHub's API is
