@@ -4087,7 +4087,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify", @"8ubah.dontcontrol", @"8ubah.reviewdb"];
     NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إكمال المهام", @"Complete quests"), T(@"لا تتحكم فيّ", @"Dont control me"), T(@"ريفيو (ReviewDB)", @"ReviewDB")];
     NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"checkmark.seal.fill", @"hand.raised.fill", @"star.bubble.fill"];
-    NSArray *hasCfg = @[@YES, @YES, @NO, @NO, @NO, @NO, @NO, @YES, @NO]; // RPC, Status Rotator, Dont Control Me have a ⚙️
+    NSArray *hasCfg = @[@YES, @YES, @NO, @NO, @NO, @NO, @NO, @YES, @YES]; // RPC, Status Rotator, Dont Control Me, ReviewDB have a ⚙️
     NSDictionary *flags = RYFeaturesLoad();
     for (NSUInteger i = 0; i < ids.count; i++) {
         NSString *pid = ids[i];
@@ -4105,6 +4105,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
             if ([pid isEqualToString:@"8ubah.rpc"]) [self renderRpcConfig];
             else if ([pid isEqualToString:@"8ubah.statusrotator"]) [self renderRotatorConfig];
             else if ([pid isEqualToString:@"8ubah.dontcontrol"]) [self renderDcmConfig];
+            else if ([pid isEqualToString:@"8ubah.reviewdb"]) [self renderDbConfig];
         }
     }
     UILabel *note = RYLabel(T(@"شغّل بالمفتاح، واضغط ⚙︎ عشان تعدّل. يثبت ويطبّق داخل ديسكورد تلقائياً.", @"Toggle with the switch, tap ⚙︎ to configure. Persists and applies in Discord."), 13, UIFontWeightMedium, RY_MUTED);
@@ -4172,6 +4173,18 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     UISwitch *s2 = RYSwitch(ad, nil, ^(BOOL v){ RYConfigSet(@"8ubah.dontcontrol", @"antiDisconnect", @(v)); });
     [self.stack addArrangedSubview:RYCard(@[RYSection(@"arrow.uturn.left", T(@"يرجّعك لو سحبوك", @"Anti-move"), s1)])];
     [self.stack addArrangedSubview:RYCard(@[RYSection(@"arrow.uturn.left.circle", T(@"يرجّعك لو فصلوك", @"Anti-disconnect"), s2)])];
+}
+- (void)renderDbConfig {
+    __weak typeof(self) ws = self;
+    BOOL in = RYRdbToken() != nil;
+    [self.stack addArrangedSubview:RYCard(@[
+        RYLabel(in ? T(@"الحالة: مسجّل دخول — تم", @"Status: logged in") : T(@"الحالة: غير مسجّل", @"Status: not logged in"), 15, UIFontWeightBold, in ? RYAccent() : RY_MUTED),
+        RYBtn(in ? T(@"إعادة تسجيل الدخول", @"Re-login") : T(@"تسجيل الدخول", @"Log in"), YES, ^{
+            RYReviewAuthVC *auth = [RYReviewAuthVC new]; auth.modalPresentationStyle = UIModalPresentationFullScreen;
+            auth.onToken = ^(NSString *tok) { if (tok.length) { RYRdbSetToken(tok); [[RYCore shared] hud:T(@"تم تسجيل الدخول", @"Logged in")]; [ws rebuild]; } else [[RYCore shared] hud:T(@"ما قدرت أسجّل الدخول", @"Login failed")]; };
+            [ws presentViewController:auth animated:YES completion:nil];
+        }),
+    ])];
 }
 
 #pragma mark Mic
@@ -4492,7 +4505,7 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     NSURL *url = a.request.URL;
     if (!_got && url && [url.host containsString:@"manti.vendicated.dev"] && [url.path containsString:@"/reviewdb/auth"] && url.query && [url.query containsString:@"code="]) {
         _got = YES; dh(WKNavigationActionPolicyCancel);
-        NSString *full = [url.absoluteString stringByAppendingString:@"&clientMod=8ubah"];
+        NSString *full = [url.absoluteString stringByAppendingString:@"&clientMod=vencord"];
         NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:full]]; [r setValue:@"application/json" forHTTPHeaderField:@"Accept"];
         __weak typeof(self) ws = self;
         [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
@@ -4508,7 +4521,7 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
 
 @interface RYReviewVC : UIViewController <UITextFieldDelegate>
 @property (nonatomic, copy) NSString *uid; @property (nonatomic, copy) NSString *uname;
-@property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field; @property (nonatomic, strong) UIImageView *headAvatar; @property (nonatomic, strong) UILabel *headName; @property (nonatomic, strong) UITextField *tokField; @property (nonatomic, strong) UIButton *loginBtn;
+@property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field; @property (nonatomic, strong) UIImageView *headAvatar; @property (nonatomic, strong) UILabel *headName; @property (nonatomic, strong) UITextField *tokField; @property (nonatomic, strong) UIButton *loginBtn; @property (nonatomic, strong) UIScrollView *scroll;
 @end
 @implementation RYReviewVC
 - (void)viewDidLoad {
@@ -4532,7 +4545,10 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     // write a review — the keyboard Send key submits (and the button)
     UITextField *tf = [UITextField new]; tf.placeholder = T(@"اكتب ريفيو عن الشخص…", @"Write a review…"); tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.borderStyle = UITextBorderStyleRoundedRect; tf.returnKeyType = UIReturnKeySend; tf.enablesReturnKeyAutomatically = YES; tf.delegate = self; [tf.heightAnchor constraintEqualToConstant:48].active = YES; self.field = tf;
     UIButton *post = RYBtn(T(@"نشر الريفيو", @"Post review"), YES, ^{ [ws submitReview]; });
-    for (UIView *v in @[headCard, RYLabel(T(@"الريفيوهات", @"Reviews"), 13, UIFontWeightBold, RY_MUTED), self.listStack, loginCard, tf, post]) [root addArrangedSubview:v];
+    UIView *writeCard = RYCard(@[tf, post]);
+    // write box + login at the TOP (never hidden by the keyboard); the reviews list is below and scrolls
+    for (UIView *v in @[headCard, loginCard, writeCard, RYLabel(T(@"الريفيوهات", @"Reviews"), 13, UIFontWeightBold, RY_MUTED), self.listStack]) [root addArrangedSubview:v];
+    self.scroll = sc;
     [self.view addSubview:sc]; [sc addSubview:root];
     sc.translatesAutoresizingMaskIntoConstraints = NO; root.translatesAutoresizingMaskIntoConstraints = NO;
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -4543,8 +4559,17 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
         [root.leadingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.leadingAnchor], [root.trailingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.trailingAnchor],
         [root.widthAnchor constraintEqualToAnchor:sc.frameLayoutGuide.widthAnchor]]];
     RYFetchUser(self.uid, ^(NSString *name, NSString *avatar) { if (name.length) ws.headName.text = name; RYLoadImageURL(avatar, ws.headAvatar); });
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(kbChange:) name:UIKeyboardWillChangeFrameNotification object:nil];
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(kbHide:) name:UIKeyboardWillHideNotification object:nil];
     [self load];
 }
+- (void)dealloc { [NSNotificationCenter.defaultCenter removeObserver:self]; }
+- (void)kbChange:(NSNotification *)n {
+    CGRect kb = [self.view convertRect:[n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue] fromView:nil];
+    CGFloat overlap = MAX(0, CGRectGetMaxY(self.view.bounds) - kb.origin.y);
+    UIEdgeInsets in = self.scroll.contentInset; in.bottom = overlap; self.scroll.contentInset = in; self.scroll.verticalScrollIndicatorInsets = in;
+}
+- (void)kbHide:(NSNotification *)n { UIEdgeInsets in = self.scroll.contentInset; in.bottom = 0; self.scroll.contentInset = in; self.scroll.verticalScrollIndicatorInsets = in; }
 - (void)openTarget {
     NSString *uid = self.uid;
     [self dismissViewControllerAnimated:YES completion:^{
