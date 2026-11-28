@@ -3712,6 +3712,13 @@ static void RYRpcUpload(NSData *data, void (^done)(NSString *url, NSString *err)
     });
 }
 
+// forward declarations so the panel's ReviewDB ⚙️ can use the login web view + token helpers defined below
+static NSString *RYRdbToken(void);
+static void RYRdbSetToken(NSString *tok);
+@interface RYReviewAuthVC : UIViewController <WKNavigationDelegate>
+@property (nonatomic, copy) void (^onToken)(NSString *token);
+@end
+
 @implementation RYPanel
 - (void)viewDidLoad { [super viewDidLoad]; [self rebuild]; }
 - (void)applyEditLock {
@@ -4490,9 +4497,7 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
 
 // ReviewDB login done for you: shows Discord's real Authorize screen in a web view, and when you grant access
 // it catches the redirect, exchanges the code with the ReviewDB backend, and saves the token automatically.
-@interface RYReviewAuthVC : UIViewController <WKNavigationDelegate>
-@property (nonatomic, copy) void (^onToken)(NSString *token);
-@end
+// (its @interface is forward-declared above @implementation RYPanel)
 @implementation RYReviewAuthVC { WKWebView *_web; BOOL _got; }
 - (void)viewDidLoad {
     [super viewDidLoad]; self.view.backgroundColor = RY_BG; self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
