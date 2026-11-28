@@ -3666,8 +3666,26 @@ static void RYConfigSet(NSString *pid, NSString *key, id value) {
 @property (nonatomic) BOOL stDragging; // true while the user's finger is on the slider: stop auto-updating it so it doesn't fight the drag
 @property (nonatomic) BOOL eqEdit;   // equalizer edit mode: scrolling and sheet dragging are frozen so only the dots move
 @property (nonatomic, weak) UIScrollView *mainScroll;
-@property (nonatomic, strong) NSString *pickPurpose; // routes the shared PHPicker callback: nil/"bg" = background image, "stereo" = Stereo video
+@property (nonatomic, strong) NSString *pickPurpose; // routes the shared PHPicker callback: nil/"bg" = background image, "stereo" = Stereo video, "rpc" = RPC image upload
 @end
+
+// Upload image data to catbox.moe (anonymous, permanent) and return its public URL — Discord RPC needs a URL,
+// not a local file, so an album image has to be hosted first.
+static void RYRpcUpload(NSData *data, void (^done)(NSString *url, NSString *err)) {
+    NSString *boundary = [@"8ubah" stringByAppendingString:[[NSUUID UUID] UUIDString]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://catbox.moe/user/api.php"]]; r.HTTPMethod = @"POST"; r.timeoutInterval = 40;
+    [r setValue:[NSString stringWithFormat:@"multipart/form-data; boundary=%@", boundary] forHTTPHeaderField:@"Content-Type"];
+    NSMutableData *body = [NSMutableData data];
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"reqtype\"\r\n\r\nfileupload\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:[[NSString stringWithFormat:@"--%@\r\nContent-Disposition: form-data; name=\"fileToUpload\"; filename=\"rpc.png\"\r\nContent-Type: image/png\r\n\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    [body appendData:data];
+    [body appendData:[[NSString stringWithFormat:@"\r\n--%@--\r\n", boundary] dataUsingEncoding:NSUTF8StringEncoding]];
+    r.HTTPBody = body;
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *resp, NSURLResponse *rp, NSError *e) {
+        NSString *s = resp ? [[[NSString alloc] initWithData:resp encoding:NSUTF8StringEncoding] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] : nil;
+        if (s.length && [s hasPrefix:@"https://"]) done(s, nil); else done(nil, s.length ? s : T(@"فشل الرفع", @"Upload failed"));
+    }] resume];
+}
 
 @implementation RYPanel
 - (void)viewDidLoad { [super viewDidLoad]; [self rebuild]; }
@@ -3859,6 +3877,17 @@ static void RYConfigSet(NSString *pid, NSString *key, id value) {
                 if (cp) { [ws toast:T(@"تعذر فتح الفيديو", @"Could not open the video")]; return; }
                 CS(@"stName", u.lastPathComponent); CS(@"stFile", dst.lastPathComponent); [ws toast:T(@"جاري التحميل…", @"Loading…")];
                 RYStDecode([NSURL fileURLWithPath:dst], ^(BOOL ok, NSString *msg) { [ws toast:msg ?: (ok ? T(@"جاهز", @"Ready") : T(@"تعذر التحميل", @"Could not load"))]; [ws rebuild]; });
+            });
+        }];
+        return;
+    }
+    if ([self.pickPurpose isEqualToString:@"rpc"]) {
+        [r.itemProvider loadDataRepresentationForTypeIdentifier:@"public.image" completionHandler:^(NSData *d, NSError *e) {
+            if (!d) { dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"تعذر فتح الصورة", @"Couldn't open image")]; }); return; }
+            dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"جاري رفع الصورة…", @"Uploading image…")]; });
+            RYRpcUpload(d, ^(NSString *url, NSString *err) {
+                if (url) { RYConfigSet(@"8ubah.rpc", @"image", url); dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"تم ✅ انحفظت صورة الـRPC", @"Done ✅")]; [ws rebuild]; }); }
+                else dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:err ?: T(@"فشل الرفع", @"Upload failed")]; });
             });
         }];
         return;
@@ -4076,6 +4105,10 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     [self addCfgField:@"8ubah.rpc" key:@"details" label:T(@"السطر الأول", @"Details")    value:S(@"details")];
     [self addCfgField:@"8ubah.rpc" key:@"state"   label:T(@"السطر الثاني", @"State")     value:S(@"state")];
     [self addCfgField:@"8ubah.rpc" key:@"image"   label:T(@"صورة (رابط)", @"Image URL")  value:S(@"image")];
+    [self.stack addArrangedSubview:RYCard(@[RYBtn(T(@"🖼️ صورة من الألبوم", @"🖼️ Image from album"), YES, ^{
+        ws.pickPurpose = @"rpc"; PHPickerConfiguration *pcfg = [PHPickerConfiguration new]; pcfg.filter = [PHPickerFilter imagesFilter]; pcfg.selectionLimit = 1;
+        PHPickerViewController *pp = [[PHPickerViewController alloc] initWithConfiguration:pcfg]; pp.delegate = ws; [ws presentViewController:pp animated:YES completion:nil];
+    })])];
     [self addCfgField:@"8ubah.rpc" key:@"button1"      label:T(@"زر: نص", @"Button text") value:S(@"button1")];
     [self addCfgField:@"8ubah.rpc" key:@"button1url"   label:T(@"زر: رابط", @"Button URL") value:S(@"button1url")];
     NSArray *typeNames = @[T(@"يلعب", @"Playing"), T(@"يبث", @"Streaming"), T(@"يسمع", @"Listening"), T(@"يشاهد", @"Watching"), T(@"ينافس", @"Competing")];
@@ -4377,25 +4410,59 @@ static void RYRdbPost(NSString *uid, NSString *comment, void (^done)(BOOL ok, NS
     }] resume];
 }
 
-@interface RYReviewVC : UIViewController
+// async image load into an image view
+static void RYLoadImageURL(NSString *url, UIImageView *iv) {
+    if (!url.length || !iv) return; NSURL *u = [NSURL URLWithString:url]; if (!u) return;
+    [[NSURLSession.sharedSession dataTaskWithURL:u completionHandler:^(NSData *d, NSURLResponse *r, NSError *e) {
+        if (!d) return; UIImage *img = [UIImage imageWithData:d]; if (!img) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ iv.image = img; });
+    }] resume];
+}
+static UIImageView *RYAvatar(CGFloat sz, NSString *url) {
+    UIImageView *iv = [UIImageView new]; iv.backgroundColor = RY_CARD2; iv.layer.cornerRadius = sz / 2; iv.clipsToBounds = YES; iv.contentMode = UIViewContentModeScaleAspectFill;
+    [iv.widthAnchor constraintEqualToConstant:sz].active = YES; [iv.heightAnchor constraintEqualToConstant:sz].active = YES;
+    RYLoadImageURL(url, iv); return iv;
+}
+// target user's display name + avatar, via the app's own auth headers
+static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *avatar)) {
+    NSDictionary *h; NSString *base; @synchronized (gFPLock) { h = gApiHdr; base = gApiBase; }
+    if (!base || !uid) { done(nil, nil); return; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:[NSString stringWithFormat:@"%@/users/%@", base, uid]]];
+    [h enumerateKeysAndObjectsUsingBlock:^(NSString *k, id v, BOOL *s) { if ([v isKindOfClass:NSString.class]) [r setValue:v forHTTPHeaderField:k]; }];
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+        id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        NSString *un = nil, *av = @"https://cdn.discordapp.com/embed/avatars/0.png";
+        if ([j isKindOfClass:NSDictionary.class]) {
+            un = [j[@"global_name"] isKindOfClass:NSString.class] ? j[@"global_name"] : ([j[@"username"] isKindOfClass:NSString.class] ? j[@"username"] : nil);
+            NSString *hash = [j[@"avatar"] isKindOfClass:NSString.class] ? j[@"avatar"] : nil;
+            if (hash.length) av = [NSString stringWithFormat:@"https://cdn.discordapp.com/avatars/%@/%@.%@?size=160", uid, hash, [hash hasPrefix:@"a_"] ? @"gif" : @"png"];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{ done(un, av); });
+    }] resume];
+}
+
+@interface RYReviewVC : UIViewController <UITextFieldDelegate>
 @property (nonatomic, copy) NSString *uid; @property (nonatomic, copy) NSString *uname;
-@property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field;
+@property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field; @property (nonatomic, strong) UIImageView *headAvatar; @property (nonatomic, strong) UILabel *headName;
 @end
 @implementation RYReviewVC
 - (void)viewDidLoad {
     [super viewDidLoad]; self.view.backgroundColor = RY_BG; self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
     __weak typeof(self) ws = self;
-    UIScrollView *sc = [UIScrollView new]; sc.alwaysBounceVertical = YES; sc.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
-    UIStackView *root = [UIStackView new]; root.axis = UILayoutConstraintAxisVertical; root.spacing = 12;
-    UILabel *title = RYLabel([NSString stringWithFormat:T(@"ريفيو: %@", @"Reviews: %@"), self.uname.length ? self.uname : self.uid], 20, UIFontWeightHeavy, UIColor.whiteColor); title.numberOfLines = 1;
-    self.listStack = [UIStackView new]; self.listStack.axis = UILayoutConstraintAxisVertical; self.listStack.spacing = 8;
-    UITextField *tf = [UITextField new]; tf.placeholder = T(@"اكتب ريفيو عن الشخص…", @"Write a review…"); tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.borderStyle = UITextBorderStyleRoundedRect; [tf.heightAnchor constraintEqualToConstant:46].active = YES; self.field = tf;
-    UIButton *post = RYBtn(T(@"نشر الريفيو", @"Post review"), YES, ^{
-        NSString *c = [ws.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        if (!c.length) return; [ws.view endEditing:YES];
-        RYRdbPost(ws.uid, c, ^(BOOL ok, NSString *err) { [[RYCore shared] hud:(ok ? T(@"تم نشر الريفيو ✅", @"Posted ✅") : err)]; if (ok) { ws.field.text = @""; [ws load]; } });
-    });
-    for (UIView *v in @[title, self.listStack, tf, post]) [root addArrangedSubview:v];
+    UIScrollView *sc = [UIScrollView new]; sc.alwaysBounceVertical = YES; sc.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    UIStackView *root = [UIStackView new]; root.axis = UILayoutConstraintAxisVertical; root.spacing = 14;
+    // target header: avatar + name, tap to open their profile (reveals it behind the sheet)
+    self.headAvatar = RYAvatar(56, nil);
+    self.headName = RYLabel(self.uname.length ? self.uname : self.uid, 19, UIFontWeightHeavy, UIColor.whiteColor); self.headName.numberOfLines = 1;
+    UIStackView *nameCol = [[UIStackView alloc] initWithArrangedSubviews:@[self.headName, RYLabel(T(@"اضغط لفتح الحساب", @"Tap to open profile"), 12, UIFontWeightMedium, RY_MUTED)]]; nameCol.axis = UILayoutConstraintAxisVertical; nameCol.spacing = 2;
+    UIStackView *headRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.headAvatar, nameCol]]; headRow.axis = UILayoutConstraintAxisHorizontal; headRow.spacing = 12; headRow.alignment = UIStackViewAlignmentCenter;
+    UIView *headCard = RYCard(@[headRow]); headCard.userInteractionEnabled = YES;
+    [headCard addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openTarget)]];
+    self.listStack = [UIStackView new]; self.listStack.axis = UILayoutConstraintAxisVertical; self.listStack.spacing = 10;
+    // write a review — the keyboard Send key submits (and the button)
+    UITextField *tf = [UITextField new]; tf.placeholder = T(@"اكتب ريفيو عن الشخص…", @"Write a review…"); tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.borderStyle = UITextBorderStyleRoundedRect; tf.returnKeyType = UIReturnKeySend; tf.enablesReturnKeyAutomatically = YES; tf.delegate = self; [tf.heightAnchor constraintEqualToConstant:48].active = YES; self.field = tf;
+    UIButton *post = RYBtn(T(@"نشر الريفيو", @"Post review"), YES, ^{ [ws submitReview]; });
+    for (UIView *v in @[headCard, RYLabel(T(@"الريفيوهات", @"Reviews"), 13, UIFontWeightBold, RY_MUTED), self.listStack, tf, post]) [root addArrangedSubview:v];
     [self.view addSubview:sc]; [sc addSubview:root];
     sc.translatesAutoresizingMaskIntoConstraints = NO; root.translatesAutoresizingMaskIntoConstraints = NO;
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -4405,7 +4472,22 @@ static void RYRdbPost(NSString *uid, NSString *comment, void (^done)(BOOL ok, NS
         [root.topAnchor constraintEqualToAnchor:sc.contentLayoutGuide.topAnchor], [root.bottomAnchor constraintEqualToAnchor:sc.contentLayoutGuide.bottomAnchor constant:-40],
         [root.leadingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.leadingAnchor], [root.trailingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.trailingAnchor],
         [root.widthAnchor constraintEqualToAnchor:sc.frameLayoutGuide.widthAnchor]]];
+    RYFetchUser(self.uid, ^(NSString *name, NSString *avatar) { if (name.length) ws.headName.text = name; RYLoadImageURL(avatar, ws.headAvatar); });
     [self load];
+}
+- (void)openTarget { [self dismissViewControllerAnimated:YES completion:nil]; }
+- (BOOL)textFieldShouldReturn:(UITextField *)tf { [self submitReview]; return NO; }
+- (void)submitReview {
+    NSString *c = [self.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!c.length) { [[RYCore shared] hud:T(@"اكتب ريفيو أول", @"Write something first")]; return; }
+    [self.view endEditing:YES]; __weak typeof(self) ws = self;
+    RYRdbPost(self.uid, c, ^(BOOL ok, NSString *err) { [[RYCore shared] hud:(ok ? T(@"تم نشر الريفيو ✅", @"Posted ✅") : err)]; if (ok) { ws.field.text = @""; [ws load]; } });
+}
+- (void)openReviewer:(UITapGestureRecognizer *)g {
+    NSString *rid = objc_getAssociatedObject(g, @selector(openReviewer:)); if (!rid.length) return;
+    RYReviewVC *vc = [RYReviewVC new]; vc.uid = rid; vc.modalPresentationStyle = UIModalPresentationPageSheet;
+    UISheetPresentationController *sp = vc.sheetPresentationController; if (sp) { sp.detents = @[UISheetPresentationControllerDetent.largeDetent, UISheetPresentationControllerDetent.mediumDetent]; sp.prefersGrabberVisible = YES; }
+    [self presentViewController:vc animated:YES completion:nil];
 }
 - (void)load {
     for (UIView *v in self.listStack.arrangedSubviews) [v removeFromSuperview];
@@ -4414,14 +4496,26 @@ static void RYRdbPost(NSString *uid, NSString *comment, void (^done)(BOOL ok, NS
     RYRdbGet(self.uid, ^(NSArray *reviews, NSString *err) {
         UIStackView *ls = ws.listStack; if (!ls) return;
         for (UIView *v in ls.arrangedSubviews) [v removeFromSuperview];
-        if (!reviews.count) { [ls addArrangedSubview:RYLabel(err ?: T(@"لا يوجد ريفيو بعد", @"No reviews yet"), 14, UIFontWeightMedium, RY_MUTED)]; return; }
+        if (!reviews.count) { [ls addArrangedSubview:RYLabel(err ?: T(@"لا يوجد ريفيو بعد — اكتب أول ريفيو", @"No reviews yet"), 14, UIFontWeightMedium, RY_MUTED)]; return; }
         for (NSDictionary *rv in reviews) {
             if (![rv isKindOfClass:NSDictionary.class]) continue;
-            NSString *name = [rv[@"sender"] isKindOfClass:NSDictionary.class] && [rv[@"sender"][@"username"] isKindOfClass:NSString.class] ? rv[@"sender"][@"username"] : @"user";
+            NSDictionary *snd = [rv[@"sender"] isKindOfClass:NSDictionary.class] ? rv[@"sender"] : nil;
+            NSString *name = [snd[@"username"] isKindOfClass:NSString.class] ? snd[@"username"] : @"user";
+            NSString *photo = [snd[@"profilePhoto"] isKindOfClass:NSString.class] ? snd[@"profilePhoto"] : nil;
+            NSString *rid = [snd[@"discordID"] isKindOfClass:NSString.class] ? snd[@"discordID"] : nil;
             NSString *comment = [rv[@"comment"] isKindOfClass:NSString.class] ? rv[@"comment"] : @"";
             UILabel *nm = RYLabel(name, 13, UIFontWeightBold, RYAccent());
             UILabel *cm = RYLabel(comment, 15, UIFontWeightRegular, RY_DIM); cm.numberOfLines = 0;
-            [ls addArrangedSubview:RYCard(@[nm, cm])];
+            UIStackView *col = [[UIStackView alloc] initWithArrangedSubviews:@[nm, cm]]; col.axis = UILayoutConstraintAxisVertical; col.spacing = 3;
+            UIStackView *rrow = [[UIStackView alloc] initWithArrangedSubviews:@[RYAvatar(34, photo), col]]; rrow.axis = UILayoutConstraintAxisHorizontal; rrow.spacing = 10; rrow.alignment = UIStackViewAlignmentTop;
+            UIView *card = RYCard(@[rrow]);
+            if (rid.length) {
+                card.userInteractionEnabled = YES;
+                UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:ws action:@selector(openReviewer:)];
+                objc_setAssociatedObject(t, @selector(openReviewer:), rid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [card addGestureRecognizer:t];
+            }
+            [ls addArrangedSubview:card];
         }
     });
 }
