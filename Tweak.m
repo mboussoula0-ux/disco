@@ -3620,8 +3620,43 @@ static void RYFeatureSet(NSString *pid, BOOL on) {
     } @catch (__unused id e) {}
 }
 
+// --- 8ubah per-plugin config (Documents/pyoncord/8ubah-config.json) --------------------------------
+// { "<plugin id>": { ...fields... } }. The ⚙️ config screens in the Plugins tab write this; the JS
+// plugins (RPC, Dont Control Me) read it, so the panel drives their behaviour. JSON both sides agree on.
+static NSString *RYConfigPath(void) {
+    NSURL *docs = [[[NSFileManager defaultManager] URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask] lastObject];
+    if (!docs) return nil;
+    return [[docs.path stringByAppendingPathComponent:@"pyoncord"] stringByAppendingPathComponent:@"8ubah-config.json"];
+}
+static NSMutableDictionary *RYConfigLoad(void) {
+    @try {
+        NSString *p = RYConfigPath();
+        NSData *d = p ? [NSData dataWithContentsOfFile:p] : nil;
+        id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+        if ([j isKindOfClass:NSDictionary.class]) return [j mutableCopy];
+    } @catch (__unused id e) {}
+    return [NSMutableDictionary new];
+}
+static NSDictionary *RYConfigFor(NSString *pid) {
+    id v = RYConfigLoad()[pid];
+    return [v isKindOfClass:NSDictionary.class] ? v : @{};
+}
+static void RYConfigSet(NSString *pid, NSString *key, id value) {
+    @try {
+        NSMutableDictionary *all = RYConfigLoad();
+        NSMutableDictionary *sub = [RYConfigFor(pid) mutableCopy];
+        if (value) sub[key] = value; else [sub removeObjectForKey:key];
+        all[pid] = sub;
+        NSString *p = RYConfigPath(); if (!p) return;
+        [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+        NSData *out = [NSJSONSerialization dataWithJSONObject:all options:0 error:nil];
+        if (out) [out writeToFile:p atomically:YES];
+    } @catch (__unused id e) {}
+}
+
 @interface RYPanel : UIViewController <PHPickerViewControllerDelegate, UIDocumentPickerDelegate, UIColorPickerViewControllerDelegate>
 @property (nonatomic) NSInteger tab;
+@property (nonatomic, copy) NSString *expandedPlugin;
 @property (nonatomic, strong) UIStackView *stack;
 @property (nonatomic, strong) UILabel *invLabel;
 @property (nonatomic, strong) NSTimer *invUI;
@@ -3994,18 +4029,90 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 
 #pragma mark Plugins
 - (void)renderPlugins {
+    __weak typeof(self) ws = self;
     NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify", @"8ubah.dontcontrol"];
     NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إخفاء المهام", @"Hide quests"), T(@"لا تتحكم فيّ", @"Dont control me")];
     NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"flag.slash.fill", @"hand.raised.fill"];
+    NSArray *hasCfg = @[@YES, @YES, @NO, @NO, @NO, @NO, @NO, @YES]; // RPC, Status Rotator, Dont Control Me have a ⚙️
     NSDictionary *flags = RYFeaturesLoad();
     for (NSUInteger i = 0; i < ids.count; i++) {
         NSString *pid = ids[i];
         UISwitch *sw = RYSwitch([flags[pid] boolValue], nil, ^(BOOL v) { RYFeatureSet(pid, v); });
-        [self.stack addArrangedSubview:RYCard(@[RYSection(syms[i], titles[i], sw)])];
+        UIView *trailing = sw;
+        if ([hasCfg[i] boolValue]) {
+            UIButton *gear = RYBtn(@"⚙︎", NO, ^{
+                ws.expandedPlugin = [ws.expandedPlugin isEqualToString:pid] ? nil : pid;
+                [ws rebuild];
+            });
+            trailing = RYHStack(@[gear, sw], 10);
+        }
+        [self.stack addArrangedSubview:RYCard(@[RYSection(syms[i], titles[i], trailing)])];
+        if ([self.expandedPlugin isEqualToString:pid]) {
+            if ([pid isEqualToString:@"8ubah.rpc"]) [self renderRpcConfig];
+            else if ([pid isEqualToString:@"8ubah.statusrotator"]) [self renderRotatorConfig];
+            else if ([pid isEqualToString:@"8ubah.dontcontrol"]) [self renderDcmConfig];
+        }
     }
-    UILabel *note = RYLabel(T(@"شغّل اللي تبي — الإعداد يثبت ويطبّق تلقائياً داخل ديسكورد.", @"Toggle what you want — it persists and applies in Discord."), 13, UIFontWeightMedium, RY_MUTED);
+    UILabel *note = RYLabel(T(@"شغّل بالمفتاح، واضغط ⚙︎ عشان تعدّل. يثبت ويطبّق داخل ديسكورد تلقائياً.", @"Toggle with the switch, tap ⚙︎ to configure. Persists and applies in Discord."), 13, UIFontWeightMedium, RY_MUTED);
     note.numberOfLines = 0;
     [self.stack addArrangedSubview:RYCard(@[note])];
+}
+
+// one tappable "label: value" row that opens a text prompt to edit a config field
+- (void)addCfgField:(NSString *)pid key:(NSString *)key label:(NSString *)label value:(NSString *)val {
+    __weak typeof(self) ws = self;
+    NSString *shown = val.length ? val : T(@"— اضغط للتعديل", @"— tap to set");
+    UIButton *row = RYBtn([NSString stringWithFormat:@"%@: %@", label, shown], NO, ^{
+        [ws ask:label ph:@"" secure:NO ok:^(NSString *v) { RYConfigSet(pid, key, v ?: @""); [ws rebuild]; }];
+    });
+    [self.stack addArrangedSubview:RYCard(@[row])];
+}
+
+- (void)renderRpcConfig {
+    __weak typeof(self) ws = self;
+    NSDictionary *c = RYConfigFor(@"8ubah.rpc");
+    NSString *(^S)(NSString *) = ^NSString *(NSString *k){ id v = c[k]; return [v isKindOfClass:NSString.class] ? v : @""; };
+    [self addCfgField:@"8ubah.rpc" key:@"name"    label:T(@"اسم اللعبة", @"Game name") value:S(@"name")];
+    [self addCfgField:@"8ubah.rpc" key:@"details" label:T(@"السطر الأول", @"Details")    value:S(@"details")];
+    [self addCfgField:@"8ubah.rpc" key:@"state"   label:T(@"السطر الثاني", @"State")     value:S(@"state")];
+    [self addCfgField:@"8ubah.rpc" key:@"image"   label:T(@"صورة (رابط)", @"Image URL")  value:S(@"image")];
+    [self addCfgField:@"8ubah.rpc" key:@"button1"      label:T(@"زر: نص", @"Button text") value:S(@"button1")];
+    [self addCfgField:@"8ubah.rpc" key:@"button1url"   label:T(@"زر: رابط", @"Button URL") value:S(@"button1url")];
+    NSArray *typeNames = @[T(@"يلعب", @"Playing"), T(@"يبث", @"Streaming"), T(@"يسمع", @"Listening"), T(@"يشاهد", @"Watching"), T(@"ينافس", @"Competing")];
+    NSArray *typeVals = @[@0, @1, @2, @3, @5];
+    NSInteger curType = [c[@"type"] isKindOfClass:NSNumber.class] ? [c[@"type"] integerValue] : 0;
+    NSUInteger ti = [typeVals indexOfObject:@(curType)]; if (ti == NSNotFound) ti = 0;
+    UIButton *typeBtn = RYBtn([NSString stringWithFormat:@"%@: %@", T(@"النوع", @"Type"), typeNames[ti]], NO, ^{
+        NSUInteger ni = (ti + 1) % typeVals.count;
+        RYConfigSet(@"8ubah.rpc", @"type", typeVals[ni]); [ws rebuild];
+    });
+    [self.stack addArrangedSubview:RYCard(@[typeBtn])];
+}
+
+- (void)renderRotatorConfig {
+    __weak typeof(self) ws = self;
+    NSDictionary *c = RYConfigFor(@"8ubah.statusrotator");
+    NSString *lines = [c[@"lines"] isKindOfClass:NSString.class] ? c[@"lines"] : @"";
+    NSString *emoji = [c[@"emoji"] isKindOfClass:NSString.class] ? c[@"emoji"] : @"";
+    NSInteger iv = [c[@"interval"] isKindOfClass:NSNumber.class] ? [c[@"interval"] integerValue] : 30;
+    [self addCfgField:@"8ubah.statusrotator" key:@"lines" label:T(@"الحالات (افصلها بـ |)", @"Statuses (| separated)") value:lines];
+    [self addCfgField:@"8ubah.statusrotator" key:@"emoji" label:T(@"إيموجي", @"Emoji") value:emoji];
+    UIButton *ivBtn = RYBtn([NSString stringWithFormat:@"%@: %ld ث", T(@"كل كم ثانية", @"Interval (s)"), (long)iv], NO, ^{
+        [ws ask:T(@"كل كم ثانية (10+)", @"Interval seconds (10+)") ph:@"30" secure:NO ok:^(NSString *v) {
+            NSInteger n = v.integerValue; if (n < 10) n = 10; RYConfigSet(@"8ubah.statusrotator", @"interval", @(n)); [ws rebuild];
+        }];
+    });
+    [self.stack addArrangedSubview:RYCard(@[ivBtn])];
+}
+
+- (void)renderDcmConfig {
+    NSDictionary *c = RYConfigFor(@"8ubah.dontcontrol");
+    BOOL am = c[@"antiMove"] ? [c[@"antiMove"] boolValue] : YES;
+    BOOL ad = c[@"antiDisconnect"] ? [c[@"antiDisconnect"] boolValue] : YES;
+    UISwitch *s1 = RYSwitch(am, nil, ^(BOOL v){ RYConfigSet(@"8ubah.dontcontrol", @"antiMove", @(v)); });
+    UISwitch *s2 = RYSwitch(ad, nil, ^(BOOL v){ RYConfigSet(@"8ubah.dontcontrol", @"antiDisconnect", @(v)); });
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"arrow.uturn.left", T(@"يرجّعك لو سحبوك", @"Anti-move"), s1)])];
+    [self.stack addArrangedSubview:RYCard(@[RYSection(@"arrow.uturn.left.circle", T(@"يرجّعك لو فصلوك", @"Anti-disconnect"), s2)])];
 }
 
 #pragma mark Mic
@@ -4414,7 +4521,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // Pinned to the dist commit's jsDelivr SHA URL (not @dist): jsDelivr caches a BRANCH ref for ~12h and
 // won't refresh, but a commit-SHA URL is immutable, fast, and served fresh at once. Bump this SHA when
 // publishing a new bundle. (Resolve the latest with: git -C displug rev-parse origin/dist)
-#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@8c9258c5e4a2b1304b6d3c774f5122f2c078d2f9/8ubah.min.js"
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@3e82eb22dedd96db6fd6eab64e3f94226067dd5a/8ubah.min.js"
 
 // OTA: resolve the latest published bundle (the newest commit on displug's dist branch) and point the
 // NEXT launch at its immutable jsDelivr SHA URL. Runs in the background, best-effort: if GitHub's API is
