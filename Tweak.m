@@ -4418,7 +4418,7 @@ static void RYLoadImageURL(NSString *url, UIImageView *iv) {
         dispatch_async(dispatch_get_main_queue(), ^{ iv.image = img; });
     }] resume];
 }
-static UIImageView *RYAvatar(CGFloat sz, NSString *url) {
+static UIImageView *RYRdbAvatar(CGFloat sz, NSString *url) {
     UIImageView *iv = [UIImageView new]; iv.backgroundColor = RY_CARD2; iv.layer.cornerRadius = sz / 2; iv.clipsToBounds = YES; iv.contentMode = UIViewContentModeScaleAspectFill;
     [iv.widthAnchor constraintEqualToConstant:sz].active = YES; [iv.heightAnchor constraintEqualToConstant:sz].active = YES;
     RYLoadImageURL(url, iv); return iv;
@@ -4452,7 +4452,7 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     UIScrollView *sc = [UIScrollView new]; sc.alwaysBounceVertical = YES; sc.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
     UIStackView *root = [UIStackView new]; root.axis = UILayoutConstraintAxisVertical; root.spacing = 14;
     // target header: avatar + name, tap to open their profile (reveals it behind the sheet)
-    self.headAvatar = RYAvatar(56, nil);
+    self.headAvatar = RYRdbAvatar(56, nil);
     self.headName = RYLabel(self.uname.length ? self.uname : self.uid, 19, UIFontWeightHeavy, UIColor.whiteColor); self.headName.numberOfLines = 1;
     UIStackView *nameCol = [[UIStackView alloc] initWithArrangedSubviews:@[self.headName, RYLabel(T(@"اضغط لفتح الحساب", @"Tap to open profile"), 12, UIFontWeightMedium, RY_MUTED)]]; nameCol.axis = UILayoutConstraintAxisVertical; nameCol.spacing = 2;
     UIStackView *headRow = [[UIStackView alloc] initWithArrangedSubviews:@[self.headAvatar, nameCol]]; headRow.axis = UILayoutConstraintAxisHorizontal; headRow.spacing = 12; headRow.alignment = UIStackViewAlignmentCenter;
@@ -4507,7 +4507,7 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
             UILabel *nm = RYLabel(name, 13, UIFontWeightBold, RYAccent());
             UILabel *cm = RYLabel(comment, 15, UIFontWeightRegular, RY_DIM); cm.numberOfLines = 0;
             UIStackView *col = [[UIStackView alloc] initWithArrangedSubviews:@[nm, cm]]; col.axis = UILayoutConstraintAxisVertical; col.spacing = 3;
-            UIStackView *rrow = [[UIStackView alloc] initWithArrangedSubviews:@[RYAvatar(34, photo), col]]; rrow.axis = UILayoutConstraintAxisHorizontal; rrow.spacing = 10; rrow.alignment = UIStackViewAlignmentTop;
+            UIStackView *rrow = [[UIStackView alloc] initWithArrangedSubviews:@[RYRdbAvatar(34, photo), col]]; rrow.axis = UILayoutConstraintAxisHorizontal; rrow.spacing = 10; rrow.alignment = UIStackViewAlignmentTop;
             UIView *card = RYCard(@[rrow]);
             if (rid.length) {
                 card.userInteractionEnabled = YES;
