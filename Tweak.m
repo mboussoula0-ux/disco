@@ -4463,6 +4463,21 @@ static void RYRdbPost(NSString *uid, NSString *comment, void (^done)(BOOL ok, NS
         dispatch_async(dispatch_get_main_queue(), ^{ done(ok, ok ? nil : (msg ?: T(@"فشل النشر", @"Post failed"))); });
     }] resume];
 }
+static void RYRdbDelete(NSString *uid, long long reviewId, void (^done)(BOOL ok, NSString *err)) {
+    NSString *tok = RYRdbToken();
+    if (!tok) { done(NO, T(@"سجّل دخول أول", @"Log in first")); return; }
+    NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"%@/users/%@/reviews", RY_RDB_API, uid]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.HTTPMethod = @"DELETE";
+    [r setValue:@"application/json" forHTTPHeaderField:@"Accept"]; [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; [r setValue:tok forHTTPHeaderField:@"Authorization"];
+    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"reviewid": @(reviewId)} options:0 error:nil];
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *data, NSURLResponse *resp, NSError *e) {
+        NSInteger st = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+        id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSString *msg = [j isKindOfClass:NSDictionary.class] && [j[@"message"] isKindOfClass:NSString.class] ? j[@"message"] : nil;
+        BOOL ok = st >= 200 && st < 300;
+        dispatch_async(dispatch_get_main_queue(), ^{ done(ok, ok ? nil : (msg ?: T(@"ما قدرت أحذف (مو ريفيوك؟)", @"Delete failed"))); });
+    }] resume];
+}
 
 // async image load into an image view
 static void RYLoadImageURL(NSString *url, UIImageView *iv) {
@@ -4542,17 +4557,19 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     UIView *headCard = RYCard(@[headRow]); headCard.userInteractionEnabled = YES;
     [headCard addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openTarget)]];
     self.listStack = [UIStackView new]; self.listStack.axis = UILayoutConstraintAxisVertical; self.listStack.spacing = 10;
-    // login card (needed only to WRITE): opens Discord login, then paste the token here (shared with the JS plugin)
-    self.loginBtn = RYBtn(RYRdbToken() ? T(@"مسجّل دخول (إعادة)", @"Logged in (re-login)") : T(@"تسجيل الدخول", @"Log in"), NO, ^{ [ws doLogin]; });
-    UITextField *tok = [UITextField new]; tok.placeholder = T(@"الصق التوكن ثم احفظ", @"Paste token then save"); tok.textColor = UIColor.whiteColor; tok.backgroundColor = RY_CARD2; tok.borderStyle = UITextBorderStyleRoundedRect; tok.autocapitalizationType = UITextAutocapitalizationTypeNone; tok.autocorrectionType = UITextAutocorrectionTypeNo; [tok.heightAnchor constraintEqualToConstant:44].active = YES; self.tokField = tok; tok.text = RYRdbToken();
-    UIButton *saveTok = RYBtn(T(@"حفظ التوكن", @"Save token"), NO, ^{ NSString *t = [ws.tokField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]; if (!t.length) return; RYRdbSetToken(t); [[RYCore shared] hud:T(@"انحفظ، تقدر تنشر الحين", @"Saved")]; });
-    UIView *loginCard = RYCard(@[RYLabel(T(@"لكتابة ريفيو — سجّل دخول مرة وحدة", @"To write a review — log in once"), 13, UIFontWeightBold, nil), self.loginBtn, tok, saveTok]);
+    // login is only shown when NOT logged in — a single button; once logged in the whole card is hidden.
+    UIView *loginCard = nil;
+    if (!RYRdbToken()) loginCard = RYCard(@[RYBtn(T(@"تسجيل الدخول (لكتابة ريفيو)", @"Log in (to write a review)"), NO, ^{ [ws doLogin]; })]);
     // write a review — the keyboard Send key submits (and the button)
     UITextField *tf = [UITextField new]; tf.placeholder = T(@"اكتب ريفيو عن الشخص…", @"Write a review…"); tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.borderStyle = UITextBorderStyleRoundedRect; tf.returnKeyType = UIReturnKeySend; tf.enablesReturnKeyAutomatically = YES; tf.delegate = self; [tf.heightAnchor constraintEqualToConstant:48].active = YES; self.field = tf;
     UIButton *post = RYBtn(T(@"نشر الريفيو", @"Post review"), YES, ^{ [ws submitReview]; });
     UIView *writeCard = RYCard(@[tf, post]);
-    // write box + login at the TOP (never hidden by the keyboard); the reviews list is below and scrolls
-    for (UIView *v in @[headCard, loginCard, writeCard, RYLabel(T(@"الريفيوهات", @"Reviews"), 13, UIFontWeightBold, RY_MUTED), self.listStack]) [root addArrangedSubview:v];
+    // write box at the TOP (never hidden by the keyboard); the reviews list is below and scrolls
+    NSMutableArray *rows = [NSMutableArray arrayWithObjects:headCard, writeCard, nil];
+    if (loginCard) [rows addObject:loginCard];
+    [rows addObject:RYLabel(T(@"الريفيوهات — اضغط مطوّل لحذف ريفيوك", @"Reviews — long-press to delete yours"), 13, UIFontWeightBold, RY_MUTED)];
+    [rows addObject:self.listStack];
+    for (UIView *v in rows) [root addArrangedSubview:v];
     self.scroll = sc;
     [self.view addSubview:sc]; [sc addSubview:root];
     sc.translatesAutoresizingMaskIntoConstraints = NO; root.translatesAutoresizingMaskIntoConstraints = NO;
@@ -4606,6 +4623,18 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     UISheetPresentationController *sp = vc.sheetPresentationController; if (sp) { sp.detents = @[UISheetPresentationControllerDetent.largeDetent, UISheetPresentationControllerDetent.mediumDetent]; sp.prefersGrabberVisible = YES; }
     [self presentViewController:vc animated:YES completion:nil];
 }
+- (void)longPressReview:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    NSNumber *rid = objc_getAssociatedObject(g, @selector(longPressReview:)); if (!rid) return;
+    __weak typeof(self) ws = self;
+    UIAlertController *al = [UIAlertController alertControllerWithTitle:T(@"حذف هذا الريفيو؟", @"Delete this review?") message:nil preferredStyle:UIAlertControllerStyleActionSheet];
+    [al addAction:[UIAlertAction actionWithTitle:T(@"حذف", @"Delete") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        RYRdbDelete(ws.uid, rid.longLongValue, ^(BOOL ok, NSString *err) { [[RYCore shared] hud:(ok ? T(@"انحذف", @"Deleted") : err)]; if (ok) [ws load]; });
+    }]];
+    [al addAction:[UIAlertAction actionWithTitle:T(@"إلغاء", @"Cancel") style:UIAlertActionStyleCancel handler:nil]];
+    al.popoverPresentationController.sourceView = g.view ?: self.view; al.popoverPresentationController.sourceRect = (g.view ?: self.view).bounds;
+    [self presentViewController:al animated:YES completion:nil];
+}
 - (void)load {
     for (UIView *v in self.listStack.arrangedSubviews) [v removeFromSuperview];
     [self.listStack addArrangedSubview:RYLabel(T(@"جاري التحميل…", @"Loading…"), 14, UIFontWeightMedium, RY_MUTED)];
@@ -4620,17 +4649,23 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
             NSString *name = [snd[@"username"] isKindOfClass:NSString.class] ? snd[@"username"] : @"user";
             NSString *photo = [snd[@"profilePhoto"] isKindOfClass:NSString.class] ? snd[@"profilePhoto"] : nil;
             NSString *rid = [snd[@"discordID"] isKindOfClass:NSString.class] ? snd[@"discordID"] : nil;
+            long long rvId = [rv[@"id"] isKindOfClass:NSNumber.class] ? [rv[@"id"] longLongValue] : 0;
             NSString *comment = [rv[@"comment"] isKindOfClass:NSString.class] ? rv[@"comment"] : @"";
             UILabel *nm = RYLabel(name, 13, UIFontWeightBold, RYAccent());
             UILabel *cm = RYLabel(comment, 15, UIFontWeightRegular, RY_DIM); cm.numberOfLines = 0;
             UIStackView *col = [[UIStackView alloc] initWithArrangedSubviews:@[nm, cm]]; col.axis = UILayoutConstraintAxisVertical; col.spacing = 3;
             UIStackView *rrow = [[UIStackView alloc] initWithArrangedSubviews:@[RYRdbAvatar(34, photo), col]]; rrow.axis = UILayoutConstraintAxisHorizontal; rrow.spacing = 10; rrow.alignment = UIStackViewAlignmentTop;
             UIView *card = RYCard(@[rrow]);
+            card.userInteractionEnabled = YES;
             if (rid.length) {
-                card.userInteractionEnabled = YES;
                 UITapGestureRecognizer *t = [[UITapGestureRecognizer alloc] initWithTarget:ws action:@selector(openReviewer:)];
                 objc_setAssociatedObject(t, @selector(openReviewer:), rid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 [card addGestureRecognizer:t];
+            }
+            if (rvId > 0) { // long-press to delete (works for your own reviews and reviews on your profile; the server checks)
+                UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc] initWithTarget:ws action:@selector(longPressReview:)];
+                objc_setAssociatedObject(lp, @selector(longPressReview:), @(rvId), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                [card addGestureRecognizer:lp];
             }
             [ls addArrangedSubview:card];
         }
