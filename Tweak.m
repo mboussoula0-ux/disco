@@ -3465,7 +3465,7 @@ static void RYCatSet(BOOL on) { CS(@"cat", @(on)); RYCatTick(); }
 @property (nonatomic, weak) UIView *bgHost;
 @property (nonatomic) NSInteger missTicks;
 @property (nonatomic) NSInteger stamp;
-@property (nonatomic, strong) UIView *fpBar; @property (nonatomic, strong) UIButton *fpFollowBtn, *fpPullBtn; @property (nonatomic, copy) NSString *fpUid; @property (nonatomic) NSInteger fpMiss;
+@property (nonatomic, strong) UIView *fpBar; @property (nonatomic, strong) UIButton *fpFollowBtn, *fpPullBtn, *fpReviewBtn; @property (nonatomic, copy) NSString *fpUid; @property (nonatomic) NSInteger fpMiss;
 - (void)fpTick;
 + (instancetype)shared;
 - (void)hud:(NSString *)s;
@@ -4031,8 +4031,8 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
 - (void)renderPlugins {
     __weak typeof(self) ws = self;
     NSArray *ids = @[@"8ubah.rpc", @"8ubah.statusrotator", @"8ubah.noblocked", @"8ubah.callidle", @"8ubah.relnotify", @"8ubah.hidden", @"8ubah.questify", @"8ubah.dontcontrol", @"8ubah.reviewdb"];
-    NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إخفاء المهام", @"Hide quests"), T(@"لا تتحكم فيّ", @"Dont control me"), T(@"ريفيو (ReviewDB)", @"ReviewDB")];
-    NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"flag.slash.fill", @"hand.raised.fill", @"star.bubble.fill"];
+    NSArray *titles = @[T(@"حالة مخصّصة (RPC)", @"Custom RPC"), T(@"تدوير الحالة", @"Status Rotator"), T(@"إظهار المحظورين", @"Show blocked msgs"), T(@"بدون طرد الخمول", @"No call idle"), T(@"منبّه العلاقات", @"Relationship alerts"), T(@"القنوات المخفية", @"Hidden channels"), T(@"إكمال المهام", @"Complete quests"), T(@"لا تتحكم فيّ", @"Dont control me"), T(@"ريفيو (ReviewDB)", @"ReviewDB")];
+    NSArray *syms = @[@"gamecontroller.fill", @"arrow.triangle.2.circlepath", @"eye.fill", @"phone.fill", @"bell.fill", @"lock.open.fill", @"checkmark.seal.fill", @"hand.raised.fill", @"star.bubble.fill"];
     NSArray *hasCfg = @[@YES, @YES, @NO, @NO, @NO, @NO, @NO, @YES, @NO]; // RPC, Status Rotator, Dont Control Me have a ⚙️
     NSDictionary *flags = RYFeaturesLoad();
     for (NSUInteger i = 0; i < ids.count; i++) {
@@ -4341,6 +4341,92 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
 @end
 
 
+#pragma mark - ReviewDB (native): a Reviews button on the profile next to Follow/Pull. Same backend as the
+// desktop ReviewDB plugin (manti.vendicated.dev). Reading needs no login; writing uses the token the JS
+// ReviewDB plugin stored at Documents/pyoncord/8ubah-reviewdb.json.
+#define RY_RDB_API @"https://manti.vendicated.dev/api/reviewdb"
+static NSString *RYRdbToken(void) {
+    NSString *p = [[[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"pyoncord"] stringByAppendingPathComponent:@"8ubah-reviewdb.json"] copy];
+    NSData *d = [NSData dataWithContentsOfFile:p]; if (!d) return nil;
+    id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+    id t = [j isKindOfClass:NSDictionary.class] ? j[@"token"] : nil;
+    return [t isKindOfClass:NSString.class] && [t length] ? t : nil;
+}
+static void RYRdbGet(NSString *uid, void (^done)(NSArray *reviews, NSString *err)) {
+    NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"%@/users/%@/reviews?limit=50", RY_RDB_API, uid]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; [r setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *data, NSURLResponse *resp, NSError *e) {
+        NSArray *out = nil; id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        if ([j isKindOfClass:NSDictionary.class] && [j[@"reviews"] isKindOfClass:NSArray.class]) out = j[@"reviews"];
+        dispatch_async(dispatch_get_main_queue(), ^{ done(out, out ? nil : T(@"ما قدرت أجيب الريفيو", @"Couldn't load reviews")); });
+    }] resume];
+}
+static void RYRdbPost(NSString *uid, NSString *comment, void (^done)(BOOL ok, NSString *err)) {
+    NSString *tok = RYRdbToken();
+    if (!tok) { done(NO, T(@"سجّل دخول أول من: 8ubah ← الإضافات ← ReviewDB", @"Log in first: 8ubah → Plugins → ReviewDB")); return; }
+    NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"%@/users/%@/reviews", RY_RDB_API, uid]];
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:u]; r.HTTPMethod = @"PUT";
+    [r setValue:@"application/json" forHTTPHeaderField:@"Accept"]; [r setValue:@"application/json" forHTTPHeaderField:@"Content-Type"]; [r setValue:tok forHTTPHeaderField:@"Authorization"];
+    r.HTTPBody = [NSJSONSerialization dataWithJSONObject:@{@"userid": uid, @"comment": comment} options:0 error:nil];
+    [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *data, NSURLResponse *resp, NSError *e) {
+        NSInteger st = [resp isKindOfClass:NSHTTPURLResponse.class] ? ((NSHTTPURLResponse *)resp).statusCode : 0;
+        id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+        NSString *msg = [j isKindOfClass:NSDictionary.class] && [j[@"message"] isKindOfClass:NSString.class] ? j[@"message"] : nil;
+        BOOL ok = st >= 200 && st < 300;
+        dispatch_async(dispatch_get_main_queue(), ^{ done(ok, ok ? nil : (msg ?: T(@"فشل النشر", @"Post failed"))); });
+    }] resume];
+}
+
+@interface RYReviewVC : UIViewController
+@property (nonatomic, copy) NSString *uid; @property (nonatomic, copy) NSString *uname;
+@property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field;
+@end
+@implementation RYReviewVC
+- (void)viewDidLoad {
+    [super viewDidLoad]; self.view.backgroundColor = RY_BG; self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    __weak typeof(self) ws = self;
+    UIScrollView *sc = [UIScrollView new]; sc.alwaysBounceVertical = YES; sc.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    UIStackView *root = [UIStackView new]; root.axis = UILayoutConstraintAxisVertical; root.spacing = 12;
+    UILabel *title = RYLabel([NSString stringWithFormat:T(@"ريفيو: %@", @"Reviews: %@"), self.uname.length ? self.uname : self.uid], 20, UIFontWeightHeavy, UIColor.whiteColor); title.numberOfLines = 1;
+    self.listStack = [UIStackView new]; self.listStack.axis = UILayoutConstraintAxisVertical; self.listStack.spacing = 8;
+    UITextField *tf = [UITextField new]; tf.placeholder = T(@"اكتب ريفيو عن الشخص…", @"Write a review…"); tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.borderStyle = UITextBorderStyleRoundedRect; [tf.heightAnchor constraintEqualToConstant:46].active = YES; self.field = tf;
+    UIButton *post = RYBtn(T(@"نشر الريفيو", @"Post review"), YES, ^{
+        NSString *c = [ws.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!c.length) return; [ws.view endEditing:YES];
+        RYRdbPost(ws.uid, c, ^(BOOL ok, NSString *err) { [[RYCore shared] hud:(ok ? T(@"تم نشر الريفيو ✅", @"Posted ✅") : err)]; if (ok) { ws.field.text = @""; [ws load]; } });
+    });
+    for (UIView *v in @[title, self.listStack, tf, post]) [root addArrangedSubview:v];
+    [self.view addSubview:sc]; [sc addSubview:root];
+    sc.translatesAutoresizingMaskIntoConstraints = NO; root.translatesAutoresizingMaskIntoConstraints = NO;
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [sc.topAnchor constraintEqualToAnchor:g.topAnchor constant:18], [sc.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+        [sc.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:16], [sc.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-16],
+        [root.topAnchor constraintEqualToAnchor:sc.contentLayoutGuide.topAnchor], [root.bottomAnchor constraintEqualToAnchor:sc.contentLayoutGuide.bottomAnchor constant:-40],
+        [root.leadingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.leadingAnchor], [root.trailingAnchor constraintEqualToAnchor:sc.contentLayoutGuide.trailingAnchor],
+        [root.widthAnchor constraintEqualToAnchor:sc.frameLayoutGuide.widthAnchor]]];
+    [self load];
+}
+- (void)load {
+    for (UIView *v in self.listStack.arrangedSubviews) [v removeFromSuperview];
+    [self.listStack addArrangedSubview:RYLabel(T(@"جاري التحميل…", @"Loading…"), 14, UIFontWeightMedium, RY_MUTED)];
+    __weak typeof(self) ws = self;
+    RYRdbGet(self.uid, ^(NSArray *reviews, NSString *err) {
+        UIStackView *ls = ws.listStack; if (!ls) return;
+        for (UIView *v in ls.arrangedSubviews) [v removeFromSuperview];
+        if (!reviews.count) { [ls addArrangedSubview:RYLabel(err ?: T(@"لا يوجد ريفيو بعد", @"No reviews yet"), 14, UIFontWeightMedium, RY_MUTED)]; return; }
+        for (NSDictionary *rv in reviews) {
+            if (![rv isKindOfClass:NSDictionary.class]) continue;
+            NSString *name = [rv[@"sender"] isKindOfClass:NSDictionary.class] && [rv[@"sender"][@"username"] isKindOfClass:NSString.class] ? rv[@"sender"][@"username"] : @"user";
+            NSString *comment = [rv[@"comment"] isKindOfClass:NSString.class] ? rv[@"comment"] : @"";
+            UILabel *nm = RYLabel(name, 13, UIFontWeightBold, RYAccent());
+            UILabel *cm = RYLabel(comment, 15, UIFontWeightRegular, RY_DIM); cm.numberOfLines = 0;
+            [ls addArrangedSubview:RYCard(@[nm, cm])];
+        }
+    });
+}
+@end
+
 #pragma mark - Core
 @implementation RYCore
 + (instancetype)shared { static RYCore *c; static dispatch_once_t t; dispatch_once(&t, ^{ c = [RYCore new]; }); return c; }
@@ -4404,12 +4490,18 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
     UIView *root = self.win.rootViewController.view; if (!root) return;
     UIView *bar = [UIView new]; bar.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.94]; bar.layer.cornerRadius = 25; bar.layer.shadowOpacity = 0.35; bar.layer.shadowRadius = 8; bar.layer.shadowOffset = CGSizeMake(0, 3);
     __weak typeof(self) ws = self;
-    UIButton *f = [UIButton buttonWithType:UIButtonTypeSystem], *p = [UIButton buttonWithType:UIButtonTypeSystem];
-    f.frame = CGRectMake(8, 6, 108, 38); p.frame = CGRectMake(124, 6, 108, 38); bar.frame = CGRectMake(0, 0, 240, 50);
+    UIButton *f = [UIButton buttonWithType:UIButtonTypeSystem], *p = [UIButton buttonWithType:UIButtonTypeSystem], *rv = [UIButton buttonWithType:UIButtonTypeSystem];
+    f.frame = CGRectMake(8, 6, 100, 38); p.frame = CGRectMake(112, 6, 100, 38); rv.frame = CGRectMake(216, 6, 112, 38); bar.frame = CGRectMake(0, 0, 336, 50);
     [f addAction:[UIAction actionWithHandler:^(UIAction *a) { NSString *u = ws.fpUid; if (!u) { [ws hud:T(@"ما قدرت أحدد الحساب", @"Can't tell which account")]; return; } RYFPToggleFollow(u); [ws fpRefresh]; }] forControlEvents:UIControlEventTouchUpInside];
     [p addAction:[UIAction actionWithHandler:^(UIAction *a) { NSString *u = ws.fpUid; if (!u) { [ws hud:T(@"ما قدرت أحدد الحساب", @"Can't tell which account")]; return; } RYFPTogglePull(u); [ws fpRefresh]; }] forControlEvents:UIControlEventTouchUpInside];
-    [bar addSubview:f]; [bar addSubview:p]; [root addSubview:bar];
-    self.fpBar = bar; self.fpFollowBtn = f; self.fpPullBtn = p; bar.hidden = YES;
+    [rv addAction:[UIAction actionWithHandler:^(UIAction *a) {
+        NSString *u = ws.fpUid; if (!u) { [ws hud:T(@"ما قدرت أحدد الحساب", @"Can't tell which account")]; return; }
+        RYReviewVC *vc = [RYReviewVC new]; vc.uid = u; vc.modalPresentationStyle = UIModalPresentationPageSheet;
+        UISheetPresentationController *sp = vc.sheetPresentationController; if (sp) { sp.detents = @[UISheetPresentationControllerDetent.largeDetent, UISheetPresentationControllerDetent.mediumDetent]; sp.prefersGrabberVisible = YES; }
+        [ws.win.rootViewController presentViewController:vc animated:YES completion:^{ [ws.win makeKeyWindow]; }];
+    }] forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:f]; [bar addSubview:p]; [bar addSubview:rv]; [root addSubview:bar];
+    self.fpBar = bar; self.fpFollowBtn = f; self.fpPullBtn = p; self.fpReviewBtn = rv; bar.hidden = YES;
 }
 static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
     UIButtonConfiguration *c = [UIButtonConfiguration filledButtonConfiguration]; c.title = title; c.cornerStyle = UIButtonConfigurationCornerStyleCapsule;
@@ -4420,6 +4512,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
     @synchronized (gFPLock) { fo = u && [gFPFollow isEqual:u]; pu = u && [gFPPull containsObject:u]; }
     RYFPStyle(self.fpFollowBtn, fo ? @"Unfollow" : @"Follow", fo ? RY_RED : RYAccent());
     RYFPStyle(self.fpPullBtn, pu ? @"Unpull" : @"Pull", pu ? RY_RED : [UIColor colorWithWhite:0.26 alpha:1]);
+    RYFPStyle(self.fpReviewBtn, T(@"ريفيو", @"Reviews"), [UIColor colorWithRed:0.16 green:0.68 blue:0.54 alpha:1]);
 }
 - (void)fpTick {                // a profile sheet is open -> Follow / Pull buttons at the bottom of the screen
     RYFPInit();
@@ -4521,7 +4614,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // Pinned to the dist commit's jsDelivr SHA URL (not @dist): jsDelivr caches a BRANCH ref for ~12h and
 // won't refresh, but a commit-SHA URL is immutable, fast, and served fresh at once. Bump this SHA when
 // publishing a new bundle. (Resolve the latest with: git -C displug rev-parse origin/dist)
-#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@7ef3ac92354b4ebb79aa7a0f90a0e351de7b0c63/8ubah.min.js"
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@629a40613bebcafbf2d0dbee61abbfd792801965/8ubah.min.js"
 
 // OTA: resolve the latest published bundle (the newest commit on displug's dist branch) and point the
 // NEXT launch at its immutable jsDelivr SHA URL. Runs in the background, best-effort: if GitHub's API is
