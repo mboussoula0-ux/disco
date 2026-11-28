@@ -3703,9 +3703,11 @@ static void RYRpcUploadImgur(NSData *data, void (^done)(NSString *url, NSString 
     }] resume];
 }
 static void RYRpcUpload(NSData *data, void (^done)(NSString *url, NSString *err)) {
-    RYRpcUploadCatbox(data, ^(NSString *url, NSString *err) {
+    // imgur first: i.imgur.com is reliably fetched by Discord's media proxy (catbox sometimes is not, which is
+    // why the RPC picture stayed blank). catbox is the fallback.
+    RYRpcUploadImgur(data, ^(NSString *url, NSString *err) {
         if (url) { done(url, nil); return; }
-        RYRpcUploadImgur(data, ^(NSString *u2, NSString *e2) { if (u2) done(u2, nil); else done(nil, e2 ?: err); });
+        RYRpcUploadCatbox(data, ^(NSString *u2, NSString *e2) { if (u2) done(u2, nil); else done(nil, e2 ?: err); });
     });
 }
 
@@ -4401,12 +4403,20 @@ static UIView *RYSl(NSString *lo, NSString *hi, NSString *unit, float mn, float 
 // desktop ReviewDB plugin (manti.vendicated.dev). Reading needs no login; writing uses the token the JS
 // ReviewDB plugin stored at Documents/pyoncord/8ubah-reviewdb.json.
 #define RY_RDB_API @"https://manti.vendicated.dev/api/reviewdb"
+static NSString *RYRdbTokenPath(void) {
+    return [[[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"pyoncord"] stringByAppendingPathComponent:@"8ubah-reviewdb.json"] copy];
+}
 static NSString *RYRdbToken(void) {
-    NSString *p = [[[NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject stringByAppendingPathComponent:@"pyoncord"] stringByAppendingPathComponent:@"8ubah-reviewdb.json"] copy];
-    NSData *d = [NSData dataWithContentsOfFile:p]; if (!d) return nil;
+    NSData *d = [NSData dataWithContentsOfFile:RYRdbTokenPath()]; if (!d) return nil;
     id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
     id t = [j isKindOfClass:NSDictionary.class] ? j[@"token"] : nil;
     return [t isKindOfClass:NSString.class] && [t length] ? t : nil;
+}
+static void RYRdbSetToken(NSString *tok) {
+    NSString *p = RYRdbTokenPath();
+    [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+    NSData *d = [NSJSONSerialization dataWithJSONObject:@{@"token": tok ?: @""} options:0 error:nil];
+    [d writeToFile:p atomically:YES];
 }
 static void RYRdbGet(NSString *uid, void (^done)(NSArray *reviews, NSString *err)) {
     NSURL *u = [NSURL URLWithString:[NSString stringWithFormat:@"%@/users/%@/reviews?limit=50", RY_RDB_API, uid]];
@@ -4466,7 +4476,7 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
 
 @interface RYReviewVC : UIViewController <UITextFieldDelegate>
 @property (nonatomic, copy) NSString *uid; @property (nonatomic, copy) NSString *uname;
-@property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field; @property (nonatomic, strong) UIImageView *headAvatar; @property (nonatomic, strong) UILabel *headName;
+@property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field; @property (nonatomic, strong) UIImageView *headAvatar; @property (nonatomic, strong) UILabel *headName; @property (nonatomic, strong) UITextField *tokField; @property (nonatomic, strong) UIButton *loginBtn;
 @end
 @implementation RYReviewVC
 - (void)viewDidLoad {
@@ -4482,10 +4492,15 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     UIView *headCard = RYCard(@[headRow]); headCard.userInteractionEnabled = YES;
     [headCard addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openTarget)]];
     self.listStack = [UIStackView new]; self.listStack.axis = UILayoutConstraintAxisVertical; self.listStack.spacing = 10;
+    // login card (needed only to WRITE): opens Discord login, then paste the token here (shared with the JS plugin)
+    self.loginBtn = RYBtn(RYRdbToken() ? T(@"مسجّل دخول ✅ (إعادة)", @"Logged in ✅ (re-login)") : T(@"🔑 تسجيل الدخول", @"🔑 Log in"), NO, ^{ [ws doLogin]; });
+    UITextField *tok = [UITextField new]; tok.placeholder = T(@"الصق التوكن ثم احفظ", @"Paste token then save"); tok.textColor = UIColor.whiteColor; tok.backgroundColor = RY_CARD2; tok.borderStyle = UITextBorderStyleRoundedRect; tok.autocapitalizationType = UITextAutocapitalizationTypeNone; tok.autocorrectionType = UITextAutocorrectionTypeNo; [tok.heightAnchor constraintEqualToConstant:44].active = YES; self.tokField = tok; tok.text = RYRdbToken();
+    UIButton *saveTok = RYBtn(T(@"حفظ التوكن", @"Save token"), NO, ^{ NSString *t = [ws.tokField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]; if (!t.length) return; RYRdbSetToken(t); [[RYCore shared] hud:T(@"انحفظ ✅ تقدر تنشر الحين", @"Saved ✅")]; });
+    UIView *loginCard = RYCard(@[RYLabel(T(@"لكتابة ريفيو — سجّل دخول مرة وحدة", @"To write a review — log in once"), 13, UIFontWeightBold, nil), self.loginBtn, tok, saveTok]);
     // write a review — the keyboard Send key submits (and the button)
     UITextField *tf = [UITextField new]; tf.placeholder = T(@"اكتب ريفيو عن الشخص…", @"Write a review…"); tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.borderStyle = UITextBorderStyleRoundedRect; tf.returnKeyType = UIReturnKeySend; tf.enablesReturnKeyAutomatically = YES; tf.delegate = self; [tf.heightAnchor constraintEqualToConstant:48].active = YES; self.field = tf;
     UIButton *post = RYBtn(T(@"نشر الريفيو", @"Post review"), YES, ^{ [ws submitReview]; });
-    for (UIView *v in @[headCard, RYLabel(T(@"الريفيوهات", @"Reviews"), 13, UIFontWeightBold, RY_MUTED), self.listStack, tf, post]) [root addArrangedSubview:v];
+    for (UIView *v in @[headCard, RYLabel(T(@"الريفيوهات", @"Reviews"), 13, UIFontWeightBold, RY_MUTED), self.listStack, loginCard, tf, post]) [root addArrangedSubview:v];
     [self.view addSubview:sc]; [sc addSubview:root];
     sc.translatesAutoresizingMaskIntoConstraints = NO; root.translatesAutoresizingMaskIntoConstraints = NO;
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
@@ -4498,9 +4513,22 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     RYFetchUser(self.uid, ^(NSString *name, NSString *avatar) { if (name.length) ws.headName.text = name; RYLoadImageURL(avatar, ws.headAvatar); });
     [self load];
 }
-- (void)openTarget { [self dismissViewControllerAnimated:YES completion:nil]; }
-- (BOOL)textFieldShouldReturn:(UITextField *)tf { [self submitReview]; return NO; }
+- (void)openTarget {
+    NSString *uid = self.uid;
+    [self dismissViewControllerAnimated:YES completion:^{
+        // hand control back to Discord's window so its (already open) profile sheet is interactive again
+        for (UIWindow *w in RYAppWindows()) { if (![NSStringFromClass(w.class) isEqual:@"RYWindow"]) { [w makeKeyWindow]; break; } }
+        (void)uid;
+    }];
+}
+- (void)doLogin {
+    NSString *u = @"https://discord.com/oauth2/authorize?client_id=915703782174752809&redirect_uri=https%3A%2F%2Fmanti.vendicated.dev%2Fapi%2Freviewdb%2Fauth&response_type=code&scope=identify";
+    [UIApplication.sharedApplication openURL:[NSURL URLWithString:u] options:@{} completionHandler:nil];
+    [[RYCore shared] hud:T(@"بعد الدخول انسخ التوكن والصقه بالخانة ثم احفظ", @"After login, copy the token, paste it, then Save")];
+}
+- (BOOL)textFieldShouldReturn:(UITextField *)tf { if (tf == self.field) [self submitReview]; return NO; }
 - (void)submitReview {
+    if (!RYRdbToken()) { [[RYCore shared] hud:T(@"سجّل دخول أول (الزر تحت)", @"Log in first (button below)")]; return; }
     NSString *c = [self.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (!c.length) { [[RYCore shared] hud:T(@"اكتب ريفيو أول", @"Write something first")]; return; }
     [self.view endEditing:YES]; __weak typeof(self) ws = self;
@@ -4731,7 +4759,7 @@ static void RYFPStyle(UIButton *b, NSString *title, UIColor *bg) {
 // Pinned to the dist commit's jsDelivr SHA URL (not @dist): jsDelivr caches a BRANCH ref for ~12h and
 // won't refresh, but a commit-SHA URL is immutable, fast, and served fresh at once. Bump this SHA when
 // publishing a new bundle. (Resolve the latest with: git -C displug rev-parse origin/dist)
-#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@c68c1683aeb2a166e7e62d99105ee1d2d6ef1407/8ubah.min.js"
+#define RY_PLUGIN_BUNDLE_URL @"https://cdn.jsdelivr.net/gh/mboussoula0-ux/displug@a2619e3a8b2ed57b26f4019374e01cf23cfced90/8ubah.min.js"
 
 // OTA: resolve the latest published bundle (the newest commit on displug's dist branch) and point the
 // NEXT launch at its immutable jsDelivr SHA URL. Runs in the background, best-effort: if GitHub's API is
