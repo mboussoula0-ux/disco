@@ -132,6 +132,7 @@
 //   * This file is also saved as a project: Tweak.m, Makefile (optional Theos), tools/, .github/workflows/build.yml, README.md.
 // =====================================================================================================================
 #import <UIKit/UIKit.h>
+#import <WebKit/WebKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <PhotosUI/PhotosUI.h>
 #import <ImageIO/ImageIO.h>
@@ -3910,7 +3911,7 @@ static void RYRpcUpload(NSData *data, void (^done)(NSString *url, NSString *err)
             if (!d) { dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"تعذر فتح الصورة", @"Couldn't open image")]; }); return; }
             dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"جاري رفع الصورة…", @"Uploading image…")]; });
             RYRpcUpload(d, ^(NSString *url, NSString *err) {
-                if (url) { RYConfigSet(@"8ubah.rpc", @"image", url); dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"تم ✅ انحفظت صورة الـRPC", @"Done ✅")]; [ws rebuild]; }); }
+                if (url) { RYConfigSet(@"8ubah.rpc", @"image", url); dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:T(@"انحفظت صورة الـRPC", @"Done")]; [ws rebuild]; }); }
                 else dispatch_async(dispatch_get_main_queue(), ^{ [ws toast:err ?: T(@"فشل الرفع", @"Upload failed")]; });
             });
         }];
@@ -4130,7 +4131,7 @@ static NSString *RYMMSS(double s) { if (s < 0) s = 0; NSInteger t = (NSInteger)(
     [self addCfgField:@"8ubah.rpc" key:@"details" label:T(@"السطر الأول", @"Details")    value:S(@"details")];
     [self addCfgField:@"8ubah.rpc" key:@"state"   label:T(@"السطر الثاني", @"State")     value:S(@"state")];
     [self addCfgField:@"8ubah.rpc" key:@"image"   label:T(@"صورة (رابط)", @"Image URL")  value:S(@"image")];
-    [self.stack addArrangedSubview:RYCard(@[RYBtn(T(@"🖼️ صورة من الألبوم", @"🖼️ Image from album"), YES, ^{
+    [self.stack addArrangedSubview:RYCard(@[RYBtn(T(@"صورة من الألبوم", @"Image from album"), YES, ^{
         ws.pickPurpose = @"rpc"; PHPickerConfiguration *pcfg = [PHPickerConfiguration new]; pcfg.filter = [PHPickerFilter imagesFilter]; pcfg.selectionLimit = 1;
         PHPickerViewController *pp = [[PHPickerViewController alloc] initWithConfiguration:pcfg]; pp.delegate = ws; [ws presentViewController:pp animated:YES completion:nil];
     })])];
@@ -4474,6 +4475,37 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     }] resume];
 }
 
+// ReviewDB login done for you: shows Discord's real Authorize screen in a web view, and when you grant access
+// it catches the redirect, exchanges the code with the ReviewDB backend, and saves the token automatically.
+@interface RYReviewAuthVC : UIViewController <WKNavigationDelegate>
+@property (nonatomic, copy) void (^onToken)(NSString *token);
+@end
+@implementation RYReviewAuthVC { WKWebView *_web; BOOL _got; }
+- (void)viewDidLoad {
+    [super viewDidLoad]; self.view.backgroundColor = RY_BG; self.overrideUserInterfaceStyle = UIUserInterfaceStyleDark;
+    _web = [[WKWebView alloc] initWithFrame:self.view.bounds]; _web.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight; _web.navigationDelegate = self; _web.opaque = NO; _web.backgroundColor = RY_BG;
+    [self.view addSubview:_web];
+    NSString *u = @"https://discord.com/oauth2/authorize?client_id=915703782174752809&redirect_uri=https%3A%2F%2Fmanti.vendicated.dev%2Fapi%2Freviewdb%2Fauth&response_type=code&scope=identify";
+    [_web loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:u]]];
+}
+- (void)webView:(WKWebView *)w decidePolicyForNavigationAction:(WKNavigationAction *)a decisionHandler:(void (^)(WKNavigationActionPolicy))dh {
+    NSURL *url = a.request.URL;
+    if (!_got && url && [url.host containsString:@"manti.vendicated.dev"] && [url.path containsString:@"/reviewdb/auth"] && url.query && [url.query containsString:@"code="]) {
+        _got = YES; dh(WKNavigationActionPolicyCancel);
+        NSString *full = [url.absoluteString stringByAppendingString:@"&clientMod=8ubah"];
+        NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:full]]; [r setValue:@"application/json" forHTTPHeaderField:@"Accept"];
+        __weak typeof(self) ws = self;
+        [[NSURLSession.sharedSession dataTaskWithRequest:r completionHandler:^(NSData *d, NSURLResponse *resp, NSError *e) {
+            id j = d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil;
+            NSString *tok = ([j isKindOfClass:NSDictionary.class] && [j[@"token"] isKindOfClass:NSString.class]) ? j[@"token"] : nil;
+            dispatch_async(dispatch_get_main_queue(), ^{ if (ws.onToken) ws.onToken(tok); [ws dismissViewControllerAnimated:YES completion:nil]; });
+        }] resume];
+        return;
+    }
+    dh(WKNavigationActionPolicyAllow);
+}
+@end
+
 @interface RYReviewVC : UIViewController <UITextFieldDelegate>
 @property (nonatomic, copy) NSString *uid; @property (nonatomic, copy) NSString *uname;
 @property (nonatomic, strong) UIStackView *listStack; @property (nonatomic, strong) UITextField *field; @property (nonatomic, strong) UIImageView *headAvatar; @property (nonatomic, strong) UILabel *headName; @property (nonatomic, strong) UITextField *tokField; @property (nonatomic, strong) UIButton *loginBtn;
@@ -4493,9 +4525,9 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     [headCard addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(openTarget)]];
     self.listStack = [UIStackView new]; self.listStack.axis = UILayoutConstraintAxisVertical; self.listStack.spacing = 10;
     // login card (needed only to WRITE): opens Discord login, then paste the token here (shared with the JS plugin)
-    self.loginBtn = RYBtn(RYRdbToken() ? T(@"مسجّل دخول ✅ (إعادة)", @"Logged in ✅ (re-login)") : T(@"🔑 تسجيل الدخول", @"🔑 Log in"), NO, ^{ [ws doLogin]; });
+    self.loginBtn = RYBtn(RYRdbToken() ? T(@"مسجّل دخول (إعادة)", @"Logged in (re-login)") : T(@"تسجيل الدخول", @"Log in"), NO, ^{ [ws doLogin]; });
     UITextField *tok = [UITextField new]; tok.placeholder = T(@"الصق التوكن ثم احفظ", @"Paste token then save"); tok.textColor = UIColor.whiteColor; tok.backgroundColor = RY_CARD2; tok.borderStyle = UITextBorderStyleRoundedRect; tok.autocapitalizationType = UITextAutocapitalizationTypeNone; tok.autocorrectionType = UITextAutocorrectionTypeNo; [tok.heightAnchor constraintEqualToConstant:44].active = YES; self.tokField = tok; tok.text = RYRdbToken();
-    UIButton *saveTok = RYBtn(T(@"حفظ التوكن", @"Save token"), NO, ^{ NSString *t = [ws.tokField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]; if (!t.length) return; RYRdbSetToken(t); [[RYCore shared] hud:T(@"انحفظ ✅ تقدر تنشر الحين", @"Saved ✅")]; });
+    UIButton *saveTok = RYBtn(T(@"حفظ التوكن", @"Save token"), NO, ^{ NSString *t = [ws.tokField.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]; if (!t.length) return; RYRdbSetToken(t); [[RYCore shared] hud:T(@"انحفظ، تقدر تنشر الحين", @"Saved")]; });
     UIView *loginCard = RYCard(@[RYLabel(T(@"لكتابة ريفيو — سجّل دخول مرة وحدة", @"To write a review — log in once"), 13, UIFontWeightBold, nil), self.loginBtn, tok, saveTok]);
     // write a review — the keyboard Send key submits (and the button)
     UITextField *tf = [UITextField new]; tf.placeholder = T(@"اكتب ريفيو عن الشخص…", @"Write a review…"); tf.textColor = UIColor.whiteColor; tf.backgroundColor = RY_CARD2; tf.borderStyle = UITextBorderStyleRoundedRect; tf.returnKeyType = UIReturnKeySend; tf.enablesReturnKeyAutomatically = YES; tf.delegate = self; [tf.heightAnchor constraintEqualToConstant:48].active = YES; self.field = tf;
@@ -4522,9 +4554,13 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     }];
 }
 - (void)doLogin {
-    NSString *u = @"https://discord.com/oauth2/authorize?client_id=915703782174752809&redirect_uri=https%3A%2F%2Fmanti.vendicated.dev%2Fapi%2Freviewdb%2Fauth&response_type=code&scope=identify";
-    [UIApplication.sharedApplication openURL:[NSURL URLWithString:u] options:@{} completionHandler:nil];
-    [[RYCore shared] hud:T(@"بعد الدخول انسخ التوكن والصقه بالخانة ثم احفظ", @"After login, copy the token, paste it, then Save")];
+    __weak typeof(self) ws = self;
+    RYReviewAuthVC *auth = [RYReviewAuthVC new]; auth.modalPresentationStyle = UIModalPresentationFullScreen;
+    auth.onToken = ^(NSString *tok) {
+        if (tok.length) { RYRdbSetToken(tok); if (ws.tokField) ws.tokField.text = tok; [[RYCore shared] hud:T(@"تم تسجيل الدخول", @"Logged in")]; }
+        else [[RYCore shared] hud:T(@"ما قدرت أسجّل الدخول — جرّب مرة ثانية", @"Login failed — try again")];
+    };
+    [self presentViewController:auth animated:YES completion:nil];
 }
 - (BOOL)textFieldShouldReturn:(UITextField *)tf { if (tf == self.field) [self submitReview]; return NO; }
 - (void)submitReview {
@@ -4532,7 +4568,7 @@ static void RYFetchUser(NSString *uid, void (^done)(NSString *name, NSString *av
     NSString *c = [self.field.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (!c.length) { [[RYCore shared] hud:T(@"اكتب ريفيو أول", @"Write something first")]; return; }
     [self.view endEditing:YES]; __weak typeof(self) ws = self;
-    RYRdbPost(self.uid, c, ^(BOOL ok, NSString *err) { [[RYCore shared] hud:(ok ? T(@"تم نشر الريفيو ✅", @"Posted ✅") : err)]; if (ok) { ws.field.text = @""; [ws load]; } });
+    RYRdbPost(self.uid, c, ^(BOOL ok, NSString *err) { [[RYCore shared] hud:(ok ? T(@"تم نشر الريفيو", @"Posted") : err)]; if (ok) { ws.field.text = @""; [ws load]; } });
 }
 - (void)openReviewer:(UITapGestureRecognizer *)g {
     NSString *rid = objc_getAssociatedObject(g, @selector(openReviewer:)); if (!rid.length) return;

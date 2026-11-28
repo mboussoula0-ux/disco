@@ -8,7 +8,7 @@ include $(THEOS)/makefiles/common.mk
 LIBRARY_NAME = 8ubahDiscord
 8ubahDiscord_FILES = Tweak.m
 8ubahDiscord_CFLAGS = -fobjc-arc -w
-8ubahDiscord_FRAMEWORKS = UIKit Foundation AVFoundation PhotosUI ImageIO AudioToolbox CoreMedia UniformTypeIdentifiers QuartzCore CoreGraphics
+8ubahDiscord_FRAMEWORKS = UIKit Foundation AVFoundation PhotosUI ImageIO AudioToolbox CoreMedia UniformTypeIdentifiers QuartzCore CoreGraphics WebKit
 8ubahDiscord_INSTALL_PATH = @executable_path/Frameworks
 
 include $(THEOS_MAKE_PATH)/library.mk

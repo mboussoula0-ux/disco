@@ -15,7 +15,7 @@ jobs:
             -dynamiclib -fobjc-arc -O2 -w \
             -framework UIKit -framework Foundation -framework AVFoundation -framework PhotosUI \
             -framework ImageIO -framework AudioToolbox -framework CoreMedia \
-            -framework UniformTypeIdentifiers -framework QuartzCore -framework CoreGraphics \
+            -framework UniformTypeIdentifiers -framework QuartzCore -framework CoreGraphics -framework WebKit \
             -install_name @executable_path/Frameworks/8ubahDiscord.dylib \
             -o 8ubahDiscord.dylib Tweak.m
           codesign -f -s - 8ubahDiscord.dylib || true
